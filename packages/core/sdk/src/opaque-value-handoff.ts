@@ -411,6 +411,22 @@ const replaceOpaqueInputs = (
   return visit(value, 0);
 };
 
+// OpenAPI `allowReserved: true` preserves both RFC 3986 unreserved characters
+// and the reserved set below while percent-encoding everything else. Keep this
+// byte-for-byte aligned with the OpenAPI invocation serializer without making
+// the carrier-neutral SDK depend on the OpenAPI plugin package.
+const OPENAPI_ALLOW_RESERVED_CHARACTER = /[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=]/;
+
+const encodeOpenApiAllowReserved = (value: string): string => {
+  let out = "";
+  for (const character of value) {
+    out += OPENAPI_ALLOW_RESERVED_CHARACTER.test(character)
+      ? character
+      : encodeURIComponent(character);
+  }
+  return out;
+};
+
 const redactionFormsFor = (value: string): readonly string[] => {
   const forms = new Set<string>([value]);
   const json = JSON.stringify(value);
@@ -430,6 +446,7 @@ const redactionFormsFor = (value: string): readonly string[] => {
     // leaves characters such as `~` untouched, so it is a distinct echo form
     // and must be retained independently.
     forms.add(uriEncoded.replaceAll("%20", "+"));
+    forms.add(encodeOpenApiAllowReserved(value));
   } catch {
     // no encoded form for malformed UTF-16
   }
@@ -443,10 +460,30 @@ const redactionFormsFor = (value: string): readonly string[] => {
   return [...forms].filter((form) => form.length > 0);
 };
 
+const foldPercentEncodedBytes = (value: string): string =>
+  value.replaceAll(/%[0-9A-Fa-f]{2}/g, (byte) => byte.toUpperCase());
+
+const replacePercentEncodingCaseInsensitive = (value: string, needle: string): string => {
+  const foldedValue = foldPercentEncodedBytes(value);
+  const foldedNeedle = foldPercentEncodedBytes(needle);
+  let cursor = 0;
+  let match = foldedValue.indexOf(foldedNeedle, cursor);
+  if (match < 0) return value;
+
+  const parts: string[] = [];
+  while (match >= 0) {
+    parts.push(value.slice(cursor, match), REDACTED);
+    cursor = match + needle.length;
+    match = foldedValue.indexOf(foldedNeedle, cursor);
+  }
+  parts.push(value.slice(cursor));
+  return parts.join("");
+};
+
 const replaceText = (value: string, needles: readonly string[]): string => {
   let out = value;
   for (const needle of [...needles].sort((left, right) => right.length - left.length)) {
-    if (needle.length > 0) out = out.replaceAll(needle, REDACTED);
+    if (needle.length > 0) out = replacePercentEncodingCaseInsensitive(out, needle);
   }
   return out;
 };
