@@ -22,6 +22,13 @@ export interface ToolAnnotations {
    * `/credentials/password` and a wildcard beneath `/items` are valid paths.
    */
   readonly sensitiveOutputPaths?: readonly string[];
+  /**
+   * Trusted JSON Pointer paths that may remain visible beside an opaque
+   * sensitive output. Once a response mints a capability, every other
+   * upstream-controlled leaf is dropped; plugins must opt specific metadata
+   * leaves back in rather than relying on transform-by-transform redaction.
+   */
+  readonly sensitiveOutputSafePaths?: readonly string[];
   /** The operation can return a sensitive HTTP response header. Headers have
    * no JSON-pointer projection, so the executor strips the entire response
    * header envelope before it crosses a sandbox or tracing boundary. */

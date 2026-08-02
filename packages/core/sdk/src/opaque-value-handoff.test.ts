@@ -27,12 +27,14 @@ const mixedCasePercentBytes = (value: string): string => {
 const sourceContext = {
   principal: "tenant-a\u0000alice",
   integration: "coolify",
+  owner: "org",
   connection: "production",
   operation: "applications.listEnvs",
 };
 const sinkContext = {
   principal: "tenant-a\u0000alice",
   integration: "coolify",
+  owner: "org",
   connection: "production",
   operation: "applications.updateEnv",
 };
@@ -47,11 +49,13 @@ const valueAt = (value: unknown, path: readonly string[]): unknown => {
 };
 
 describe("opaque sensitive value handoff", () => {
-  it("seals declared output leaves without changing unrelated data", () => {
+  it("projects a sensitive source to opaque leaves without enumerating sibling transforms", () => {
     const handoff = makeOpaqueValueHandoff();
+    const base64 = Buffer.from(MARKER).toString("base64");
+    const base64url = Buffer.from(MARKER).toString("base64url");
     const protectedValue = handoff.protectOutput(
       {
-        envs: [{ name: "SOURCE_ENV", value: MARKER }],
+        envs: [{ name: "SOURCE_ENV", value: MARKER, base64, base64url }],
         "slash/key": { "tilde~key": MARKER },
         public: "visible",
       },
@@ -59,10 +63,35 @@ describe("opaque sensitive value handoff", () => {
     );
 
     expect(JSON.stringify(protectedValue)).not.toContain(MARKER);
-    expect(valueAt(protectedValue, ["public"])).toBe("visible");
+    expect(JSON.stringify(protectedValue)).not.toContain(base64);
+    expect(JSON.stringify(protectedValue)).not.toContain(base64url);
+    expect(valueAt(protectedValue, ["public"])).toBeUndefined();
+    expect(valueAt(protectedValue, ["envs", "0", "name"])).toBeUndefined();
     expect(isOpaqueValueReference(valueAt(protectedValue, ["envs", "0", "value"]))).toBe(true);
     expect(isOpaqueValueReference(valueAt(protectedValue, ["slash/key", "tilde~key"]))).toBe(true);
     expect(handoff.hasOpaqueValues()).toBe(true);
+  });
+
+  it("retains only explicitly projected safe source metadata", () => {
+    const handoff = makeOpaqueValueHandoff();
+    const protectedValue = handoff.protectOutput(
+      {
+        envs: [{ key: "SOURCE_ENV", value: MARKER, unknown: "drop-me" }],
+        requestId: "request-1",
+        unknown: "drop-me-too",
+      },
+      ["/envs/*/value"],
+      undefined,
+      ["/envs/*/key", "/requestId"],
+    );
+
+    expect(protectedValue).toMatchObject({
+      envs: [{ key: "SOURCE_ENV" }],
+      requestId: "request-1",
+    });
+    expect(isOpaqueValueReference(valueAt(protectedValue, ["envs", "0", "value"]))).toBe(true);
+    expect(valueAt(protectedValue, ["envs", "0", "unknown"])).toBeUndefined();
+    expect(valueAt(protectedValue, ["unknown"])).toBeUndefined();
   });
 
   it("uses a non-secret type-compatible value for validation and resolves only afterwards", () => {
@@ -309,6 +338,7 @@ describe("opaque sensitive value handoff", () => {
     handoff.prepareInputForValidation(approvedInput, ["/body/value"], sinkContext);
     for (const foreignSink of [
       { ...sinkContext, integration: "other-integration" },
+      { ...sinkContext, owner: "user" },
       { ...sinkContext, connection: "other-connection" },
       { ...sinkContext, operation: "other-operation" },
     ]) {

@@ -39,6 +39,7 @@ export class OpaqueValueHandoffError extends Error {
 export type OpaqueValueCallContext = {
   readonly principal: string;
   readonly integration: string;
+  readonly owner: string;
   readonly connection: string;
   readonly operation: string;
 };
@@ -52,6 +53,7 @@ export type OpaqueValueHandoffOptions = {
 
 type OpaqueOperationScope = {
   readonly integration: string;
+  readonly owner: string;
   readonly connection: string;
   readonly operation: string;
 };
@@ -111,6 +113,7 @@ export interface OpaqueValueHandoff {
     value: unknown,
     paths: readonly string[] | undefined,
     context?: OpaqueValueCallContext,
+    safePaths?: readonly string[],
   ) => unknown;
   /**
    * Replace permitted opaque input values with type-compatible, non-secret
@@ -300,6 +303,32 @@ const cloneAndReplaceOutput = (
   return changed ? out : value;
 };
 
+/** Keep only the structural paths required to carry opaque handles plus
+ * explicitly trusted metadata. Array positions remain stable; unmatched
+ * positions become executor-owned null placeholders rather than shifting a
+ * later capability to a different JSON Pointer. */
+const projectSourceOutput = (
+  value: unknown,
+  patterns: readonly PathSegment[][],
+  depth = 0,
+): unknown => {
+  if (patterns.some((pattern) => pattern.length === 0)) return value;
+  if (depth > MAX_REDACTION_DEPTH) return null;
+  if (Array.isArray(value)) {
+    return value.map((item, index) => {
+      const suffixes = matchingSuffixes(patterns, String(index));
+      return suffixes.length > 0 ? projectSourceOutput(item, suffixes, depth + 1) : null;
+    });
+  }
+  if (!isRecord(value)) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    const suffixes = matchingSuffixes(patterns, key);
+    if (suffixes.length > 0) out[key] = projectSourceOutput(item, suffixes, depth + 1);
+  }
+  return out;
+};
+
 type OpaqueOccurrence = {
   readonly id: string;
   readonly path: readonly string[];
@@ -309,18 +338,21 @@ type OpaqueOccurrence = {
 const defaultContext: OpaqueValueCallContext = {
   principal: "opaque-direct-unit-principal",
   integration: "opaque-direct-unit-integration",
+  owner: "opaque-direct-unit-owner",
   connection: "opaque-direct-unit-connection",
   operation: "opaque-direct-unit-operation",
 };
 
 const scopeFor = (context: OpaqueValueCallContext): OpaqueOperationScope => ({
   integration: context.integration,
+  owner: context.owner,
   connection: context.connection,
   operation: context.operation,
 });
 
 const sameScope = (left: OpaqueOperationScope, right: OpaqueOperationScope): boolean =>
   left.integration === right.integration &&
+  left.owner === right.owner &&
   left.connection === right.connection &&
   left.operation === right.operation;
 
@@ -606,11 +638,16 @@ export const makeOpaqueValueHandoff = (
 
   return {
     hasOpaqueValues: () => hasSealedValues,
-    protectOutput: (value, paths, context = defaultContext) => {
+    protectOutput: (value, paths, context = defaultContext, safePaths = []) => {
       const patterns = decodePointers(paths);
       if (patterns.length === 0) return redact(value);
       assertAvailable();
-      const sealed = cloneAndReplaceOutput(value, patterns, (sensitiveValue, path) => {
+      // A source response is provenance-tainted as soon as it can mint an
+      // opaque capability. Project structurally before sealing so base64,
+      // base64url, hashes, or any future sibling transform never reaches a
+      // result/redaction/trace boundary in the first place.
+      const projected = projectSourceOutput(value, [...patterns, ...decodePointers(safePaths)]);
+      const sealed = cloneAndReplaceOutput(projected, patterns, (sensitiveValue, path) => {
         const id = crypto.randomUUID();
         const needles = [...stringsIn(sensitiveValue)];
         redactionValues.push(sensitiveValue);

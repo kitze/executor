@@ -1,10 +1,12 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Logger } from "effect";
+import { Cause, Effect, Exit, Logger } from "effect";
 import type * as Tracer from "effect/Tracer";
 
 import {
   ElicitationResponse,
+  ToolAddress,
   isOpaqueValueReference,
+  makeOpaqueValueHandoff,
   ToolResult,
   createExecutor,
   definePlugin,
@@ -29,6 +31,12 @@ const adversarialEchoes = (value: string): readonly string[] => {
     encodeURIComponent(uri),
   ];
 };
+
+const arbitrarySourceTransforms = (value: string): readonly string[] => [
+  Buffer.from(value).toString("base64"),
+  Buffer.from(value).toString("base64url"),
+  [...value].reverse().join(""),
+];
 
 type RecordedSpan = {
   readonly name: string;
@@ -92,14 +100,25 @@ const makeRecordingTracer = (): {
 };
 
 const spanSurface = (spans: readonly RecordedSpan[]): string =>
-  JSON.stringify(
+  cycleSafeStringify(
     spans.map((span) => ({
       name: span.name,
       attributes: [...span.attributes.entries()],
       events: span.events,
+      status: span.status,
     })),
-    (_key, value) => (typeof value === "bigint" ? value.toString() : value),
   );
+
+const cycleSafeStringify = (value: unknown): string => {
+  const seen = new WeakSet<object>();
+  return JSON.stringify(value, (_key, item) => {
+    if (typeof item === "bigint") return item.toString();
+    if (typeof item !== "object" || item === null) return item;
+    if (seen.has(item)) return "[circular]";
+    seen.add(item);
+    return item;
+  });
+};
 
 type Ledger = {
   readonly writes: unknown[];
@@ -121,7 +140,27 @@ const makePlugin = (ledger: Ledger) =>
             description: "Read an environment value",
             annotations: { sensitiveOutputPaths: ["/envs/*/value"] },
             execute: () =>
-              Effect.succeed(ToolResult.ok({ envs: [{ key: "SOURCE_VALUE", value: MARKER }] })),
+              Effect.gen(function* () {
+                const transforms = arbitrarySourceTransforms(MARKER);
+                yield* Effect.log("opaque source response", { transforms });
+                yield* Effect.annotateCurrentSpan({
+                  "opaque.source.transforms": transforms.join("|"),
+                });
+                return ToolResult.ok({
+                  envs: [
+                    {
+                      key: "SOURCE_VALUE",
+                      value: MARKER,
+                      base64Echo: transforms[0],
+                      base64urlEcho: transforms[1],
+                      arbitraryEcho: transforms[2],
+                      error: { message: transforms[0] },
+                      logs: transforms,
+                      trace: { "http.response.body": transforms.join("|") },
+                    },
+                  ],
+                });
+              }),
           }),
           tool({
             name: "write",
@@ -178,6 +217,24 @@ const makePlugin = (ledger: Ledger) =>
                 const value = (args as { readonly body?: { readonly value?: unknown } }).body
                   ?.value;
                 return adversarialEchoes(String(value)).join("\n");
+              }),
+          }),
+          tool({
+            name: "writeDefect",
+            description: "Defect after receiving an environment value",
+            annotations: { sensitiveInputPaths: ["/body/value"] },
+            execute: (args) =>
+              Effect.gen(function* () {
+                ledger.writes.push(args);
+                const value = (args as { readonly body?: { readonly value?: unknown } }).body
+                  ?.value;
+                const transforms = arbitrarySourceTransforms(String(value));
+                yield* Effect.log("opaque sink defect", { transforms });
+                yield* Effect.annotateCurrentSpan({
+                  "opaque.defect.transforms": transforms.join("|"),
+                });
+                // oxlint-disable-next-line executor/no-error-constructor -- regression boundary: prove an untrusted built-in Error defect carrying source material is normalized before Cause.pretty/trace surfaces
+                return yield* Effect.die(new Error(`${String(value)}|${transforms.join("|")}`));
               }),
           }),
           tool({
@@ -278,9 +335,12 @@ describe("opaque sensitive value execution", () => {
           MARKER,
         );
         const sandboxResult = resumed.result.result as {
-          readonly source?: unknown;
+          readonly source?: {
+            readonly data?: { readonly envs?: readonly Record<string, unknown>[] };
+          };
           readonly written?: unknown;
         };
+        expect(Object.keys(sandboxResult.source?.data?.envs?.[0] ?? {})).toEqual(["value"]);
         expect(sandboxResult.written).toEqual({
           ok: true,
           data: null,
@@ -298,12 +358,39 @@ describe("opaque sensitive value execution", () => {
         const publicSurface = JSON.stringify(resumed);
         const observedSpans = spanSurface(spans);
         const observedLogs = recordedLogs.join("\n");
-        for (const echo of echoes) {
+        for (const echo of [...echoes, ...arbitrarySourceTransforms(MARKER)]) {
           expect(publicSurface).not.toContain(echo);
           expect(observedSpans).not.toContain(echo);
           expect(observedLogs).not.toContain(echo);
         }
       }),
+  );
+
+  it.effect("normalizes a sensitive Effect defect before result, log, or Cause tracing", () =>
+    Effect.gen(function* () {
+      const { executor, ledger } = yield* makeHarness();
+      const { tracer, spans } = makeRecordingTracer();
+      const recordedLogs: string[] = [];
+      const logger = Logger.make<unknown, void>((options) => {
+        recordedLogs.push(JSON.stringify(options.message));
+      });
+      const exit = yield* executor
+        .execute(
+          ToolAddress.make("opaque.writeDefect"),
+          { body: { value: MARKER } },
+          { opaqueValueHandoff: makeOpaqueValueHandoff() },
+        )
+        .pipe(Effect.withTracer(tracer), Effect.withLogger(logger), Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      expect(ledger.writes).toEqual([{ body: { value: MARKER } }]);
+
+      const renderedCause = Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "";
+      const publicSurface = `${cycleSafeStringify(exit)}\n${renderedCause}\n${spanSurface(spans)}\n${recordedLogs.join("\n")}`;
+      expect(publicSurface).not.toContain(MARKER);
+      for (const transform of arbitrarySourceTransforms(MARKER)) {
+        expect(publicSurface).not.toContain(transform);
+      }
+    }),
   );
 
   it.effect("suppresses transformed opaque echoes in failures and raw text results", () =>

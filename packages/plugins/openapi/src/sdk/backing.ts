@@ -204,6 +204,9 @@ const toBinding = (def: ToolDefinition): OperationBinding =>
     ...(def.operation.sensitiveOutputPaths
       ? { sensitiveOutputPaths: def.operation.sensitiveOutputPaths }
       : {}),
+    ...(def.operation.sensitiveOutputSafePaths
+      ? { sensitiveOutputSafePaths: def.operation.sensitiveOutputSafePaths }
+      : {}),
     ...(def.operation.sensitiveResponseHeaders ? { sensitiveResponseHeaders: true } : {}),
     sensitivityVersion: 1,
     ...(def.operation.requiredScopeAlternatives
