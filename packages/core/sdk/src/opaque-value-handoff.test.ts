@@ -11,6 +11,19 @@ const STRUCTURAL_KEY_MARKER = "opaque-structural-key-marker";
 const JSON_MARKER = 'opaque-json-"escaped"-marker';
 const URI_MARKER = "opaque-uri/a?b=marker";
 const FORM_MARKER = "opaque form+slash/?=marker~";
+const ADVERSARIAL_ENCODING_MARKER = "opaque café +slash\\/?[x]=~";
+const OPENAPI_ALLOW_RESERVED_ENCODING = "opaque%20caf%C3%A9%20+slash%5C/?[x]=~";
+
+const lowercasePercentBytes = (value: string): string =>
+  value.replaceAll(/%[0-9A-F]{2}/g, (byte) => byte.toLowerCase());
+
+const mixedCasePercentBytes = (value: string): string => {
+  let lowercaseNext = true;
+  return value.replaceAll(/%[0-9A-F]{2}/g, (byte) => {
+    lowercaseNext = !lowercaseNext;
+    return lowercaseNext ? byte.toLowerCase() : byte;
+  });
+};
 const sourceContext = {
   principal: "tenant-a\u0000alice",
   integration: "coolify",
@@ -164,6 +177,46 @@ describe("opaque sensitive value handoff", () => {
     for (const encoded of encodings) {
       expect(rendered).not.toContain(encoded);
       expect(handoff.redactText(`value=${encoded}`)).not.toContain(encoded);
+    }
+  });
+
+  it("redacts lowercase percent bytes and OpenAPI allowReserved hybrids across every output channel", () => {
+    const handoff = makeOpaqueValueHandoff();
+    handoff.protectOutput({ value: ADVERSARIAL_ENCODING_MARKER }, ["/value"]);
+
+    const uriEncoded = encodeURIComponent(ADVERSARIAL_ENCODING_MARKER);
+    const formEncoded = new URLSearchParams([["value", ADVERSARIAL_ENCODING_MARKER]])
+      .toString()
+      .slice("value=".length);
+    expect(OPENAPI_ALLOW_RESERVED_ENCODING).toContain("+slash%5C/?[x]=~");
+
+    const adversarialEchoes = [
+      lowercasePercentBytes(uriEncoded),
+      mixedCasePercentBytes(uriEncoded),
+      lowercasePercentBytes(formEncoded),
+      mixedCasePercentBytes(formEncoded),
+      OPENAPI_ALLOW_RESERVED_ENCODING,
+      lowercasePercentBytes(OPENAPI_ALLOW_RESERVED_ENCODING),
+      mixedCasePercentBytes(OPENAPI_ALLOW_RESERVED_ENCODING),
+    ];
+    expect(new Set(adversarialEchoes).size).toBe(adversarialEchoes.length);
+
+    const safe = handoff.redact({
+      success: adversarialEchoes.map((encoded) => ({ body: `value=${encoded}` })),
+      error: adversarialEchoes.map((encoded) => ({ message: `value=${encoded}` })),
+      logs: adversarialEchoes.map((encoded) => `value=${encoded}`),
+      trace: adversarialEchoes.map((encoded) => ({ "http.response.body": `value=${encoded}` })),
+    });
+    const expectedRedactions = adversarialEchoes.map(() => "value=[redacted]");
+
+    expect(safe).toEqual({
+      success: expectedRedactions.map((body) => ({ body })),
+      error: expectedRedactions.map((message) => ({ message })),
+      logs: expectedRedactions,
+      trace: expectedRedactions.map((body) => ({ "http.response.body": body })),
+    });
+    for (const encoded of adversarialEchoes) {
+      expect(handoff.redactText(`value=${encoded}`)).toBe("value=[redacted]");
     }
   });
 
