@@ -1,6 +1,15 @@
-import { Effect, Option } from "effect";
+import { Effect, Option, Predicate } from "effect";
 
 import { planToolPaths, type OperationPathInput, type PlannedToolPath } from "./definitions";
+import {
+  coolifyEnvironmentWriteKind,
+  isCoolifyApplicationResponseSchema,
+  isCoolifyEnvironmentListResponseSchema,
+  isVerifiedCoolifyApplicationReadOperation,
+  isVerifiedCoolifyEnvironmentListOperation,
+  isVerifiedCoolifyEnvironmentWriteRequest,
+  type CoolifyOperationIdentity,
+} from "./coolify-environment";
 import { OpenApiExtractionError } from "./errors";
 import type { ParsedDocument } from "./parse";
 import {
@@ -15,6 +24,7 @@ import {
 import {
   declaredContents,
   DocResolver,
+  type HeaderObject,
   isNdjsonMediaType,
   ndjsonArrayOutputSchema,
   preferredResponseContent,
@@ -59,6 +69,12 @@ const HTTP_METHODS: readonly HttpMethod[] = [
 
 const VALID_PARAM_LOCATIONS = new Set<string>(["path", "query", "header", "cookie"]);
 
+/** Parameter Objects may use either `schema` or a single media entry in
+ * `content`. Preserve the latter's schema so validation and opaque-sink
+ * metadata describe the same value the invoker serializes. */
+const parameterSchema = (parameter: ParameterObject): unknown =>
+  parameter.schema ?? declaredContents(parameter.content)[0]?.media.schema;
+
 // ---------------------------------------------------------------------------
 // Parameter extraction
 // ---------------------------------------------------------------------------
@@ -88,7 +104,7 @@ const extractParameters = (
         name: p.name,
         location: p.in as ParameterLocation,
         required: p.in === "path" ? true : p.required === true,
-        schema: Option.fromNullishOr(p.schema),
+        schema: Option.fromNullishOr(parameterSchema(p)),
         style: Option.fromNullishOr(p.style),
         explode: Option.fromNullishOr(p.explode),
         allowReserved: Option.fromNullishOr("allowReserved" in p ? p.allowReserved : undefined),
@@ -163,86 +179,381 @@ const extractRequestBody = (
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-// Explicit opt-in only. `writeOnly`, `format: password`, and property names
-// are documentation hints, not a safe authority to hide values from a model.
+// Explicit opt-in is strongest, but OpenAPI's standardized secret semantics
+// also form deterministic safety metadata. This is intentionally conservative:
+// extra opacity is safe, while one plaintext credential field is not.
 const SENSITIVE_SCHEMA_EXTENSION = "x-executor-sensitive";
 
+const SCHEMA_WILDCARD = Symbol("openapi-sensitive-wildcard");
+type SchemaPathSegment = string | typeof SCHEMA_WILDCARD;
+
 const pointerEscape = (segment: string): string =>
-  segment.replaceAll("~", "~0").replaceAll("/", "~1");
+  segment.replaceAll("~", "~0").replaceAll("/", "~1").replaceAll("*", "~2");
 
-const pointerAt = (segments: readonly string[]): string =>
-  segments.length === 0 ? "" : `/${segments.map(pointerEscape).join("/")}`;
+const pointerAt = (segments: readonly SchemaPathSegment[]): string =>
+  segments.length === 0
+    ? ""
+    : `/${segments
+        .map((segment) => (segment === SCHEMA_WILDCARD ? "*" : pointerEscape(segment)))
+        .join("/")}`;
 
-/** Collect every exact schema marker as an RFC 6901 pointer. A component ref
- * is resolved through the current document and guarded against recursive
- * schemas. Array and map members use the shared `/*` wildcard convention. */
+const hasSensitiveSchemaSemantics = (schema: Record<string, unknown>): boolean => {
+  if (schema[SENSITIVE_SCHEMA_EXTENSION] === true) return true;
+  if (schema.writeOnly === true || schema["x-secret"] === true || schema["x-sensitive"] === true) {
+    return true;
+  }
+  const format = typeof schema.format === "string" ? schema.format.toLowerCase() : "";
+  return ["password", "secret", "token", "api-key", "api_key"].includes(format);
+};
+
+const SCHEMA_REFERENCE_KEYS = ["$ref", "$dynamicRef", "$recursiveRef"] as const;
+
+type SensitivityDirection = "input" | "output";
+
+/** Collect every exact schema marker as an RFC 6901 pointer. References are
+ * resolved through the current document and guarded as an active recursion
+ * stack, rather than de-duplicated globally: the same component may appear at
+ * several operation paths and every occurrence needs its own pointer. Unknown
+ * output references seal their enclosing value; unknown inputs cannot become
+ * secret-capable sinks. Array and map members use the shared `/*` wildcard
+ * convention. */
 const collectSensitiveSchemaPaths = (
   schema: unknown,
   resolver: DocResolver,
-  path: readonly string[] = [],
+  direction: SensitivityDirection,
+  path: readonly SchemaPathSegment[] = [],
   out = new Set<string>(),
-  seenRefs = new Set<string>(),
+  activeRefs = new Set<string>(),
 ): Set<string> => {
   if (!isRecord(schema)) return out;
-  if (schema[SENSITIVE_SCHEMA_EXTENSION] === true) out.add(pointerAt(path));
+  if (hasSensitiveSchemaSemantics(schema)) out.add(pointerAt(path));
 
-  const ref = schema.$ref;
-  if (typeof ref === "string" && !seenRefs.has(ref)) {
-    seenRefs.add(ref);
-    const resolved = resolver.resolve<Record<string, unknown>>(schema as never);
-    if (resolved && resolved !== schema) {
-      collectSensitiveSchemaPaths(resolved, resolver, path, out, seenRefs);
+  for (const key of SCHEMA_REFERENCE_KEYS) {
+    const ref: unknown = schema[key];
+    if (ref === undefined) continue;
+    if (typeof ref !== "string") {
+      if (direction === "output") out.add(pointerAt(path));
+      continue;
     }
-    // This is a recursion guard, not a de-duplication set. The same component
-    // can occur at several object paths and every occurrence needs its own
-    // pointer in the operation metadata.
-    seenRefs.delete(ref);
+    const resolved: unknown = resolver.resolveReference<unknown>(ref);
+    if (activeRefs.has(ref) || !isRecord(resolved) || resolved === schema) {
+      // A cycle has no finite leaf projection. It is safe to seal an unknown
+      // output. Never turn that fallback into an input sink: only a concrete
+      // marker at a finite schema path authorizes opaque-value resolution.
+      if (direction === "output") out.add(pointerAt(path));
+      continue;
+    }
+    activeRefs.add(ref);
+    collectSensitiveSchemaPaths(resolved, resolver, direction, path, out, activeRefs);
+    activeRefs.delete(ref);
   }
 
   const properties = schema.properties;
   if (isRecord(properties)) {
     for (const [name, nested] of Object.entries(properties)) {
-      collectSensitiveSchemaPaths(nested, resolver, [...path, name], out, seenRefs);
+      collectSensitiveSchemaPaths(nested, resolver, direction, [...path, name], out, activeRefs);
     }
   }
-  if (schema.items !== undefined) {
-    collectSensitiveSchemaPaths(schema.items, resolver, [...path, "*"], out, seenRefs);
+  const patternProperties = schema.patternProperties;
+  if (isRecord(patternProperties)) {
+    for (const nested of Object.values(patternProperties)) {
+      collectSensitiveSchemaPaths(
+        nested,
+        resolver,
+        direction,
+        [...path, SCHEMA_WILDCARD],
+        out,
+        activeRefs,
+      );
+    }
   }
-  if (isRecord(schema.additionalProperties)) {
+  if (Array.isArray(schema.items)) {
+    // OpenAPI 3.0 / legacy JSON Schema tuple form. OpenAPI 3.1 uses
+    // `prefixItems`, but persisted specs can still contain the older shape.
+    for (let index = 0; index < schema.items.length; index += 1) {
+      collectSensitiveSchemaPaths(
+        schema.items[index],
+        resolver,
+        direction,
+        [...path, String(index)],
+        out,
+        activeRefs,
+      );
+    }
+  } else if (schema.items !== undefined) {
     collectSensitiveSchemaPaths(
-      schema.additionalProperties,
+      schema.items,
       resolver,
-      [...path, "*"],
+      direction,
+      [...path, SCHEMA_WILDCARD],
       out,
-      seenRefs,
+      activeRefs,
     );
+  }
+  if (Array.isArray(schema.prefixItems)) {
+    for (let index = 0; index < schema.prefixItems.length; index += 1) {
+      collectSensitiveSchemaPaths(
+        schema.prefixItems[index],
+        resolver,
+        direction,
+        [...path, String(index)],
+        out,
+        activeRefs,
+      );
+    }
+  }
+  for (const key of ["additionalItems", "additionalProperties", "unevaluatedProperties"] as const) {
+    if (!isRecord(schema[key])) continue;
+    collectSensitiveSchemaPaths(
+      schema[key],
+      resolver,
+      direction,
+      [...path, SCHEMA_WILDCARD],
+      out,
+      activeRefs,
+    );
+  }
+  for (const key of ["contains", "unevaluatedItems"] as const) {
+    if (schema[key] !== undefined) {
+      collectSensitiveSchemaPaths(
+        schema[key],
+        resolver,
+        direction,
+        [...path, SCHEMA_WILDCARD],
+        out,
+        activeRefs,
+      );
+    }
   }
   for (const key of ["allOf", "anyOf", "oneOf"] as const) {
     const variants = schema[key];
     if (!Array.isArray(variants)) continue;
     for (const variant of variants) {
-      collectSensitiveSchemaPaths(variant, resolver, path, out, seenRefs);
+      collectSensitiveSchemaPaths(variant, resolver, direction, path, out, activeRefs);
     }
+  }
+  for (const key of ["if", "then", "else", "not"] as const) {
+    if (schema[key] !== undefined) {
+      collectSensitiveSchemaPaths(schema[key], resolver, direction, path, out, activeRefs);
+    }
+  }
+  for (const key of ["dependentSchemas", "dependencies"] as const) {
+    const schemas = schema[key];
+    if (!isRecord(schemas)) continue;
+    for (const nested of Object.values(schemas)) {
+      collectSensitiveSchemaPaths(nested, resolver, direction, path, out, activeRefs);
+    }
+  }
+
+  // These schemas constrain a property name or encoded content rather than a
+  // JSON child that can be named with a pointer. If either carries sensitive
+  // semantics, seal the enclosing instance rather than invent an inaccurate
+  // child path.
+  for (const key of ["propertyNames", "contentSchema"] as const) {
+    if (schema[key] === undefined) continue;
+    const nested = new Set<string>();
+    collectSensitiveSchemaPaths(
+      schema[key],
+      resolver,
+      direction,
+      path,
+      nested,
+      new Set(activeRefs),
+    );
+    if (nested.size > 0) out.add(pointerAt(path));
   }
   return out;
 };
 
 const withPointerPrefix = (prefix: string, path: string): string => `${prefix}${path}`;
 
+const parameterInputPrefixes = (parameter: OperationParameter): readonly string[] => {
+  const name = pointerEscape(parameter.name);
+  const direct = `/${name}`;
+  const prefixes = {
+    path: [`/path/${name}`, `/pathParams/${name}`, `/params/${name}`],
+    query: [`/query/${name}`, `/queryParams/${name}`, `/params/${name}`],
+    header: [`/headers/${name}`, `/header/${name}`],
+    cookie: [`/cookies/${name}`, `/cookie/${name}`],
+  } satisfies Record<OperationParameter["location"], readonly string[]>;
+  return [direct, ...prefixes[parameter.location]];
+};
+
+const rawServerVariablePaths = (servers: readonly ServerObject[]): readonly string[] => {
+  const paths = new Set<string>();
+  for (const server of servers) {
+    const variables = server.variables;
+    if (!isRecord(variables)) continue;
+    for (const [name, raw] of Object.entries(variables)) {
+      if (isRecord(raw) && hasSensitiveSchemaSemantics(raw)) {
+        paths.add(`/server/variables/${pointerEscape(name)}`);
+      }
+    }
+  }
+  return [...paths];
+};
+
+/** Collect every response schema, rather than only the preferred display
+ * schema. The HTTP runtime accepts every 2xx response and exposes error
+ * bodies, so a secret in a 201/default/alternate media type must drive the
+ * same source sealing and trace suppression as a secret in the preferred 200.
+ */
+const collectResponseSensitivity = (
+  operation: OperationObject,
+  resolver: DocResolver,
+): {
+  readonly paths: Set<string>;
+  readonly hasSensitiveHeaders: boolean;
+} => {
+  const paths = new Set<string>();
+  let hasSensitiveHeaders = false;
+  if (!operation.responses) return { paths, hasSensitiveHeaders };
+
+  for (const rawResponse of Object.values(operation.responses)) {
+    const response = resolver.resolve<ResponseObject>(rawResponse);
+    if (!response) {
+      // A referenced response could contain either a body or headers. Do not
+      // let a missing local target turn that unknown output into plaintext.
+      paths.add("");
+      hasSensitiveHeaders = true;
+      continue;
+    }
+    for (const { mediaType, media } of declaredContents(response.content)) {
+      const prefix = isNdjsonMediaType(mediaType) ? "/*" : "";
+      for (const path of collectSensitiveSchemaPaths(media.schema, resolver, "output")) {
+        paths.add(withPointerPrefix(prefix, path));
+      }
+    }
+    for (const rawHeader of Object.values(response.headers ?? {})) {
+      const header = resolver.resolve<HeaderObject>(rawHeader);
+      if (!header) {
+        hasSensitiveHeaders = true;
+        continue;
+      }
+      const schemas = [
+        header.schema,
+        ...declaredContents(header.content).map(({ media }) => media.schema),
+      ];
+      if (
+        schemas.some((schema) => collectSensitiveSchemaPaths(schema, resolver, "output").size > 0)
+      ) {
+        hasSensitiveHeaders = true;
+      }
+    }
+  }
+  return { paths, hasSensitiveHeaders };
+};
+
+const resolveSchemaReference = (schema: unknown, resolver: DocResolver): unknown =>
+  isRecord(schema) && typeof schema.$ref === "string"
+    ? (resolver.resolveReference<unknown>(schema.$ref) ?? schema)
+    : schema;
+
+const schemasForRequestBody = (
+  requestBody: OperationRequestBody | undefined,
+  resolver: DocResolver,
+): readonly unknown[] => {
+  if (!requestBody) return [];
+  const schemas = [
+    Option.getOrUndefined(requestBody.schema),
+    ...(Option.getOrUndefined(requestBody.contents) ?? []).map((content) =>
+      Option.getOrUndefined(content.schema),
+    ),
+  ].filter(Predicate.isNotUndefined);
+  return schemas.map((schema) => resolveSchemaReference(schema, resolver));
+};
+
+const schemasForResponses = (
+  operation: OperationObject,
+  resolver: DocResolver,
+): readonly unknown[] => {
+  if (!operation.responses) return [];
+  const schemas: unknown[] = [];
+  for (const rawResponse of Object.values(operation.responses)) {
+    const response = resolver.resolve<ResponseObject>(rawResponse);
+    if (!response) continue;
+    for (const { media } of declaredContents(response.content)) {
+      if (media.schema !== undefined) schemas.push(resolveSchemaReference(media.schema, resolver));
+    }
+  }
+  return schemas;
+};
+
+/** Coolify's published schemas omit the semantic credential annotations. This
+ * narrowly recognizes only its known operation IDs, exact routes, required
+ * UUID parameter, and request/response fingerprints. A similarly-shaped
+ * tenant endpoint therefore cannot gain an opaque secret sink. */
+const addCoolifySensitivity = (
+  input: {
+    readonly identity: CoolifyOperationIdentity;
+    readonly requestSchemas: readonly unknown[];
+    readonly responseSchemas: readonly unknown[];
+  },
+  sensitiveInputPaths: Set<string>,
+  sensitiveOutputPaths: Set<string>,
+): void => {
+  const writeKind = coolifyEnvironmentWriteKind(input.identity);
+  if (writeKind && isVerifiedCoolifyEnvironmentWriteRequest(writeKind, input.requestSchemas)) {
+    if (writeKind === "single") {
+      sensitiveInputPaths.add("/body/value");
+      sensitiveInputPaths.add("/input/value");
+      if (input.identity.method === "patch") {
+        sensitiveOutputPaths.add("/value");
+        sensitiveOutputPaths.add("/real_value");
+      }
+    } else {
+      sensitiveInputPaths.add("/body/data/*/value");
+      sensitiveInputPaths.add("/input/data/*/value");
+      sensitiveOutputPaths.add("/*/value");
+      sensitiveOutputPaths.add("/*/real_value");
+    }
+  }
+
+  if (
+    isVerifiedCoolifyEnvironmentListOperation(input.identity) &&
+    input.responseSchemas.some(isCoolifyEnvironmentListResponseSchema)
+  ) {
+    sensitiveOutputPaths.add("/*/value");
+    sensitiveOutputPaths.add("/*/real_value");
+  }
+
+  if (
+    isVerifiedCoolifyApplicationReadOperation(input.identity) &&
+    input.responseSchemas.some(isCoolifyApplicationResponseSchema)
+  ) {
+    for (const field of [
+      "manual_webhook_secret_github",
+      "manual_webhook_secret_gitlab",
+      "manual_webhook_secret_bitbucket",
+      "manual_webhook_secret_gitea",
+      "http_basic_auth_password",
+    ]) {
+      sensitiveOutputPaths.add(`/${field}`);
+    }
+  }
+};
+
 const operationSensitivity = (input: {
   readonly parameters: readonly OperationParameter[];
   readonly requestBody: OperationRequestBody | undefined;
-  readonly responseBody: OperationResponseBody | undefined;
+  readonly rawOperation: OperationObject;
   readonly resolver: DocResolver;
+  readonly operationId: string;
+  readonly method: HttpMethod;
+  readonly pathTemplate: string;
+  readonly rawServers: readonly ServerObject[];
 }): {
   readonly sensitiveInputPaths?: readonly string[];
   readonly sensitiveOutputPaths?: readonly string[];
+  readonly sensitiveResponseHeaders?: boolean;
 } => {
   const sensitiveInputPaths = new Set<string>();
   for (const parameter of input.parameters) {
     const schema = Option.getOrUndefined(parameter.schema);
-    for (const path of collectSensitiveSchemaPaths(schema, input.resolver)) {
-      sensitiveInputPaths.add(withPointerPrefix(`/${pointerEscape(parameter.name)}`, path));
+    for (const path of collectSensitiveSchemaPaths(schema, input.resolver, "input")) {
+      for (const prefix of parameterInputPrefixes(parameter)) {
+        sensitiveInputPaths.add(withPointerPrefix(prefix, path));
+      }
     }
   }
   if (input.requestBody) {
@@ -253,20 +564,34 @@ const operationSensitivity = (input: {
       ),
     ];
     for (const schema of schemas) {
-      for (const path of collectSensitiveSchemaPaths(schema, input.resolver)) {
+      for (const path of collectSensitiveSchemaPaths(schema, input.resolver, "input")) {
         sensitiveInputPaths.add(withPointerPrefix("/body", path));
+        // `input` is a documented legacy alias for request bodies in the
+        // OpenAPI invoker and must have identical capability semantics.
+        sensitiveInputPaths.add(withPointerPrefix("/input", path));
       }
     }
   }
+  for (const path of rawServerVariablePaths(input.rawServers)) sensitiveInputPaths.add(path);
 
   const sensitiveOutputPaths = new Set<string>();
-  if (input.responseBody) {
-    const schema = Option.getOrUndefined(input.responseBody.schema);
-    const prefix = isNdjsonMediaType(input.responseBody.contentType) ? "/*" : "";
-    for (const path of collectSensitiveSchemaPaths(schema, input.resolver)) {
-      sensitiveOutputPaths.add(withPointerPrefix(prefix, path));
-    }
-  }
+  const responseSensitivity = collectResponseSensitivity(input.rawOperation, input.resolver);
+  for (const path of responseSensitivity.paths) sensitiveOutputPaths.add(path);
+
+  addCoolifySensitivity(
+    {
+      identity: {
+        operationId: input.operationId,
+        method: input.method,
+        pathTemplate: input.pathTemplate,
+        parameters: input.parameters,
+      },
+      requestSchemas: schemasForRequestBody(input.requestBody, input.resolver),
+      responseSchemas: schemasForResponses(input.rawOperation, input.resolver),
+    },
+    sensitiveInputPaths,
+    sensitiveOutputPaths,
+  );
 
   return {
     ...(sensitiveInputPaths.size > 0
@@ -275,6 +600,7 @@ const operationSensitivity = (input: {
     ...(sensitiveOutputPaths.size > 0
       ? { sensitiveOutputPaths: [...sensitiveOutputPaths].sort() }
       : {}),
+    ...(responseSensitivity.hasSensitiveHeaders ? { sensitiveResponseHeaders: true } : {}),
   };
 };
 
@@ -718,16 +1044,21 @@ export const extract = Effect.fn("OpenApi.extract")(function* (doc: ParsedDocume
       const requestBody = extractRequestBody(operation, r);
       const responseBody = extractResponseBody(operation, r);
       const servers = operationServers(pathItem, operation, docServers);
+      const operationPathTemplate = explicitPathTemplate(operation) ?? pathTemplate;
+      const operationId = deriveOperationId(method, pathTemplate, operation);
       const sensitivity = operationSensitivity({
         parameters,
         requestBody,
-        responseBody,
+        rawOperation: operation,
         resolver: r,
+        operationId,
+        method,
+        pathTemplate: operationPathTemplate,
+        rawServers: operation.servers ?? pathItem.servers ?? doc.servers ?? [],
       });
       const inputSchema = buildInputSchema(parameters, requestBody, servers);
       const outputSchema = responseBody ? outputSchemaFromResponseBody(responseBody) : undefined;
       const tags = (operation.tags ?? []).filter((t) => t.trim().length > 0);
-      const operationPathTemplate = explicitPathTemplate(operation) ?? pathTemplate;
 
       const requiredScopeAlternatives = securityScopeAlternatives(
         operation,
@@ -735,7 +1066,7 @@ export const extract = Effect.fn("OpenApi.extract")(function* (doc: ParsedDocume
       );
       operations.push(
         ExtractedOperation.make({
-          operationId: OperationId.make(deriveOperationId(method, pathTemplate, operation)),
+          operationId: OperationId.make(operationId),
           toolPath: Option.fromNullishOr(explicitToolPath(operation)),
           method,
           servers,
@@ -781,6 +1112,7 @@ export interface OperationBindingChunk {
 interface OperationRef {
   readonly pathItem: PathItemObject;
   readonly operation: OperationObject;
+  readonly operationId: string;
   readonly method: HttpMethod;
   /** Resolved path template (`x-executor-pathTemplate` override or the key). */
   readonly pathTemplate: string;
@@ -847,7 +1179,13 @@ export const streamOperationBindings = <E, R>(
           pathTemplate: resolvedPathTemplate,
           tag0: tags[0],
         });
-        opRefs.push({ pathItem, operation, method, pathTemplate: resolvedPathTemplate });
+        opRefs.push({
+          pathItem,
+          operation,
+          operationId: deriveOperationId(method, pathTemplate, operation),
+          method,
+          pathTemplate: resolvedPathTemplate,
+        });
       }
     }
 
@@ -869,8 +1207,12 @@ export const streamOperationBindings = <E, R>(
       const sensitivity = operationSensitivity({
         parameters,
         requestBody,
-        responseBody,
+        rawOperation: ref.operation,
         resolver: r,
+        operationId: ref.operationId,
+        method: ref.method,
+        pathTemplate: ref.pathTemplate,
+        rawServers: ref.operation.servers ?? ref.pathItem.servers ?? doc.servers ?? [],
       });
       const requiredScopeAlternatives = securityScopeAlternatives(
         ref.operation,
@@ -889,6 +1231,7 @@ export const streamOperationBindings = <E, R>(
           parameters,
           requestBody: Option.fromNullishOr(requestBody),
           responseBody: Option.fromNullishOr(responseBody),
+          sensitivityVersion: 1,
           ...sensitivity,
           ...(requiredScopeAlternatives ? { requiredScopeAlternatives } : {}),
         }),
@@ -1014,8 +1357,12 @@ export const streamOperationBindingsFromStructure = <E, R>(
         const sensitivity = operationSensitivity({
           parameters,
           requestBody,
-          responseBody,
+          rawOperation: operation,
           resolver: r,
+          operationId: deriveOperationId(method, path, operation),
+          method,
+          pathTemplate: resolvedPathTemplate,
+          rawServers: operation.servers ?? pathItem.servers ?? resolverDoc.servers ?? [],
         });
         const requiredScopeAlternatives = securityScopeAlternatives(
           operation,
@@ -1034,6 +1381,7 @@ export const streamOperationBindingsFromStructure = <E, R>(
             parameters,
             requestBody: Option.fromNullishOr(requestBody),
             responseBody: Option.fromNullishOr(responseBody),
+            sensitivityVersion: 1,
             ...sensitivity,
             ...(requiredScopeAlternatives ? { requiredScopeAlternatives } : {}),
           }),

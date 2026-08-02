@@ -204,6 +204,8 @@ const toBinding = (def: ToolDefinition): OperationBinding =>
     ...(def.operation.sensitiveOutputPaths
       ? { sensitiveOutputPaths: def.operation.sensitiveOutputPaths }
       : {}),
+    ...(def.operation.sensitiveResponseHeaders ? { sensitiveResponseHeaders: true } : {}),
+    sensitivityVersion: 1,
     ...(def.operation.requiredScopeAlternatives
       ? { requiredScopeAlternatives: def.operation.requiredScopeAlternatives }
       : {}),
@@ -215,6 +217,23 @@ const descriptionFor = (def: ToolDefinition): string => {
     Option.getOrElse(op.summary, () => `${op.method.toUpperCase()} ${op.pathTemplate}`),
   );
 };
+
+/** Bindings written before opaque sensitivity extraction have no trustworthy
+ * source metadata. Do not turn their unknown inputs into secret sinks, but do
+ * seal every output and header until a normal connection refresh writes a v1
+ * binding from the saved specification. */
+const annotationsForStoredOperation = (binding: OperationBinding) =>
+  annotationsForOperation(
+    binding.method,
+    binding.pathTemplate,
+    binding.sensitivityVersion === 1
+      ? binding
+      : {
+          ...binding,
+          sensitiveOutputPaths: [""],
+          sensitiveResponseHeaders: true,
+        },
+  );
 
 /**
  * Copyable contract appended to the stored description of any tool whose
@@ -721,7 +740,7 @@ const toolDefFromStoredOperation = (op: StoredOperation): ToolDef => {
           onSome: (responseBody) =>
             normalizeOpenApiRefs(outputSchemaFromResponseBody(responseBody)),
         }),
-    annotations: annotationsForOperation(binding.method, binding.pathTemplate, binding),
+    annotations: annotationsForStoredOperation(binding),
   };
 };
 
@@ -997,6 +1016,16 @@ export const invokeOpenApiBackedTool = (input: {
       Object.assign(queryParams, rendered.queryParams);
     }
 
+    // HTTP client spans record full URLs and arbitrary request headers before
+    // tool-result redaction runs. Integration configuration and rendered auth
+    // are both opaque configuration surfaces, so any configured placement
+    // suppresses only the nested transport span while preserving the safe
+    // operation-level observability span.
+    const disableRequestTracing =
+      input.invokeOptions?.disableRequestTracing === true ||
+      Object.keys(headers).length > 0 ||
+      Object.keys(queryParams).length > 0;
+
     const invocation = yield* invokeWithLayer(
       binding,
       (input.args ?? {}) as Record<string, unknown>,
@@ -1004,7 +1033,10 @@ export const invokeOpenApiBackedTool = (input: {
       headers,
       queryParams,
       input.httpClientLayer,
-      input.invokeOptions,
+      {
+        ...input.invokeOptions,
+        ...(disableRequestTracing ? { disableRequestTracing: true } : {}),
+      },
     ).pipe(
       Effect.map((result) => ({ ok: true as const, result })),
       Effect.catchTag("OpenApiInvocationError", (error: OpenApiInvocationError) =>
@@ -1126,11 +1158,7 @@ export const resolveOpenApiBackedAnnotations = (input: {
     for (const row of input.toolRows) {
       const operation = yield* input.ctx.storage.getOperation(input.integration, row.name);
       if (!operation) continue;
-      out[row.name] = annotationsForOperation(
-        operation.binding.method,
-        operation.binding.pathTemplate,
-        operation.binding,
-      );
+      out[row.name] = annotationsForStoredOperation(operation.binding);
     }
     return out;
   });
@@ -1241,6 +1269,9 @@ export const checkHealthOpenApi = (input: {
       Object.assign(queryParams, rendered.queryParams);
     }
 
+    const disableRequestTracing =
+      Object.keys(headers).length > 0 || Object.keys(queryParams).length > 0;
+
     // `invokeWithLayer` fails only with the typed `OpenApiInvocationError`
     // (transport / body-read failures before an HTTP status); fold it onto the
     // success channel so a dead upstream reads as `degraded`, not a thrown error.
@@ -1251,6 +1282,7 @@ export const checkHealthOpenApi = (input: {
       headers,
       queryParams,
       input.httpClientLayer,
+      disableRequestTracing ? { disableRequestTracing: true } : {},
     ).pipe(
       Effect.map((result) => ({ ok: true as const, result })),
       Effect.catch((failure) => Effect.succeed({ ok: false as const, failure })),

@@ -277,8 +277,12 @@ export const createMcpRequestHandler = (
       const response = await readResumeResponse(request);
       if (!response) return json({ error: "Invalid approval response" }, 400);
 
-      await Effect.runPromise(approvals.recordResponse(executionId, response));
-      return json(resumeApprovalResult(executionId, response));
+      const engine = sessionEngines.get(sessionId) ?? defaultEngine;
+      if (!engine) return json({ error: "MCP session not found" }, 404);
+      const granted = await Effect.runPromise(engine.grantLiveApproval(executionId, response));
+      if (!granted) return json({ error: "MCP session not found" }, 404);
+      await Effect.runPromise(approvals.recordResponse(executionId, granted));
+      return json(resumeApprovalResult(executionId, granted));
     },
 
     close: async () => {

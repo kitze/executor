@@ -142,6 +142,9 @@ const MCP_MESSAGE_HEADER = "cf-mcp-message";
 const MODEL_RESUME_FORWARD_TIMEOUT_MS = 10_000;
 const MCP_STREAM_REQS_KEY_PREFIX = "__mcp_stream_reqs__:";
 const approvalResponseKey = (executionId: string) => `approval-response:${executionId}`;
+/** Kept after the response queue is consumed so a later browser POST cannot
+ * overwrite the first terminal decision before the paused execution settles. */
+const approvalDecisionKey = (executionId: string) => `approval-decision:${executionId}`;
 
 type JsonRpcRequestId = string | number;
 const JsonRpcRequestWithId = Schema.Struct({
@@ -903,8 +906,10 @@ export abstract class McpAgentSessionDOBase<
         const paused = yield* self.engine.getPausedExecution(executionId);
         if (!paused) return { status: "not_found" } as const;
 
-        yield* self.recordApprovalResponse(executionId, response);
-        return resumeApprovalResult(executionId, response);
+        const granted = yield* self.engine.grantLiveApproval(executionId, response);
+        if (!granted) return { status: "not_found" } as const;
+        const terminalResponse = yield* self.recordApprovalResponse(executionId, granted);
+        return resumeApprovalResult(executionId, terminalResponse);
       }).pipe(
         Effect.withSpan("McpSessionDO.resumeExecutionForApproval", {
           attributes: { "mcp.execution.id": executionId },
@@ -1074,9 +1079,18 @@ export abstract class McpAgentSessionDOBase<
     const self = this;
     return Effect.gen(function* () {
       if (!self.engine) return null;
-      yield* self.beginPendingApprovalResume(executionId);
-      return yield* self.engine.resume(executionId, response);
-    }).pipe(Effect.ensuring(self.finishPendingApprovalResume(executionId)));
+      const paused = yield* self.engine.getPausedExecution(executionId);
+      // A model-side raw accept cannot release an opaque pause.  Do not clear
+      // its lease while the engine intentionally leaves it paused: the real
+      // browser grant may already be waiting in the approval store.
+      if (paused?.requiresLiveApproval === true && response.action === "accept") {
+        return yield* self.engine.resume(executionId, response);
+      }
+      return yield* Effect.gen(function* () {
+        yield* self.beginPendingApprovalResume(executionId);
+        return yield* self.engine!.resume(executionId, response);
+      }).pipe(Effect.ensuring(self.finishPendingApprovalResume(executionId)));
+    });
   }
 
   private resumeFromExecutionOwnerDirectory(
@@ -1255,6 +1269,13 @@ export abstract class McpAgentSessionDOBase<
       if (lease.timeout) clearTimeout(lease.timeout);
       self.pendingApprovalLeases.delete(executionId);
       lease.disposeKeepAlive();
+      self.approvalResponses.delete(executionId);
+      yield* Effect.promise(() =>
+        self.ctx.storage.delete([
+          approvalResponseKey(executionId),
+          approvalDecisionKey(executionId),
+        ]),
+      );
       yield* self.deleteExecutionOwnerEntry(executionId);
     });
   }
@@ -1273,6 +1294,13 @@ export abstract class McpAgentSessionDOBase<
         self.pendingApprovalLeases.clear();
       });
       for (const executionId of executionIds) {
+        self.approvalResponses.delete(executionId);
+        yield* Effect.promise(() =>
+          self.ctx.storage.delete([
+            approvalResponseKey(executionId),
+            approvalDecisionKey(executionId),
+          ]),
+        );
         yield* self.deleteExecutionOwnerEntry(executionId);
       }
     });
@@ -1281,13 +1309,25 @@ export abstract class McpAgentSessionDOBase<
   private recordApprovalResponse(
     executionId: string,
     response: ResumeResponse,
-  ): Effect.Effect<void> {
+  ): Effect.Effect<ResumeResponse> {
     const self = this;
     return Effect.gen(function* () {
-      self.approvalResponses.set(executionId, response);
-      yield* Effect.promise(() => self.ctx.storage.put(approvalResponseKey(executionId), response));
+      const inMemory = self.approvalResponses.get(executionId);
+      if (inMemory) return inMemory;
+      const terminalResponse = yield* Effect.promise(() =>
+        self.ctx.storage.transaction(async (transaction) => {
+          const key = approvalDecisionKey(executionId);
+          const existing = await transaction.get<ResumeResponse>(key);
+          if (existing) return existing;
+          await transaction.put(key, response);
+          await transaction.put(approvalResponseKey(executionId), response);
+          return response;
+        }),
+      );
+      self.approvalResponses.set(executionId, terminalResponse);
       const waiter = self.approvalWaiters.get(executionId);
-      if (waiter) yield* Deferred.succeed(waiter, response);
+      if (waiter) yield* Deferred.succeed(waiter, terminalResponse);
+      return terminalResponse;
     });
   }
 
@@ -1309,9 +1349,9 @@ export abstract class McpAgentSessionDOBase<
       yield* Effect.sync(() => {
         console.info(JSON.stringify({ event: "mcp_pending_approval_lease_expire", executionId }));
       });
-      yield* self.recordApprovalResponse(executionId, response);
+      const terminalResponse = yield* self.recordApprovalResponse(executionId, response);
       if (self.engine && !self.approvalWaiters.has(executionId)) {
-        yield* self.engine.resume(executionId, response).pipe(Effect.ignore);
+        yield* self.engine.resume(executionId, terminalResponse).pipe(Effect.ignore);
       }
     }).pipe(
       Effect.ensuring(self.releasePendingApprovalLease(executionId)),
@@ -1325,14 +1365,13 @@ export abstract class McpAgentSessionDOBase<
     const self = this;
     return Effect.promise(async () => {
       const memoryResponse = self.approvalResponses.get(executionId);
-      if (memoryResponse) {
-        self.approvalResponses.delete(executionId);
-        await self.ctx.storage.delete(approvalResponseKey(executionId));
-        return memoryResponse;
-      }
-      const stored = await self.ctx.storage.get<ResumeResponse>(approvalResponseKey(executionId));
+      if (memoryResponse) return memoryResponse;
+      // A terminal decision remains readable until the pause settles. It is
+      // not a consumable queue entry: concurrent long-polling retries must
+      // all receive the first decision, while engine resume is idempotent.
+      const stored = await self.ctx.storage.get<ResumeResponse>(approvalDecisionKey(executionId));
       if (!stored) return null;
-      await self.ctx.storage.delete(approvalResponseKey(executionId));
+      self.approvalResponses.set(executionId, stored);
       return stored;
     });
   }
@@ -1346,7 +1385,12 @@ export abstract class McpAgentSessionDOBase<
       const waiter =
         self.approvalWaiters.get(executionId) ?? (yield* Deferred.make<ResumeResponse>());
       self.approvalWaiters.set(executionId, waiter);
-      yield* Deferred.await(waiter).pipe(
+      // The storage read above yields to the event loop. Recheck once the
+      // waiter is registered so a browser decision committed between that
+      // read and registration cannot strand a model resume indefinitely.
+      const racedDecision = yield* self.takeApprovalResponse(executionId);
+      if (racedDecision) return racedDecision;
+      return yield* Deferred.await(waiter).pipe(
         Effect.ensuring(
           Effect.sync(() => {
             if (self.approvalWaiters.get(executionId) === waiter) {
@@ -1355,7 +1399,6 @@ export abstract class McpAgentSessionDOBase<
           }),
         ),
       );
-      return yield* self.takeApprovalResponse(executionId);
     });
   }
 

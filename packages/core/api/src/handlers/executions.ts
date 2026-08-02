@@ -6,7 +6,6 @@ import { ExecutorApi } from "../api";
 import { formatExecuteResult, formatPausedExecution } from "@executor-js/execution";
 import { resolveArtifactAction } from "@executor-js/host-mcp/artifact-action";
 import { TOOL_CALL_CONTRACT_MESSAGE } from "@executor-js/host-mcp/tool-call-code";
-import { PENDING_APPROVAL_TTL_MS } from "@executor-js/sdk";
 import { ExecutionEngineService, ExecutorService } from "../services";
 import { capture, captureEngineError } from "@executor-js/api";
 
@@ -98,84 +97,6 @@ const resolveArtifactCode = (
     });
   });
 
-/**
- * Record a paused artifact call so a later request can honour the approval.
- *
- * Best-effort by design: the in-memory pause is still live and still the fast
- * path, so a storage hiccup here must not turn a working approval into a failed
- * execution. It degrades to exactly the behaviour we had before this record
- * existed.
- */
-const recordPendingApproval = (approval: {
-  readonly executionId: string;
-  readonly artifactId: string;
-  readonly code: string;
-  readonly address: string;
-}): Effect.Effect<void, never, ExecutorService> =>
-  Effect.gen(function* () {
-    const executor = yield* ExecutorService;
-    yield* executor.pendingApprovals
-      .put({ ...approval, expiresAt: Date.now() + PENDING_APPROVAL_TTL_MS })
-      .pipe(Effect.catchCause(() => Effect.void));
-  });
-
-/**
- * Honour an approval whose paused fiber is no longer reachable.
- *
- * The record is read through the caller's OWN scoped executor, so an execution
- * id that is not this caller's reads as absent — the same-query ownership rule
- * the artifact path already uses. It is consumed on read, so one approval
- * authorizes exactly one invocation.
- *
- * A non-accept answer discards the record and reports the decline, which is the
- * same observable outcome as declining a live pause: nothing runs.
- */
-const resumeFromPendingApproval = (executionId: string, action: "accept" | "decline" | "cancel") =>
-  Effect.gen(function* () {
-    const executor = yield* ExecutorService;
-    const engine = yield* ExecutionEngineService;
-
-    const approval = yield* executor.pendingApprovals
-      .consume(executionId)
-      .pipe(Effect.catchCause(() => Effect.succeed(null)));
-    if (!approval) return null;
-
-    if (action !== "accept") {
-      return {
-        status: "completed" as const,
-        text: `Approval ${action === "decline" ? "declined" : "cancelled"}. Nothing ran.`,
-        structured: { status: "declined", executionId, address: approval.address },
-        isError: false,
-      };
-    }
-
-    // The human approved, so run the recorded call with the gate satisfied.
-    // `code` is the address the server itself resolved at pause time, so this
-    // runs exactly the call that was described in the approval prompt.
-    const outcome = yield* captureEngineError(
-      engine.executeWithPause(approval.code, { autoApprove: true }),
-    );
-
-    if (outcome.status === "completed") {
-      const formatted = formatExecuteResult(outcome.result);
-      return {
-        status: "completed" as const,
-        text: formatted.text,
-        structured: formatted.structured,
-        isError: formatted.isError,
-      };
-    }
-
-    // `autoApprove` accepts every gate inline, so a second pause is not
-    // reachable here; surface it rather than silently dropping the call.
-    const formatted = formatPausedExecution(outcome.execution);
-    return {
-      status: "paused" as const,
-      text: formatted.text,
-      structured: formatted.structured,
-    };
-  });
-
 export const ExecutionsHandlers = HttpApiBuilder.group(ExecutorApi, "executions", (handlers) =>
   handlers
     .handle("getPaused", ({ params: path }) =>
@@ -219,23 +140,11 @@ export const ExecutionsHandlers = HttpApiBuilder.group(ExecutorApi, "executions"
             };
           }
 
-          // The pause is a live fiber in THIS engine, which on a host that
-          // builds an engine per request is gone the moment this response is
-          // written. Record the resolved call so the approval can be honoured by
-          // whichever instance serves the resume. Artifact calls only: a general
-          // codemode pause can sit anywhere inside arbitrary code and is not
-          // reconstructible from one address.
-          // Opaque values are scoped to the live execution fiber. Never write
-          // a resumable record for one: after a restart its capabilities must
-          // be unavailable rather than silently reconstructed or resolved.
-          if (payload.artifactId !== undefined && !outcome.execution.hasOpaqueValues) {
-            yield* recordPendingApproval({
-              executionId: outcome.execution.id,
-              artifactId: payload.artifactId,
-              code,
-              address: String(outcome.execution.elicitationContext.address),
-            });
-          }
+          // A paused fiber is the only authority that can resume code. Do not
+          // persist/replay code after a process hop: even an artifact's narrow
+          // one-call source can evolve behind an approval boundary, and a later
+          // replay with auto-approval could read then release a new secret. A
+          // restarted caller must execute again and receive a fresh approval.
 
           const formatted = formatPausedExecution(outcome.execution);
           return {
@@ -250,19 +159,19 @@ export const ExecutionsHandlers = HttpApiBuilder.group(ExecutorApi, "executions"
       capture(
         Effect.gen(function* () {
           const engine = yield* ExecutionEngineService;
-          const result = yield* captureEngineError(
-            engine.resume(path.executionId, {
-              action: payload.action,
-              content: payload.content as Record<string, unknown> | undefined,
-            }),
-          );
+          const granted = yield* engine.grantLiveApproval(path.executionId, {
+            action: payload.action,
+            content: payload.content as Record<string, unknown> | undefined,
+          });
+          if (!granted) {
+            return yield* new ApprovalExpiredError({ executionId: path.executionId });
+          }
+          const result = yield* captureEngineError(engine.resume(path.executionId, granted));
 
-          // No live pause: either this resume landed on a different engine
-          // instance than the pause did (the normal case on a host that builds
-          // an engine per request), or the window really has closed.
+          // No live pause means the process/human approval window changed. It
+          // is intentionally non-replayable: start a fresh execution so every
+          // step, including any later secret read, receives a fresh approval.
           if (!result) {
-            const honoured = yield* resumeFromPendingApproval(path.executionId, payload.action);
-            if (honoured) return honoured;
             return yield* new ApprovalExpiredError({ executionId: path.executionId });
           }
 

@@ -104,8 +104,11 @@ export {
   makeOpaqueValueHandoff,
   isOpaqueValueReference,
   OPAQUE_VALUE_TAG,
+  OPAQUE_VALUE_TTL_MS,
   OpaqueValueHandoffError,
   type OpaqueValueHandoff,
+  type OpaqueValueHandoffOptions,
+  type OpaqueValueCallContext,
   type OpaqueValueReference,
 } from "./opaque-value-handoff";
 
@@ -244,15 +247,6 @@ export {
   type PluginBlobStore,
   type OwnerPartitions,
 } from "./blob";
-
-// Durable pending approvals — how an artifact action that paused on a human
-// survives a host whose HTTP API builds a fresh engine per request.
-export {
-  makePendingApprovalStore,
-  PendingApproval,
-  PENDING_APPROVAL_TTL_MS,
-  type PendingApprovalStore,
-} from "./pending-approval";
 
 // Plugin storage.
 export {

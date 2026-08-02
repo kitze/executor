@@ -364,10 +364,19 @@ export const makeInMemoryMcpSessionStore = (
     const response = raw === null ? null : decodeResumeResponse(raw);
     if (!response) return json({ error: "Invalid approval response" }, 400);
 
-    await Effect.runPromise(approvals.recordResponse(executionId, response));
+    const engine = engines.get(sessionId);
+    if (!engine) return json({ error: "Paused execution not found" }, 404);
+    // The authenticated browser endpoint is the only source allowed to mint
+    // a live approval response. The returned object is process-local and is
+    // rejected by the engine if a model/API caller reconstructs raw JSON.
+    const granted = await Effect.runPromise(engine.grantLiveApproval(executionId, response));
+    if (!granted) return json({ error: "Paused execution not found" }, 404);
+    const terminalResponse = await Effect.runPromise(
+      approvals.recordResponse(executionId, granted),
+    );
     return json({
       status: "completed",
-      ...formatResumeAcknowledgement(executionId, response),
+      ...formatResumeAcknowledgement(executionId, terminalResponse),
       isError: false,
     });
   };

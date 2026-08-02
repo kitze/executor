@@ -40,6 +40,9 @@ export type ExecutionResult =
 export type PausedExecution = {
   readonly id: string;
   readonly elicitationContext: ElicitationContext;
+  /** This pause can release an opaque capability only through a server-minted
+   * human approval grant. It is rendering metadata, not the grant itself. */
+  readonly requiresLiveApproval?: boolean;
   /** True means this pause owns in-memory opaque values and must not be
    * reconstructed after a host restart. This is metadata only. */
   readonly hasOpaqueValues?: boolean;
@@ -61,10 +64,6 @@ export type ResumeResponse = {
   readonly action: "accept" | "decline" | "cancel";
   readonly content?: Record<string, unknown>;
 };
-
-// Auto-accept every elicitation. Used by the `autoApprove` path where the
-// caller is itself the human approver (the operator-facing Run/Test panel).
-const acceptAllHandler: ElicitationHandler = () => Effect.succeed({ action: "accept" });
 
 /**
  * Stamp the current `mcp.execute` / `mcp.execute.resume` span with how the
@@ -168,11 +167,14 @@ export const formatPausedExecution = (
   const requestedSchema = isFormElicitation ? req.requestedSchema : undefined;
   const hasRequestedSchema =
     requestedSchema !== undefined && Object.keys(requestedSchema).length > 0;
+  const requiresLiveApproval = paused.requiresLiveApproval === true;
   const baseInstructions = isUrlElicitation
     ? `The user needs to open this URL in a browser and complete the flow. After the user finishes, call the resume tool with executionId "${paused.id}" and action "accept".`
-    : hasRequestedSchema
-      ? `Ask the user for values matching requestedSchema. Then call the resume tool with executionId "${paused.id}", action "accept", and content matching requestedSchema. If the user declines, call resume with action "decline" or "cancel".`
-      : `This is a model-side confirmation gate; there is no browser form to open. Ask the user whether to approve the paused tool call. If the user approves, call the resume tool with executionId "${paused.id}" and action "accept". If the user declines, call resume with action "decline" or "cancel".`;
+    : requiresLiveApproval
+      ? "A trusted human approval endpoint must accept this action before it can resume. A model or app-provided raw accept cannot release it."
+      : hasRequestedSchema
+        ? `Ask the user for values matching requestedSchema. Then call the resume tool with executionId "${paused.id}", action "accept", and content matching requestedSchema. If the user declines, call resume with action "decline" or "cancel".`
+        : `This is a model-side confirmation gate; there is no browser form to open. Ask the user whether to approve the paused tool call. If the user approves, call the resume tool with executionId "${paused.id}" and action "accept". If the user declines, call resume with action "decline" or "cancel".`;
   const deadlineInstructions = deadline
     ? ` Resume before ${deadline.expiresAt}; this approval window lasts ${formatTtlDuration(deadline.ttlMs)}.`
     : "";
@@ -205,6 +207,7 @@ export const formatPausedExecution = (
     structured: {
       status: "waiting_for_interaction",
       executionId: paused.id,
+      ...(requiresLiveApproval ? { requiresLiveApproval: true } : {}),
       ...(deadline ? { expiresAt: deadline.expiresAt, ttlMs: deadline.ttlMs } : {}),
       interaction: {
         kind: isUrlElicitation ? "url" : "form",
@@ -423,11 +426,9 @@ export type ExecutionEngine<E extends Cause.YieldableError = CodeExecutionError>
    * Use this when the host doesn't support inline elicitation.
    * Returns either a completed result or a paused execution that can be resumed.
    *
-   * `options.autoApprove` treats the caller as the human in the loop: every
-   * elicitation is accepted inline, so an approval-gated tool runs to
-   * completion instead of pausing. The operator-facing Run/Test panel sets
-   * this because clicking Run IS the approval. `block` policies still fail
-   * before any elicitation, so this never bypasses a hard block.
+   * `options.autoApprove` accepts ordinary gates inline for the operator-facing
+   * Run/Test panel. A gate that consumes an opaque secret always pauses for a
+   * separate live approval; a transport flag can never authorize its release.
    */
   readonly executeWithPause: (
     code: string,
@@ -442,6 +443,14 @@ export type ExecutionEngine<E extends Cause.YieldableError = CodeExecutionError>
     executionId: string,
     response: ResumeResponse,
   ) => Effect.Effect<ExecutionResult | null, E>;
+
+  /** Mint a one-shot, in-memory approval response after an authenticated human
+   * approval endpoint has accepted the decision. The returned object is bound
+   * to this live pause and cannot be reconstructed from JSON after a restart. */
+  readonly grantLiveApproval: (
+    executionId: string,
+    response: ResumeResponse,
+  ) => Effect.Effect<ResumeResponse | null>;
 
   /**
    * True when the engine remembers that an executionId has already settled, even
@@ -485,6 +494,10 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
   // Resumes whose outcome is still being computed, so a concurrent duplicate
   // awaits the same result instead of missing the (already-consumed) pause.
   const pendingResumes = new Map<string, Deferred.Deferred<ExecutionResult, E>>();
+  // A browser/native approval endpoint gets an object from `grantLiveApproval`
+  // only after authenticating a human. A model can serialize a matching action
+  // but cannot reconstruct this process-local WeakMap membership.
+  const liveApprovalResponses = new WeakMap<object, string>();
 
   // Exits (not just successes) so a replayed failure re-fails through the
   // typed channel — hosts render engine failures opaquely, and a replay must
@@ -545,28 +558,29 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
       "mcp.execute.code_length": code.length,
     });
 
-    // Operator-approved invoke: run through the inline path with an accept-all
-    // handler so an approval gate resolves itself instead of pausing. Never
-    // pauses, so the caller always gets a completed result.
-    if (options?.autoApprove) {
-      yield* Effect.annotateCurrentSpan({ "mcp.execute.auto_approve": true });
-      const result = yield* runInlineExecution(code, { onElicitation: acceptAllHandler });
-      yield* annotateExecuteOutcome(result);
-      return { status: "completed", result } satisfies ExecutionResult;
-    }
+    const autoApprove = options?.autoApprove === true;
+    if (autoApprove) yield* Effect.annotateCurrentSpan({ "mcp.execute.auto_approve": true });
 
     // Queue preserves pauses that arrive before the previous approval has
     // returned to the caller, which can happen with concurrent tool calls.
     const pauseQueue = yield* Queue.unbounded<InternalPausedExecution<E>>();
     // The store belongs to this one fiber and survives its pauses/resumes. It
     // deliberately disappears on restart instead of becoming durable state.
-    const opaqueValueHandoff = makeOpaqueValueHandoff();
+    const opaqueValueHandoff = makeOpaqueValueHandoff({
+      executionId: `opaque_${crypto.randomUUID()}`,
+    });
 
     // Will be set once the fiber is forked.
     let fiber: Fiber.Fiber<ExecuteResult, E>;
 
     const elicitationHandler: ElicitationHandler = (ctx) =>
       Effect.gen(function* () {
+        // `autoApprove` is a convenience for ordinary Run/Test flows, not a
+        // secret-release authority. Once an opaque value reaches a sink, keep
+        // the active fiber and pause it for the browser/MCP human decision.
+        if (autoApprove && !ctx.requiresLiveApproval) {
+          return { action: "accept" };
+        }
         const responseDeferred = yield* Deferred.make<typeof ElicitationResponse.Type>();
         // Globally unique — engine instances are rebuilt on host restarts
         // (Durable Object cold restores, redeploys), so a counter would
@@ -577,6 +591,7 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
         const paused: InternalPausedExecution<E> = {
           id,
           elicitationContext: ctx,
+          ...(ctx.requiresLiveApproval ? { requiresLiveApproval: true } : {}),
           ...(opaqueValueHandoff.hasOpaqueValues() ? { hasOpaqueValues: true } : {}),
           response: responseDeferred,
           fiber: fiber!,
@@ -616,6 +631,11 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
               exit,
               (result): ExecutionResult => ({ status: "completed", result }),
             );
+            // The fiber has already mapped its public result through redact,
+            // so no later caller needs the raw source values. Clear both
+            // single-use handles and their redaction material promptly rather
+            // than retaining a paused execution's secrets until process exit.
+            opaqueValueHandoff.dispose();
             for (const [id, paused] of pausedExecutions) {
               if (paused.fiber !== sandboxFiber) continue;
               pausedExecutions.delete(id);
@@ -666,7 +686,20 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
 
     const paused = pausedExecutions.get(executionId);
     if (!paused) return null;
+    if (
+      paused.requiresLiveApproval === true &&
+      response.action === "accept" &&
+      liveApprovalResponses.get(response) !== executionId
+    ) {
+      // Keep the live pause intact. A raw model/app/API `accept` is neither a
+      // human decision nor a consumable grant, so it must not become a denial
+      // or a release merely by racing the real browser approval.
+      yield* Effect.annotateCurrentSpan({ "mcp.execute.resume.live_grant_missing": true });
+      return { status: "paused" as const, execution: paused };
+    }
     pausedExecutions.delete(executionId);
+
+    if (response.action === "accept") liveApprovalResponses.delete(response);
 
     const inflight = yield* Deferred.make<ExecutionResult, E>();
     pendingResumes.set(executionId, inflight);
@@ -701,11 +734,19 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
       "mcp.execute.mode": "inline",
       "mcp.execute.code_length": code.length,
     });
-    const opaqueValueHandoff = makeOpaqueValueHandoff();
+    const opaqueValueHandoff = makeOpaqueValueHandoff({
+      executionId: `opaque_${crypto.randomUUID()}`,
+    });
     const invoker = makeFullInvoker(
       executor,
       {
-        onElicitation: options.onElicitation,
+        onElicitation: (context) =>
+          context.requiresLiveApproval
+            ? // Inline callbacks are ordinary in-process control flow, not a
+              // browser/native approval capability. Route opaque handoffs
+              // through executeWithPause + grantLiveApproval instead.
+              Effect.succeed({ action: "decline" } satisfies ElicitationResponse)
+            : options.onElicitation(context),
         opaqueValueHandoff,
       },
       toolDiscoveryProvider,
@@ -713,7 +754,8 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
     const result = yield* codeExecutor
       .execute(code, invoker)
       .pipe(Effect.map((result) => opaqueValueHandoff.redact(result) as ExecuteResult))
-      .pipe(Effect.withSpan("executor.code.exec"));
+      .pipe(Effect.withSpan("executor.code.exec"))
+      .pipe(Effect.ensuring(Effect.sync(() => opaqueValueHandoff.dispose())));
     yield* annotateExecuteOutcome(result);
     return result;
   });
@@ -722,6 +764,15 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
     execute: runInlineExecution,
     executeWithPause: startPausableExecution,
     resume: resumeExecution,
+    grantLiveApproval: (executionId, response) =>
+      Effect.sync(() => {
+        const paused = pausedExecutions.get(executionId);
+        if (!paused) return null;
+        if (response.action !== "accept" || paused.requiresLiveApproval !== true) return response;
+        const granted = { ...response };
+        liveApprovalResponses.set(granted, executionId);
+        return granted;
+      }),
     isExecutionSettled: (executionId) => Effect.sync(() => settledExecutionIds.has(executionId)),
     getPausedExecution: (executionId) =>
       Effect.sync(() => pausedExecutions.get(executionId) ?? null),

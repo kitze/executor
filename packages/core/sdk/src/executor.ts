@@ -16,7 +16,7 @@ import {
   type StorageFailure,
 } from "./fuma-runtime";
 import { makeFumaBlobStore, pluginBlobStore, type BlobStore, type OwnerPartitions } from "./blob";
-import { makePendingApprovalStore, type PendingApprovalStore } from "./pending-approval";
+import type { OpaqueValueCallContext } from "./opaque-value-handoff";
 import { coreToolsPlugin } from "./core-tools";
 import type {
   Connection,
@@ -411,16 +411,6 @@ export type Executor<TPlugins extends readonly AnyPlugin[] = readonly []> = {
       input: SetArtifactPreviewInput,
     ) => Effect.Effect<void, ArtifactNotFoundError | StorageFailure>;
   };
-
-  /**
-   * Approvals recorded for artifact-originated calls that paused on a human.
-   *
-   * Scoped to this executor's owner, so a record is only readable by the caller
-   * who created it — the ownership check on resume is the same read that fetches
-   * it. See `pending-approval.ts` for why an artifact pause is reconstructible
-   * when a general codemode pause is not.
-   */
-  readonly pendingApprovals: PendingApprovalStore;
 
   readonly execute: (
     address: ToolAddress,
@@ -4257,9 +4247,17 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       policy: EffectivePolicy,
       handler: ElicitationHandler,
       consumesOpaqueValue: boolean,
+      nonInteractiveApproval: boolean,
     ) =>
       Effect.gen(function* () {
         if (!approvalRequired(annotations, policy, consumesOpaqueValue)) return;
+        // `accept-all` is useful for non-sensitive test/automation flows, but
+        // it is not a human approval capability for releasing an opaque value.
+        // The engine's pausable Run/Test path supplies its own handler and will
+        // pause instead; a direct noninteractive SDK call fails closed here.
+        if (consumesOpaqueValue && nonInteractiveApproval) {
+          return yield* new ElicitationDeclinedError({ address, action: "decline" });
+        }
         const policyForcesApproval = policy.action === "require_approval";
         const message = annotations?.approvalDescription
           ? annotations.approvalDescription
@@ -4270,7 +4268,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           message,
           requestedSchema: { type: "object", properties: {} },
         });
-        const response = yield* handler({ address, request });
+        const response = yield* handler({
+          address,
+          request,
+          ...(consumesOpaqueValue ? { requiresLiveApproval: true } : {}),
+        });
         if (response.action !== "accept") {
           return yield* new ElicitationDeclinedError({
             address,
@@ -4329,18 +4331,50 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     ): Effect.Effect<unknown, ExecuteError> => {
       const handler = pickHandler(options);
       const opaqueValues = options?.opaqueValueHandoff;
+      const nonInteractiveApproval =
+        (options?.onElicitation ?? config.onElicitation) === "accept-all";
       return Effect.gen(function* () {
-        const prepareOpaqueInput = (annotations: ToolAnnotations | undefined) =>
+        // This identity is constructed inside the scoped executor and is never
+        // exposed through sandbox values or approval payloads. An opaque
+        // capability is bound to this execution by its handoff store and here
+        // to the actual integration, connection, operation, and tenant subject.
+        const opaquePrincipal = `${tenant}\u0000${subject ?? ""}`;
+        const staticOpaqueContext = (entry: StaticTools): OpaqueValueCallContext => ({
+          principal: opaquePrincipal,
+          integration: entry.integration.id,
+          connection: String(staticToolConnection(entry.integration)),
+          operation: entry.tool.name,
+        });
+        const dynamicOpaqueContext = (parsed: ParsedToolAddress): OpaqueValueCallContext => ({
+          principal: opaquePrincipal,
+          integration: String(parsed.integration),
+          connection: String(parsed.connection),
+          operation: String(parsed.tool),
+        });
+
+        const prepareOpaqueInput = (
+          annotations: ToolAnnotations | undefined,
+          context: OpaqueValueCallContext,
+        ) =>
           opaqueValues
-            ? opaqueValues.prepareInputForValidation(args, annotations?.sensitiveInputPaths)
+            ? opaqueValues.prepareInputForValidation(
+                args,
+                annotations?.sensitiveInputPaths,
+                context,
+              )
             : { value: args, containsOpaqueValue: false };
 
         const resolveOpaqueInput = (
           annotations: ToolAnnotations | undefined,
           prepared: { readonly containsOpaqueValue: boolean },
+          context: OpaqueValueCallContext,
         ): unknown =>
           prepared.containsOpaqueValue && opaqueValues
-            ? opaqueValues.resolveInputAfterApproval(args, annotations?.sensitiveInputPaths)
+            ? opaqueValues.resolveInputAfterApproval(
+                args,
+                annotations?.sensitiveInputPaths,
+                context,
+              )
             : args;
 
         // Protect declared sensitive response fields, then redact every value
@@ -4350,16 +4384,52 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         const protectInvocationResult = (
           value: unknown,
           annotations: ToolAnnotations | undefined,
+          context: OpaqueValueCallContext,
         ): unknown => {
           if (!opaqueValues) return value;
           if (isToolResult(value)) {
-            if (!value.ok) return opaqueValues.redact(value);
+            const hasSensitiveOutput =
+              (annotations?.sensitiveOutputPaths?.length ?? 0) > 0 ||
+              annotations?.sensitiveResponseHeaders === true;
+            const hasSensitiveTransport =
+              hasSensitiveOutput || (annotations?.sensitiveInputPaths?.length ?? 0) > 0;
+            if (!value.ok) {
+              // Error payloads are upstream-controlled and can contain the
+              // same secret-bearing response shape as a successful call. They
+              // are not a usable source capability, so retain only safe status
+              // metadata rather than accidentally surfacing a secret in
+              // `error.message` or `error.details`.
+              if (hasSensitiveTransport) {
+                return {
+                  ok: false,
+                  error: {
+                    code: value.error.code,
+                    message: "Upstream request failed.",
+                    ...(value.error.status !== undefined ? { status: value.error.status } : {}),
+                    ...(value.error.retryable !== undefined
+                      ? { retryable: value.error.retryable }
+                      : {}),
+                  },
+                };
+              }
+              return opaqueValues.redact(value);
+            }
             return opaqueValues.redact({
               ...value,
-              data: opaqueValues.protectOutput(value.data, annotations?.sensitiveOutputPaths),
+              data: opaqueValues.protectOutput(
+                value.data,
+                annotations?.sensitiveOutputPaths,
+                context,
+              ),
+              // Response headers have no schema-level projection today. When
+              // a response body contains a declared secret, do not make an
+              // unclassified header an alternate plaintext output channel.
+              ...(hasSensitiveTransport && value.http
+                ? { http: { ...value.http, headers: {} } }
+                : {}),
             });
           }
-          return opaqueValues.protectOutput(value, annotations?.sensitiveOutputPaths);
+          return opaqueValues.protectOutput(value, annotations?.sensitiveOutputPaths, context);
         };
 
         // oxlint-disable executor/no-instanceof-error, executor/no-unknown-error-message, executor/no-manual-tag-check -- boundary: normalize arbitrary unknown plugin failures into a human-readable message for ToolInvocationError/telemetry
@@ -4378,9 +4448,21 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // oxlint-enable executor/no-instanceof-error, executor/no-unknown-error-message, executor/no-manual-tag-check
         const wrapInvocationError = <A, E>(
           effect: Effect.Effect<A, E>,
+          annotations?: ToolAnnotations,
         ): Effect.Effect<A, ToolInvocationError> =>
           effect.pipe(
             Effect.mapError((cause) => {
+              const hasSensitiveTransport =
+                (annotations?.sensitiveInputPaths?.length ?? 0) > 0 ||
+                (annotations?.sensitiveOutputPaths?.length ?? 0) > 0 ||
+                annotations?.sensitiveResponseHeaders === true;
+              if (hasSensitiveTransport) {
+                return new ToolInvocationError({
+                  address,
+                  message: "Upstream request failed.",
+                  cause: { _tag: "SensitiveToolInvocationFailure" },
+                });
+              }
               const safeCause = opaqueValues ? opaqueValues.redact(cause) : cause;
               return new ToolInvocationError({
                 address,
@@ -4409,23 +4491,37 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               pattern: policy.pattern ?? "*",
             });
           }
-          const prepared = prepareOpaqueInput(staticEntry.tool.annotations);
+          const opaqueContext = staticOpaqueContext(staticEntry);
+          const prepared = prepareOpaqueInput(staticEntry.tool.annotations, opaqueContext);
           yield* enforceApproval(
             staticEntry.tool.annotations,
             address,
             policy,
             handler,
             prepared.containsOpaqueValue,
+            nonInteractiveApproval,
           );
-          const invocationArgs = resolveOpaqueInput(staticEntry.tool.annotations, prepared);
+          const invocationArgs = resolveOpaqueInput(
+            staticEntry.tool.annotations,
+            prepared,
+            opaqueContext,
+          );
+          const staticSensitiveTransportTracingDisabled =
+            (staticEntry.tool.annotations?.sensitiveInputPaths?.length ?? 0) > 0 ||
+            (staticEntry.tool.annotations?.sensitiveOutputPaths?.length ?? 0) > 0 ||
+            staticEntry.tool.annotations?.sensitiveResponseHeaders === true;
+          const invocation = staticEntry.tool.handler({
+            ctx: staticEntry.ctx,
+            args: invocationArgs,
+            elicit: buildElicit(address, handler),
+          });
           const result = yield* wrapInvocationError(
-            staticEntry.tool.handler({
-              ctx: staticEntry.ctx,
-              args: invocationArgs,
-              elicit: buildElicit(address, handler),
-            }),
+            staticSensitiveTransportTracingDisabled
+              ? invocation.pipe(Effect.withTracerEnabled(false))
+              : invocation,
+            staticEntry.tool.annotations,
           );
-          return protectInvocationResult(result, staticEntry.tool.annotations);
+          return protectInvocationResult(result, staticEntry.tool.annotations, opaqueContext);
         }
 
         const parsed = parseToolAddress(String(address));
@@ -4515,7 +4611,16 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             .pipe(wrapInvocationError);
           resolvedAnnotations = map[String(parsed.tool)] ?? annotations;
         }
-        const prepared = prepareOpaqueInput(resolvedAnnotations);
+        // A transport span may see a fully materialized validation request
+        // before the real invocation reaches its redaction boundary. Treat
+        // preflight exactly like the call itself: no nested tracing when either
+        // declared direction contains sensitive material.
+        const opaqueContext = dynamicOpaqueContext(parsed);
+        const sensitiveTransportTracingDisabled =
+          (resolvedAnnotations?.sensitiveInputPaths?.length ?? 0) > 0 ||
+          (resolvedAnnotations?.sensitiveOutputPaths?.length ?? 0) > 0 ||
+          resolvedAnnotations?.sensitiveResponseHeaders === true;
+        const prepared = prepareOpaqueInput(resolvedAnnotations, opaqueContext);
         const requiresApproval = approvalRequired(
           resolvedAnnotations,
           policy,
@@ -4527,13 +4632,19 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // that then goes to waste. Non-pausing calls skip this — invokeTool
         // raises the identical failure moments later without the extra pass.
         if (requiresApproval && runtime.plugin.validateToolArgs) {
-          yield* runtime.plugin
+          const validation = runtime.plugin
             .validateToolArgs({
               ctx: runtime.ctx,
               toolRow: row,
               args: prepared.containsOpaqueValue ? prepared.value : args,
             })
-            .pipe(wrapInvocationError);
+            .pipe(
+              sensitiveTransportTracingDisabled
+                ? Effect.withTracerEnabled(false)
+                : (effect) => effect,
+              wrapInvocationError,
+            );
+          yield* validation;
         }
         yield* enforceApproval(
           resolvedAnnotations,
@@ -4541,6 +4652,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           policy,
           handler,
           prepared.containsOpaqueValue,
+          nonInteractiveApproval,
         );
 
         // Resolve every named credential input (`variable → value`); `value` is
@@ -4552,7 +4664,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // This is the first point the actual opaque value can reach any plugin
         // code. Credential resolution and preflight validation already ran;
         // the human gate above must have accepted an opaque-consuming call.
-        const invocationArgs = resolveOpaqueInput(resolvedAnnotations, prepared);
+        const invocationArgs = resolveOpaqueInput(resolvedAnnotations, prepared, opaqueContext);
+        // A transport span may see the fully materialized request before input
+        // redaction, and an upstream client/error implementation may retain a
+        // response body before output redaction.  Disable nested transport
+        // tracing for either declared direction; the enclosing executor span
+        // retains only safe tool metadata and the redacted outcome.
         const invokeWith = (
           resolved: Record<string, string | null>,
         ): Effect.Effect<unknown, ToolInvocationError> => {
@@ -4566,15 +4683,27 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             config: integrationRow ? decodeJsonColumn(integrationRow.config) : undefined,
             ...(grantedScopes ? { grantedScopes } : {}),
           };
+          const invocation = invokeTool({
+            ctx: runtime.ctx,
+            toolRow: row,
+            credential,
+            args: invocationArgs,
+            elicit: buildElicit(address, handler),
+            invokeOptions: {
+              ...options,
+              ...(sensitiveTransportTracingDisabled
+                ? { disableSensitiveRequestTracing: true }
+                : {}),
+            },
+          });
+          // Effect's HTTP client records raw URLs and arbitrary headers before
+          // executor-level result redaction runs. Disable nested tracing for a
+          // declared sensitive transport in either direction.
           return wrapInvocationError(
-            invokeTool({
-              ctx: runtime.ctx,
-              toolRow: row,
-              credential,
-              args: invocationArgs,
-              elicit: buildElicit(address, handler),
-              invokeOptions: options,
-            }),
+            sensitiveTransportTracingDisabled
+              ? invocation.pipe(Effect.withTracerEnabled(false))
+              : invocation,
+            resolvedAnnotations,
           );
         };
 
@@ -4595,7 +4724,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // still surfaces the upstream's own auth failure and its reconnect
         // guidance rather than a masked one.
         if (!isUnauthorizedToolFailure(first)) {
-          return protectInvocationResult(first, resolvedAnnotations);
+          return protectInvocationResult(first, resolvedAnnotations, opaqueContext);
         }
         const refreshed = yield* forceRefreshConnectionValues(connectionRow).pipe(
           // A failed re-mint is not this call's failure to report: the upstream
@@ -4603,9 +4732,13 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           // strictly more actionable than a refresh-plumbing error. Keep it.
           Effect.catchTag("CredentialResolutionError", () => Effect.succeed(null)),
         );
-        if (!refreshed) return protectInvocationResult(first, resolvedAnnotations);
+        if (!refreshed) return protectInvocationResult(first, resolvedAnnotations, opaqueContext);
         yield* Effect.annotateCurrentSpan({ "executor.oauth.refresh.retried": true });
-        return protectInvocationResult(yield* invokeWith(refreshed), resolvedAnnotations);
+        return protectInvocationResult(
+          yield* invokeWith(refreshed),
+          resolvedAnnotations,
+          opaqueContext,
+        );
       }).pipe(
         // Expected tool failures (`ToolResult.fail`) resolve through the
         // success channel, so the tracer alone would record them as healthy
@@ -4680,16 +4813,6 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       org: `o:${tenant}`,
       user: subject != null ? `u:${tenant}:${subject}` : null,
     };
-
-    // Pending approvals file under the narrowest partition this executor has:
-    // a subject-bound executor keeps them private to that member, and a pure-org
-    // executor (no subject) files them at the org. Either way the partition IS
-    // the ownership check — another caller's executor reads a different
-    // namespace and simply does not see the record.
-    const pendingApprovals = makePendingApprovalStore(
-      blobs,
-      blobPartitions.user ?? blobPartitions.org,
-    );
 
     for (const plugin of plugins) {
       if (runtimes.has(plugin.id)) {
@@ -5095,7 +5218,6 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         remove: artifactsRemove,
         setPreview: artifactsSetPreview,
       },
-      pendingApprovals,
       execute,
       close,
     };

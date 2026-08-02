@@ -16,6 +16,7 @@ import {
 
 class MemoryStorage {
   private readonly data = new Map<string, unknown>();
+  private transactionTail: Promise<void> = Promise.resolve();
   alarm: number | undefined;
 
   readonly sql = {
@@ -28,6 +29,18 @@ class MemoryStorage {
 
   async put(key: string, value: unknown): Promise<void> {
     this.data.set(key, value);
+  }
+
+  async transaction<T>(
+    callback: (storage: Pick<MemoryStorage, "get" | "put">) => Promise<T>,
+  ): Promise<T> {
+    const previous = this.transactionTail;
+    let release: () => void = () => undefined;
+    this.transactionTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    return callback(this).finally(release);
   }
 
   async setAlarm(time: number | Date): Promise<void> {
@@ -107,6 +120,17 @@ type HarnessSession = {
   }) => Promise<"ok" | "not_found" | "forbidden" | "terminated">;
 };
 
+type ApprovalRaceHarnessSession = HarnessSession & {
+  approvalResponses: Map<string, ResumeResponse>;
+  approvalWaiters: Map<string, unknown>;
+  resumeExecutionForApproval: (
+    executionId: string,
+    identity: McpApprovalOwner,
+    response: ResumeResponse,
+  ) => Promise<unknown>;
+  takeApprovalResponse: (executionId: string) => Effect.Effect<ResumeResponse | null>;
+};
+
 class StaleCloseTransport implements Transport {
   onclose?: () => void;
   onerror?: (error: Error) => void;
@@ -168,6 +192,7 @@ const makeEngine = (
           calls.push({ executionId, response });
           return resultForResume(executionId, response);
         }),
+      grantLiveApproval: (_executionId, response) => Effect.succeed(response),
       getPausedExecution: () => Effect.succeed(null),
       pausedExecutionCount: () => Effect.succeed(0),
       hasPausedExecutions: () => Effect.succeed(false),
@@ -481,5 +506,41 @@ describe("McpAgentSessionDOBase transport restore", () => {
     });
     expect(onStartCalls).toBe(1);
     expect(restoredEngine.calls).toEqual([{ executionId: "exec-model", response: approval }]);
+  });
+});
+
+describe("McpAgentSessionDOBase browser approval decisions", () => {
+  it("keeps the first concurrent durable browser decision terminal across a memory reset", async () => {
+    const session = (await makeHarnessSession()) as ApprovalRaceHarnessSession;
+    session.approvalResponses = new Map();
+    session.approvalWaiters = new Map();
+    session.engine = {
+      ...makeEngine().engine,
+      getPausedExecution: () => Effect.succeed({} as never),
+    };
+
+    const executionId = "exec-first-terminal";
+    const identity = { accountId: "user-1", organizationId: "org-1" };
+    const first = { action: "decline" as const, content: { reason: "first" } };
+    const later = { action: "accept" as const, content: { reason: "later" } };
+    const [firstResult, laterResult] = await Promise.all([
+      session.resumeExecutionForApproval(executionId, identity, first),
+      session.resumeExecutionForApproval(executionId, identity, later),
+    ]);
+
+    expect(firstResult).toMatchObject({
+      status: "ok",
+      structured: { status: "denied", executionId },
+    });
+    expect(laterResult).toMatchObject({
+      status: "ok",
+      structured: { status: "denied", executionId },
+    });
+    expect(await Effect.runPromise(session.takeApprovalResponse(executionId))).toEqual(first);
+
+    // Model a Durable Object eviction: only the persisted terminal decision
+    // survives, and a later read must still return that first decision.
+    session.approvalResponses.clear();
+    expect(await Effect.runPromise(session.takeApprovalResponse(executionId))).toEqual(first);
   });
 });
