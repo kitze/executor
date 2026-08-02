@@ -174,7 +174,7 @@ const makePausedResult = (
   status: "paused",
   execution: {
     id,
-    elicitationContext: { address: STUB_TOOL_ADDRESS, args: {}, request },
+    elicitationContext: { address: STUB_TOOL_ADDRESS, request },
   },
 });
 
@@ -204,7 +204,6 @@ const makeElicitingEngine = (
       Effect.gen(function* () {
         const response = yield* onElicitation({
           address: STUB_TOOL_ADDRESS,
-          args: {},
           request,
         });
         return { result: formatResult(response) };
@@ -1739,7 +1738,6 @@ describe("MCP host server — multiple elicitations", () => {
         Effect.gen(function* () {
           const r1 = yield* onElicitation({
             address: STUB_TOOL_ADDRESS,
-            args: {},
             request: FormElicitation.make({
               message: "What is your name?",
               requestedSchema: {
@@ -1751,7 +1749,6 @@ describe("MCP host server — multiple elicitations", () => {
 
           const r2 = yield* onElicitation({
             address: STUB_TOOL_ADDRESS,
-            args: {},
             request: FormElicitation.make({
               message: `Confirm: ${r1.content?.name}?`,
               requestedSchema: {

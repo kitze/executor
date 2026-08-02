@@ -36,7 +36,6 @@ const pausedResult: ExecutionResult = {
     id: "exec-1",
     elicitationContext: {
       address: ToolAddress.make("github.issues.create"),
-      args: {},
       request: UrlElicitation.make({
         message: "approve",
         url: "https://example.test/approve",

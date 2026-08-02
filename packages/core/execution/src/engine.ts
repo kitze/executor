@@ -9,6 +9,7 @@ import type {
   ElicitationHandler,
   ElicitationContext,
 } from "@executor-js/sdk/core";
+import { makeOpaqueValueHandoff } from "@executor-js/sdk/core";
 import { CodeExecutionError } from "@executor-js/codemode-core";
 import type { CodeExecutor, ExecuteResult, SandboxToolInvoker } from "@executor-js/codemode-core";
 
@@ -39,6 +40,9 @@ export type ExecutionResult =
 export type PausedExecution = {
   readonly id: string;
   readonly elicitationContext: ElicitationContext;
+  /** True means this pause owns in-memory opaque values and must not be
+   * reconstructed after a host restart. This is metadata only. */
+  readonly hasOpaqueValues?: boolean;
 };
 
 export type PausedExecutionDeadline = {
@@ -188,7 +192,6 @@ export const formatPausedExecution = (
         message: req.message,
         instructions,
         address: String(paused.elicitationContext.address),
-        args: paused.elicitationContext.args,
         ...(isUrlElicitation ? { url: req.url } : {}),
         ...(isFormElicitation ? { requestedSchema: req.requestedSchema } : {}),
       },
@@ -535,6 +538,9 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
     // Queue preserves pauses that arrive before the previous approval has
     // returned to the caller, which can happen with concurrent tool calls.
     const pauseQueue = yield* Queue.unbounded<InternalPausedExecution<E>>();
+    // The store belongs to this one fiber and survives its pauses/resumes. It
+    // deliberately disappears on restart instead of becoming durable state.
+    const opaqueValueHandoff = makeOpaqueValueHandoff();
 
     // Will be set once the fiber is forked.
     let fiber: Fiber.Fiber<ExecuteResult, E>;
@@ -551,6 +557,7 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
         const paused: InternalPausedExecution<E> = {
           id,
           elicitationContext: ctx,
+          ...(opaqueValueHandoff.hasOpaqueValues() ? { hasOpaqueValues: true } : {}),
           response: responseDeferred,
           fiber: fiber!,
           pauseQueue,
@@ -565,11 +572,14 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
 
     const invoker = makeFullInvoker(
       executor,
-      { onElicitation: elicitationHandler },
+      { onElicitation: elicitationHandler, opaqueValueHandoff },
       toolDiscoveryProvider,
     );
     fiber = yield* Effect.forkDetach(
-      codeExecutor.execute(code, invoker).pipe(Effect.withSpan("executor.code.exec")),
+      codeExecutor
+        .execute(code, invoker)
+        .pipe(Effect.map((result) => opaqueValueHandoff.redact(result) as ExecuteResult))
+        .pipe(Effect.withSpan("executor.code.exec")),
     );
 
     // When the fiber settles on its own (sandbox timeout, failure) while
@@ -663,14 +673,19 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
       "mcp.execute.mode": "inline",
       "mcp.execute.code_length": code.length,
     });
+    const opaqueValueHandoff = makeOpaqueValueHandoff();
     const invoker = makeFullInvoker(
       executor,
       {
         onElicitation: options.onElicitation,
+        opaqueValueHandoff,
       },
       toolDiscoveryProvider,
     );
-    return yield* codeExecutor.execute(code, invoker).pipe(Effect.withSpan("executor.code.exec"));
+    return yield* codeExecutor
+      .execute(code, invoker)
+      .pipe(Effect.map((result) => opaqueValueHandoff.redact(result) as ExecuteResult))
+      .pipe(Effect.withSpan("executor.code.exec"));
   });
 
   return {

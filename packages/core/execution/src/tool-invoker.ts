@@ -338,11 +338,17 @@ export const makeExecutorToolInvoker = (
         // Any other failure here is an infra/plugin defect. Emit an
         // opaque generic with a correlation id so internal context (URLs
         // with tokens, DB connection strings, file paths in stacks)
-        // can't leak through Error.message into the sandbox. The full
-        // cause is logged with the same correlation id so operators can
-        // still trace the failure.
+        // can't leak through Error.message into the sandbox. When this
+        // execution sealed a sensitive value, the logged diagnostic is also
+        // redacted; the correlation id still connects the safe records.
         const correlationId = newCorrelationId();
-        return Effect.logError("tool dispatch failed", cause).pipe(
+        const safeCause = options.invokeOptions.opaqueValueHandoff
+          ? options.invokeOptions.opaqueValueHandoff.redact(cause)
+          : cause;
+        const safeError = options.invokeOptions.opaqueValueHandoff
+          ? options.invokeOptions.opaqueValueHandoff.redact(err ?? cause)
+          : (err ?? cause);
+        return Effect.logError("tool dispatch failed", safeCause).pipe(
           Effect.annotateLogs({
             "executor.correlation_id": correlationId,
             "mcp.tool.name": path,
@@ -351,7 +357,7 @@ export const makeExecutorToolInvoker = (
             Effect.fail(
               new ExecutionToolError({
                 message: `${OPAQUE_DEFECT_MESSAGE} [${correlationId}]`,
-                cause: err ?? cause,
+                cause: safeError,
               }),
             ),
           ),

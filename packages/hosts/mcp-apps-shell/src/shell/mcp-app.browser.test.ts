@@ -1144,7 +1144,7 @@ const makePausedResult = (
   request: ReturnType<typeof FormElicitation.make>,
 ): ExecutionResult => ({
   status: "paused",
-  execution: { id, elicitationContext: { address: formToolId, args: {}, request } },
+  execution: { id, elicitationContext: { address: formToolId, request } },
 });
 
 /**

@@ -12,6 +12,23 @@ export interface ToolAnnotations {
   readonly requiresApproval?: boolean;
   readonly approvalDescription?: string;
   readonly mayElicit?: boolean;
+  /**
+   * JSON Pointer paths in a successful tool result's `data` payload whose
+   * values are sensitive. During sandbox execution, these values become
+   * opaque, per-execution capabilities instead of crossing into the sandbox.
+   *
+   * Paths use RFC 6901 JSON Pointer syntax. A slash followed by a wildcard
+   * matches every member of an object or array. For example,
+   * `/credentials/password` and a wildcard beneath `/items` are valid paths.
+   */
+  readonly sensitiveOutputPaths?: readonly string[];
+  /**
+   * JSON Pointer paths in a tool's argument object that may consume an opaque
+   * sensitive value. The executor resolves the capability only after the
+   * operation's approval gate accepts it; approval and elicitation views omit
+   * these fields entirely.
+   */
+  readonly sensitiveInputPaths?: readonly string[];
 }
 
 /** A tool as produced by a plugin — the definition, no address yet (the SDK

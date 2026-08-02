@@ -48,18 +48,14 @@ type PausedInteractionView = {
   readonly kind: string | null;
   readonly message: string;
   readonly title: string;
-  readonly args: unknown;
   readonly url: string | null;
   readonly requestedSchema: unknown;
   readonly toolId: string | null;
 };
 
-const encodeJsonPreview = Schema.encodeUnknownOption(Schema.UnknownFromJsonString);
-const decodeJsonPreview = Schema.decodeUnknownOption(Schema.UnknownFromJsonString);
 const PausedInteractionInfo = Schema.Struct({
   kind: Schema.optional(Schema.String),
   message: Schema.optional(Schema.String),
-  args: Schema.optional(Schema.Unknown),
   url: Schema.optional(Schema.String),
   requestedSchema: Schema.optional(Schema.Unknown),
   toolId: Schema.optional(Schema.String),
@@ -78,19 +74,8 @@ const failureMessage = (exit: Exit.Exit<unknown, unknown>): string => {
 const requestedSchemaFromPausedInfo = (paused: PausedExecutionInfo | null): unknown =>
   paused ? interactionFromPausedInfo(paused)?.requestedSchema : undefined;
 
-const safeJson = (value: unknown): string | null => Option.getOrNull(encodeJsonPreview(value));
-
-const parseArgumentsFromMessage = (message: string): unknown => {
-  const marker = "\n\nArguments:\n";
-  const index = message.indexOf(marker);
-  if (index === -1) return undefined;
-  const raw = message.slice(index + marker.length).trim();
-  return Option.getOrUndefined(decodeJsonPreview(raw));
-};
-
 const messageTitle = (message: string): string => {
-  const marker = "\n\nArguments:\n";
-  const first = (message.includes(marker) ? message.slice(0, message.indexOf(marker)) : message)
+  const first = message
     .trim()
     .split("\n")
     .find((line) => line.trim().length > 0);
@@ -102,12 +87,10 @@ const interactionFromPausedInfo = (paused: PausedExecutionInfo): PausedInteracti
   const interaction = structured?.interaction;
   if (!interaction) return null;
   const message = interaction.message ?? paused.text;
-  const args = interaction.args ?? parseArgumentsFromMessage(message);
   return {
     kind: interaction.kind ?? null,
     message,
     title: messageTitle(message),
-    args,
     url: interaction.url ?? null,
     requestedSchema: interaction.requestedSchema,
     toolId: interaction.toolId ?? null,
@@ -363,8 +346,6 @@ function PendingRequestDetails({
     return <div className="text-sm text-muted-foreground">No pending request details found.</div>;
   }
 
-  const argsJson = interaction.args === undefined ? null : safeJson(interaction.args);
-
   return (
     <div className="space-y-4">
       <div className="space-y-1">
@@ -386,17 +367,6 @@ function PendingRequestDetails({
             Open link
           </a>
         </Button>
-      )}
-
-      {argsJson && (
-        <div className="rounded-md border border-border bg-background">
-          <div className="border-b border-border px-3 py-2 text-xs font-medium text-muted-foreground">
-            Arguments
-          </div>
-          <pre className="max-h-72 overflow-auto whitespace-pre-wrap p-3 font-mono text-xs leading-5 text-foreground">
-            {argsJson}
-          </pre>
-        </div>
       )}
 
       {approvalFields && (

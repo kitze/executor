@@ -100,13 +100,13 @@ describe("MCP elicitation (end-to-end)", () => {
       const acceptedMessages: string[] = [];
       const declinedMessages: string[] = [];
       let capturedAddress: string | undefined;
-      let capturedArgs: unknown;
+      let capturedContext: unknown;
       let capturedRequest: unknown;
 
       const options: InvokeOptions = {
         onElicitation: (ctx) => {
           capturedAddress = String(ctx.address);
-          capturedArgs = ctx.args;
+          capturedContext = ctx;
           capturedRequest = ctx.request;
           if (isFormElicitation(ctx.request)) {
             acceptedMessages.push(ctx.request.message);
@@ -147,7 +147,7 @@ describe("MCP elicitation (end-to-end)", () => {
       expect(acceptedMessages).toEqual(['Approve echo for "hello"?']);
       expect(declinedMessages).toEqual(['Approve echo for "nope"?']);
       expect(capturedAddress).toBe(String(gatedEcho.address));
-      expect(capturedArgs).toEqual({ value: "hello" });
+      expect(capturedContext).not.toHaveProperty("args");
       expect(isFormElicitation(capturedRequest)).toBe(true);
       const form = capturedRequest as FormElicitation;
       expect(form.message).toContain('Approve echo for "hello"?');

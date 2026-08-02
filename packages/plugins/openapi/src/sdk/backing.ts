@@ -198,6 +198,12 @@ const toBinding = (def: ToolDefinition): OperationBinding =>
     parameters: [...def.operation.parameters],
     requestBody: def.operation.requestBody,
     responseBody: def.operation.responseBody,
+    ...(def.operation.sensitiveInputPaths
+      ? { sensitiveInputPaths: def.operation.sensitiveInputPaths }
+      : {}),
+    ...(def.operation.sensitiveOutputPaths
+      ? { sensitiveOutputPaths: def.operation.sensitiveOutputPaths }
+      : {}),
     ...(def.operation.requiredScopeAlternatives
       ? { requiredScopeAlternatives: def.operation.requiredScopeAlternatives }
       : {}),
@@ -602,7 +608,11 @@ export const openApiToolDefsFromCompiled = (compiled: CompiledOpenApiSpec): read
       outputSchema: returnsFile
         ? ToolFileJsonSchema
         : normalizeOpenApiRefs(Option.getOrUndefined(def.operation.outputSchema)),
-      annotations: annotationsForOperation(def.operation.method, def.operation.pathTemplate),
+      annotations: annotationsForOperation(
+        def.operation.method,
+        def.operation.pathTemplate,
+        def.operation,
+      ),
     };
   });
 
@@ -711,7 +721,7 @@ const toolDefFromStoredOperation = (op: StoredOperation): ToolDef => {
           onSome: (responseBody) =>
             normalizeOpenApiRefs(outputSchemaFromResponseBody(responseBody)),
         }),
-    annotations: annotationsForOperation(binding.method, binding.pathTemplate),
+    annotations: annotationsForOperation(binding.method, binding.pathTemplate, binding),
   };
 };
 
@@ -1119,6 +1129,7 @@ export const resolveOpenApiBackedAnnotations = (input: {
       out[row.name] = annotationsForOperation(
         operation.binding.method,
         operation.binding.pathTemplate,
+        operation.binding,
       );
     }
     return out;

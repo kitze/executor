@@ -100,6 +100,14 @@ export type {
   ValidateConnectionInput,
 } from "./connection";
 export type { Tool, ToolDef, ToolListFilter, ToolAnnotations } from "./tool";
+export {
+  makeOpaqueValueHandoff,
+  isOpaqueValueReference,
+  OPAQUE_VALUE_TAG,
+  OpaqueValueHandoffError,
+  type OpaqueValueHandoff,
+  type OpaqueValueReference,
+} from "./opaque-value-handoff";
 
 // Credential providers.
 export type { CredentialProvider, ProviderEntry } from "./provider";

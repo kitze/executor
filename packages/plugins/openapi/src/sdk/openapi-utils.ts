@@ -40,8 +40,12 @@ export class DocResolver {
     if (!ref.startsWith("#/")) return null;
     const segments = ref.slice(2).split("/");
     let current: unknown = this.doc;
-    for (const segment of segments) {
+    for (const encodedSegment of segments) {
       if (typeof current !== "object" || current === null) return null;
+      // OpenAPI references use RFC 6901 JSON Pointer escaping. Component
+      // schema names commonly contain `~` or `/`, and sensitivity metadata
+      // must resolve those exactly like every other schema consumer.
+      const segment = encodedSegment.replaceAll("~1", "/").replaceAll("~0", "~");
       current = (current as Record<string, unknown>)[segment];
     }
     return current;
