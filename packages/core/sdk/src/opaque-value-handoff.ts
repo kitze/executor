@@ -423,7 +423,13 @@ const redactionFormsFor = (value: string): readonly string[] => {
   // form in place; a malformed string is still covered by the direct needle.
   // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: URI encoding rejects malformed surrogate input.
   try {
-    forms.add(encodeURIComponent(value));
+    const uriEncoded = encodeURIComponent(value);
+    forms.add(uriEncoded);
+    // Several form/body clients approximate application/x-www-form-urlencoded
+    // by replacing encoded spaces with `+`. Unlike URLSearchParams below, that
+    // leaves characters such as `~` untouched, so it is a distinct echo form
+    // and must be retained independently.
+    forms.add(uriEncoded.replaceAll("%20", "+"));
   } catch {
     // no encoded form for malformed UTF-16
   }

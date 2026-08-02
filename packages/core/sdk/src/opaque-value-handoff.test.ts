@@ -133,22 +133,38 @@ describe("opaque sensitive value handoff", () => {
   it("redacts application/x-www-form-urlencoded echoes across response, error, log, and trace shapes", () => {
     const handoff = makeOpaqueValueHandoff();
     handoff.protectOutput({ value: FORM_MARKER }, ["/value"]);
-    const encoded = new URLSearchParams([["value", FORM_MARKER]]).toString().slice("value=".length);
-    expect(encoded, "the regression fixture exercises HTML form space-to-plus encoding").toContain(
-      "+",
-    );
+    const urlSearchParamsEncoded = new URLSearchParams([["value", FORM_MARKER]])
+      .toString()
+      .slice("value=".length);
+    const uriComponentFormEncoded = encodeURIComponent(FORM_MARKER).replaceAll("%20", "+");
+    const encodings = [urlSearchParamsEncoded, uriComponentFormEncoded];
+
+    for (const encoded of encodings) {
+      expect(encoded, "a literal space uses form encoding's plus representation").toContain("+");
+      expect(encoded, "a literal plus remains distinguishable from a space").toContain("%2B");
+    }
+    expect(urlSearchParamsEncoded, "URLSearchParams escapes the fixture's tilde").toContain("%7E");
+    expect(
+      uriComponentFormEncoded,
+      "the common encodeURIComponent form leaves tilde literal",
+    ).toContain("~");
+    expect(urlSearchParamsEncoded).not.toBe(uriComponentFormEncoded);
 
     const safe = handoff.redact({
-      response: { echoed: `value=${encoded}` },
-      error: { message: `upstream rejected value=${encoded}` },
-      logs: [`request body value=${encoded}`],
-      trace: { attributes: { "http.request.body": `value=${encoded}` } },
+      response: encodings.map((encoded) => ({ echoed: `value=${encoded}` })),
+      error: { messages: encodings.map((encoded) => `upstream rejected value=${encoded}`) },
+      logs: encodings.map((encoded) => `request body value=${encoded}`),
+      trace: {
+        attributes: encodings.map((encoded) => ({ "http.request.body": `value=${encoded}` })),
+      },
     });
     const rendered = JSON.stringify(safe);
 
     expect(rendered).not.toContain(FORM_MARKER);
-    expect(rendered).not.toContain(encoded);
-    expect(handoff.redactText(`value=${encoded}`)).not.toContain(encoded);
+    for (const encoded of encodings) {
+      expect(rendered).not.toContain(encoded);
+      expect(handoff.redactText(`value=${encoded}`)).not.toContain(encoded);
+    }
   });
 
   it("disposes raw capabilities and redaction material when its TTL elapses", async () => {
