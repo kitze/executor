@@ -16,6 +16,7 @@ const makeBaseEngine = (): ExecutionEngine =>
         status: "completed",
         result: { result: "ok", logs: [] },
       }),
+    grantLiveApproval: (_executionId, response) => Effect.succeed(response),
     getPausedExecution: () => Effect.succeed(null),
     pausedExecutionCount: () => Effect.succeed(0),
     hasPausedExecutions: () => Effect.succeed(false),

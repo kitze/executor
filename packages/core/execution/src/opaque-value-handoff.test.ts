@@ -117,7 +117,14 @@ describe("opaque sensitive value execution", () => {
         expect(formatted.text).not.toContain(MARKER);
         expect(ledger.writes, "the sink has not received a value before approval").toEqual([]);
 
-        const resumed = yield* engine.resume(paused.execution.id, { action: "accept" });
+        const rawResume = yield* engine.resume(paused.execution.id, { action: "accept" });
+        expect(rawResume?.status, "raw model/API JSON cannot release the secret").toBe("paused");
+        expect(ledger.writes, "a rejected raw accept does not invoke the sink").toEqual([]);
+
+        const granted = yield* engine.grantLiveApproval(paused.execution.id, { action: "accept" });
+        expect(granted, "an authenticated browser/native endpoint mints the grant").not.toBeNull();
+        if (!granted) return;
+        const resumed = yield* engine.resume(paused.execution.id, granted);
         expect(resumed?.status).toBe("completed");
         if (resumed?.status !== "completed") return;
 
@@ -147,6 +154,141 @@ describe("opaque sensitive value execution", () => {
       expect(declined?.status).toBe("completed");
       expect(ledger.writes, "declining never reaches the sink").toEqual([]);
       expect(JSON.stringify(declined)).not.toContain(MARKER);
+      expect(
+        yield* engine.grantLiveApproval(paused.execution.id, { action: "accept" }),
+        "the first terminal decline cannot be changed into a later acceptance",
+      ).toBeNull();
+    }),
+  );
+
+  it.effect("never lets autoApprove release an opaque value", () =>
+    Effect.gen(function* () {
+      const { executor, engine, ledger } = yield* makeHarness();
+      yield* executor.policies.create({ owner: "org", pattern: "opaque.write", action: "approve" });
+
+      const paused = yield* engine.executeWithPause(handoffCode, { autoApprove: true });
+      expect(paused.status, "opaque input turns autoApprove back into a live pause").toBe("paused");
+      if (paused.status !== "paused") return;
+      expect(paused.execution.elicitationContext.requiresLiveApproval).toBe(true);
+      expect(ledger.writes).toEqual([]);
+
+      const rawResume = yield* engine.resume(paused.execution.id, { action: "accept" });
+      expect(rawResume?.status).toBe("paused");
+      expect(ledger.writes).toEqual([]);
+      const granted = yield* engine.grantLiveApproval(paused.execution.id, { action: "accept" });
+      expect(granted).not.toBeNull();
+      if (!granted) return;
+      const resumed = yield* engine.resume(paused.execution.id, granted);
+      expect(resumed?.status).toBe("completed");
+      expect(ledger.writes).toHaveLength(1);
+      expect(JSON.stringify(resumed)).not.toContain(MARKER);
+    }),
+  );
+
+  it.effect("settles duplicate concurrent live-grant resumes exactly once", () =>
+    Effect.gen(function* () {
+      const { executor, engine, ledger } = yield* makeHarness();
+      yield* executor.policies.create({ owner: "org", pattern: "opaque.write", action: "approve" });
+
+      const paused = yield* engine.executeWithPause(handoffCode);
+      expect(paused.status).toBe("paused");
+      if (paused.status !== "paused") return;
+
+      const grants = yield* Effect.all(
+        [
+          engine.grantLiveApproval(paused.execution.id, { action: "accept" }),
+          engine.grantLiveApproval(paused.execution.id, { action: "accept" }),
+        ],
+        { concurrency: "unbounded" },
+      );
+      const [firstGrant, secondGrant] = grants;
+      expect(firstGrant).not.toBeNull();
+      expect(secondGrant).not.toBeNull();
+      if (!firstGrant || !secondGrant) return;
+
+      const outcomes = yield* Effect.all(
+        [
+          engine.resume(paused.execution.id, firstGrant),
+          engine.resume(paused.execution.id, secondGrant),
+        ],
+        { concurrency: "unbounded" },
+      );
+      expect(outcomes.map((outcome) => outcome?.status)).toEqual(["completed", "completed"]);
+      expect(ledger.writes, "all duplicate live grants share one terminal execution").toHaveLength(
+        1,
+      );
+      expect(JSON.stringify(outcomes)).not.toContain(MARKER);
+    }),
+  );
+
+  it.effect("rejects an arbitrary inline elicitation accept for an opaque sink", () =>
+    Effect.gen(function* () {
+      const { executor, engine, ledger } = yield* makeHarness();
+      yield* executor.policies.create({ owner: "org", pattern: "opaque.write", action: "approve" });
+
+      const result = yield* engine.execute(handoffCode, {
+        onElicitation: () => Effect.succeed({ action: "accept" as const }),
+      });
+
+      expect(result.error).toContain("requires approval but the request was declined");
+      expect(ledger.writes, "an in-process callback is not a live approval grant").toEqual([]);
+    }),
+  );
+
+  it.effect("consumes a capability once across sequential and concurrent sink attempts", () =>
+    Effect.gen(function* () {
+      const { executor, engine, ledger } = yield* makeHarness();
+      yield* executor.policies.create({ owner: "org", pattern: "opaque.write", action: "approve" });
+
+      const sequential = yield* engine.executeWithPause(`
+        const source = await tools.opaque.read({});
+        const ref = source.data.envs[0].value;
+        const first = await tools.opaque.write({ body: { value: ref } });
+        const second = await tools.opaque.write({ body: { value: ref } });
+        return { first, second };
+      `);
+      expect(sequential.status).toBe("paused");
+      if (sequential.status !== "paused") return;
+      const sequentialGrant = yield* engine.grantLiveApproval(sequential.execution.id, {
+        action: "accept",
+      });
+      expect(sequentialGrant).not.toBeNull();
+      if (!sequentialGrant) return;
+      const sequentialResult = yield* engine.resume(sequential.execution.id, sequentialGrant);
+      expect(sequentialResult?.status).toBe("completed");
+      expect(ledger.writes).toHaveLength(1);
+      expect(JSON.stringify(sequentialResult)).not.toContain(MARKER);
+
+      const concurrent = yield* engine.executeWithPause(`
+        const source = await tools.opaque.read({});
+        const ref = source.data.envs[0].value;
+        return await Promise.all([
+          tools.opaque.write({ body: { value: ref } }),
+          tools.opaque.write({ body: { value: ref } }),
+        ]);
+      `);
+      expect(concurrent.status).toBe("paused");
+      if (concurrent.status !== "paused") return;
+      const concurrentGrant = yield* engine.grantLiveApproval(concurrent.execution.id, {
+        action: "accept",
+      });
+      expect(concurrentGrant).not.toBeNull();
+      if (!concurrentGrant) return;
+      const firstResume = yield* engine.resume(concurrent.execution.id, concurrentGrant);
+      // Depending on the sandbox scheduler, the second invocation either
+      // reaches a queued approval before consumption or sees the consumed
+      // handle immediately. Neither path may issue a second target write.
+      const nextPauseId = firstResume?.status === "paused" ? firstResume.execution.id : null;
+      const finalConcurrentResult = nextPauseId
+        ? yield* Effect.gen(function* () {
+            const secondGrant = yield* engine.grantLiveApproval(nextPauseId, { action: "accept" });
+            if (!secondGrant) return null;
+            return yield* engine.resume(nextPauseId, secondGrant);
+          })
+        : firstResume;
+      expect(finalConcurrentResult).not.toBeNull();
+      expect(JSON.stringify(finalConcurrentResult)).not.toContain(MARKER);
+      expect(ledger.writes).toHaveLength(2);
     }),
   );
 
@@ -201,6 +343,50 @@ describe("opaque sensitive value execution", () => {
       expect(foreign.result.error, "the sandbox receives only an opaque failure").toContain(
         "Internal tool error",
       );
+    }),
+  );
+
+  it.effect("rejects a stale live approval grant after an engine restart", () =>
+    Effect.gen(function* () {
+      const { executor, engine: originalEngine, ledger } = yield* makeHarness();
+      yield* executor.policies.create({ owner: "org", pattern: "opaque.write", action: "approve" });
+
+      const original = yield* originalEngine.executeWithPause(handoffCode);
+      expect(original.status).toBe("paused");
+      if (original.status !== "paused") return;
+      const staleGrant = yield* originalEngine.grantLiveApproval(original.execution.id, {
+        action: "accept",
+      });
+      expect(staleGrant).not.toBeNull();
+      if (!staleGrant) return;
+
+      // Settle the pre-restart fiber, then retain its process-local grant as a
+      // hostile stale object. A real restart cannot serialize this WeakMap
+      // membership at all; this is the stronger in-memory proof.
+      yield* originalEngine.resume(original.execution.id, { action: "decline" });
+
+      const restartedEngine = createExecutionEngine({
+        executor,
+        codeExecutor: makeQuickJsExecutor(),
+      });
+      const fresh = yield* restartedEngine.executeWithPause(handoffCode);
+      expect(fresh.status).toBe("paused");
+      if (fresh.status !== "paused") return;
+      expect(fresh.execution.id).not.toBe(original.execution.id);
+
+      const staleResume = yield* restartedEngine.resume(fresh.execution.id, staleGrant);
+      expect(staleResume?.status).toBe("paused");
+      expect(ledger.writes, "a stale grant never releases the new execution").toEqual([]);
+
+      const freshGrant = yield* restartedEngine.grantLiveApproval(fresh.execution.id, {
+        action: "accept",
+      });
+      expect(freshGrant).not.toBeNull();
+      if (!freshGrant) return;
+      const resumed = yield* restartedEngine.resume(fresh.execution.id, freshGrant);
+      expect(resumed?.status).toBe("completed");
+      expect(ledger.writes).toHaveLength(1);
+      expect(JSON.stringify(resumed)).not.toContain(MARKER);
     }),
   );
 

@@ -55,6 +55,7 @@ const makeFakeEngine = (
   execute: () => outcomes.execute ?? Effect.succeed({ result: "ok" }),
   executeWithPause: () => outcomes.executeWithPause ?? Effect.succeed(completedResult()),
   resume: () => outcomes.resume ?? Effect.succeed(null),
+  grantLiveApproval: (_executionId, response) => Effect.succeed(response),
   getPausedExecution: () => Effect.succeed(null),
   pausedExecutionCount: () => Effect.succeed(0),
   hasPausedExecutions: () => Effect.succeed(false),

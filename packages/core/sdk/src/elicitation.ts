@@ -44,6 +44,9 @@ export type ElicitationResponse = typeof ElicitationResponse.Type;
 export interface ElicitationContext {
   readonly address: ToolAddress;
   readonly request: ElicitationRequest;
+  /** Metadata only: this gate consumes an opaque value and therefore cannot be
+   * auto-accepted by a transport-level Run/Test shortcut. */
+  readonly requiresLiveApproval?: boolean;
 }
 
 /** Host-provided handler the SDK calls when a tool suspends for input. */
@@ -59,6 +62,10 @@ export interface InvokeOptions {
   readonly onElicitation?: OnElicitation;
   /** @internal Per-sandbox-execution sensitive-value capability store. */
   readonly opaqueValueHandoff?: OpaqueValueHandoff;
+  /** @internal A declared sensitive tool input may reach a path/query/header,
+   * request body, or server variable. Downstream transports must not emit raw
+   * request telemetry for this invocation. */
+  readonly disableSensitiveRequestTracing?: boolean;
 }
 
 /** A tool was declined or cancelled during elicitation. */

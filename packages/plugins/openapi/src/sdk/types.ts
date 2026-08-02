@@ -185,6 +185,7 @@ export const ExtractedOperation = Schema.Struct({
    * output paths are relative to `ToolResult.data`. */
   sensitiveInputPaths: Schema.optional(Schema.Array(Schema.String)),
   sensitiveOutputPaths: Schema.optional(Schema.Array(Schema.String)),
+  sensitiveResponseHeaders: Schema.optional(Schema.Boolean),
   /** OAuth scope requirements from `security`, alternatives preserved: each
    *  inner array is one acceptable Security Requirement Object's scope set
    *  (sorted, deduped); the outer array is an OR across alternatives. An
@@ -220,6 +221,10 @@ export const OperationBinding = Schema.Struct({
    * reparsing the source OpenAPI document. Optional for legacy bindings. */
   sensitiveInputPaths: Schema.optional(Schema.Array(Schema.String)),
   sensitiveOutputPaths: Schema.optional(Schema.Array(Schema.String)),
+  sensitiveResponseHeaders: Schema.optional(Schema.Boolean),
+  /** Fresh bindings carry complete sensitivity extraction. Older bindings
+   * intentionally fail closed at runtime until their connection is refreshed. */
+  sensitivityVersion: Schema.optional(Schema.Literal(1)),
   /** Declared OAuth scope alternatives (see
    *  ExtractedOperation.requiredScopeAlternatives), persisted with the
    *  binding so the invoke path can annotate a scope-insufficient rejection

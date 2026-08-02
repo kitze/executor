@@ -17,6 +17,7 @@ export type OperationObject = OpenAPIV3.OperationObject | OpenAPIV3_1.OperationO
 export type PathItemObject = OpenAPIV3.PathItemObject | OpenAPIV3_1.PathItemObject;
 export type RequestBodyObject = OpenAPIV3.RequestBodyObject | OpenAPIV3_1.RequestBodyObject;
 export type ResponseObject = OpenAPIV3.ResponseObject | OpenAPIV3_1.ResponseObject;
+export type HeaderObject = OpenAPIV3.HeaderObject | OpenAPIV3_1.HeaderObject;
 export type MediaTypeObject = OpenAPIV3.MediaTypeObject | OpenAPIV3_1.MediaTypeObject;
 export type ServerObject = OpenAPIV3.ServerObject | OpenAPIV3_1.ServerObject;
 
@@ -30,13 +31,16 @@ export class DocResolver {
   /** Resolve a value that might be a $ref, returning the resolved object */
   resolve<T>(value: T | OpenAPIV3.ReferenceObject | OpenAPIV3_1.ReferenceObject): T | null {
     if (isRef(value)) {
-      const resolved = this.resolvePointer(value.$ref);
-      return resolved as T | null;
+      return this.resolveReference<T>(value.$ref);
     }
     return value as T;
   }
 
-  private resolvePointer(ref: string): unknown {
+  /** Resolve a local JSON Pointer reference. Schema walkers also use this for
+   * OpenAPI 3.1's `$dynamicRef` / `$recursiveRef` when their target is an
+   * ordinary local pointer; unresolved reference forms are handled fail-closed
+   * by the caller instead of being mistaken for public data. */
+  resolveReference<T>(ref: string): T | null {
     if (!ref.startsWith("#/")) return null;
     const segments = ref.slice(2).split("/");
     let current: unknown = this.doc;
@@ -48,7 +52,7 @@ export class DocResolver {
       const segment = encodedSegment.replaceAll("~1", "/").replaceAll("~0", "~");
       current = (current as Record<string, unknown>)[segment];
     }
-    return current;
+    return current as T;
   }
 }
 

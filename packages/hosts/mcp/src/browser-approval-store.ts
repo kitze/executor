@@ -21,22 +21,25 @@ import type { BrowserApprovalStore } from "./tool-server";
 export interface InProcessBrowserApprovalStore {
   /** The store the MCP server awaits a decision on (browser elicitation mode). */
   readonly store: BrowserApprovalStore;
-  /** Record a human's decision, waking any in-flight `waitForResponse`. */
-  readonly recordResponse: (executionId: string, response: ResumeResponse) => Effect.Effect<void>;
+  /** Record the first terminal human decision, waking an in-flight waiter.
+   * Later duplicate/conflicting posts return that original decision. */
+  readonly recordResponse: (
+    executionId: string,
+    response: ResumeResponse,
+  ) => Effect.Effect<ResumeResponse>;
   /** Drop a pending decision/waiter (e.g. when its session is torn down). */
   readonly forget: (executionId: string) => void;
 }
 
 export const makeInProcessBrowserApprovalStore = (): InProcessBrowserApprovalStore => {
-  const responses = new Map<string, ResumeResponse>();
+  // Keep an immutable terminal decision until the owning live pause settles.
+  // A response is not a queue item: concurrent model retries must observe the
+  // same first decision, then the engine's resume cache makes execution safe.
+  const decisions = new Map<string, ResumeResponse>();
   const waiters = new Map<string, Deferred.Deferred<ResumeResponse>>();
 
   const take = (executionId: string): Effect.Effect<ResumeResponse | null> =>
-    Effect.sync(() => {
-      const response = responses.get(executionId) ?? null;
-      if (response) responses.delete(executionId);
-      return response;
-    });
+    Effect.sync(() => decisions.get(executionId) ?? null);
 
   const waitFor = (executionId: string): Effect.Effect<ResumeResponse | null> =>
     Effect.gen(function* () {
@@ -45,27 +48,39 @@ export const makeInProcessBrowserApprovalStore = (): InProcessBrowserApprovalSto
 
       const waiter = waiters.get(executionId) ?? (yield* Deferred.make<ResumeResponse>());
       waiters.set(executionId, waiter);
-      yield* Deferred.await(waiter).pipe(
+      // `take` and waiter registration are separate steps. Recheck after the
+      // waiter is visible so a browser post that lands in that tiny interval
+      // cannot leave this model-side resume waiting forever.
+      const racedDecision = yield* take(executionId);
+      if (racedDecision) return racedDecision;
+      return yield* Deferred.await(waiter).pipe(
         Effect.ensuring(
           Effect.sync(() => {
             if (waiters.get(executionId) === waiter) waiters.delete(executionId);
           }),
         ),
       );
-      return yield* take(executionId);
     });
 
+  const forget = (executionId: string): void => {
+    decisions.delete(executionId);
+    waiters.delete(executionId);
+  };
+
   return {
-    store: { takeResponse: take, waitForResponse: waitFor },
+    store: { takeResponse: take, waitForResponse: waitFor, forget },
     recordResponse: (executionId, response) =>
       Effect.gen(function* () {
-        responses.set(executionId, response);
+        const finalResponse = yield* Effect.sync(() => {
+          const existing = decisions.get(executionId);
+          if (existing) return existing;
+          decisions.set(executionId, response);
+          return response;
+        });
         const waiter = waiters.get(executionId);
-        if (waiter) yield* Deferred.succeed(waiter, response);
+        if (waiter) yield* Deferred.succeed(waiter, finalResponse);
+        return finalResponse;
       }),
-    forget: (executionId) => {
-      responses.delete(executionId);
-      waiters.delete(executionId);
-    },
+    forget,
   };
 };

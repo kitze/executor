@@ -1308,15 +1308,27 @@ export const openApiPlugin = definePlugin<
       );
     },
 
-    invokeTool: ({ ctx: invokeCtx, toolRow, credential, args }) => {
+    invokeTool: ({
+      ctx: invokeCtx,
+      toolRow,
+      credential,
+      args,
+      invokeOptions: executorInvokeOptions,
+    }) => {
       const httpClientLayer = options?.httpClientLayer ?? invokeCtx.httpClientLayer;
+      const invokeOptions = {
+        ...options?.invokeOptions,
+        ...(executorInvokeOptions?.disableSensitiveRequestTracing
+          ? { disableRequestTracing: true }
+          : {}),
+      };
       return invokeOpenApiBackedTool({
         ctx: invokeCtx,
         toolRow,
         credential,
         args,
         httpClientLayer,
-        invokeOptions: options?.invokeOptions,
+        invokeOptions,
       });
     },
 

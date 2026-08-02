@@ -208,6 +208,10 @@ export interface StreamingResponseCaps {
 export interface InvokeOptions {
   readonly responseHeadersTimeoutMs?: number;
   readonly responseBodyTimeoutMs?: number;
+  /** Do not create nested request-building or HTTP spans when a declared
+   * sensitive input or rendered credential can appear in a URL, header, body,
+   * or server-variable expansion. The outer operation span is metadata-only. */
+  readonly disableRequestTracing?: boolean;
 }
 
 const formatTimeout = (timeoutMs: number): string =>
@@ -1116,7 +1120,12 @@ export const invoke = Effect.fn("OpenApi.invoke")(function* (
     Option.Option<Exit.Exit<HttpClientResponse.HttpClientResponse, OpenApiInvocationError>>
   >((resume, signal) => {
     let settled = false;
-    const responseEffect = client.execute(request).pipe(
+    const requestEffect = options.disableRequestTracing
+      ? client
+          .execute(request)
+          .pipe(Effect.provideService(HttpClient.TracerDisabledWhen, () => true))
+      : client.execute(request);
+    const responseEffect = requestEffect.pipe(
       Effect.mapError(
         (err) =>
           new OpenApiInvocationError({
@@ -1316,13 +1325,31 @@ export const invokeWithLayer = (
       ).pipe(Layer.provide(httpClientLayer))
     : httpClientLayer;
 
-  return invoke(operation, args, resolvedHeaders, integrationQueryParams, options).pipe(
+  const invokeEffect = invoke(
+    operation,
+    args,
+    resolvedHeaders,
+    integrationQueryParams,
+    options,
+  ).pipe(
     Effect.provide(clientWithBaseUrl),
     // `invoke` annotates http.status_code on ITS span (`OpenApi.invoke`,
     // via Effect.fn) — annotateCurrentSpan inside it never reaches this
     // wrapper span. Stamp the status here too so queries against
     // `plugin.openapi.invoke` see the upstream outcome directly.
     Effect.tap((result) => Effect.annotateCurrentSpan({ "http.status_code": result.status })),
+  );
+
+  // `buildRequest` records its returned HttpClientRequest as an Effect span
+  // exit. Disabling the HTTP client's own tracer is not enough: a custom
+  // header or query API key would still be serialized in that nested span.
+  // Keep the outer operation span below (safe method/path metadata only), but
+  // suppress every inner request-construction and transport span.
+  return (
+    options.disableRequestTracing
+      ? invokeEffect.pipe(Effect.withTracerEnabled(false))
+      : invokeEffect
+  ).pipe(
     Effect.withSpan("plugin.openapi.invoke", {
       attributes: {
         "plugin.openapi.method": operation.method.toUpperCase(),
@@ -1345,6 +1372,7 @@ export const annotationsForOperation = (
   sensitivity?: {
     readonly sensitiveInputPaths?: readonly string[];
     readonly sensitiveOutputPaths?: readonly string[];
+    readonly sensitiveResponseHeaders?: boolean;
   },
 ): ToolAnnotations => {
   const m = method.toLowerCase();
@@ -1355,6 +1383,7 @@ export const annotationsForOperation = (
     ...(sensitivity?.sensitiveOutputPaths?.length
       ? { sensitiveOutputPaths: sensitivity.sensitiveOutputPaths }
       : {}),
+    ...(sensitivity?.sensitiveResponseHeaders ? { sensitiveResponseHeaders: true } : {}),
   };
   if (!REQUIRE_APPROVAL.has(m)) return sensitive;
   return {

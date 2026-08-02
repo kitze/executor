@@ -1367,6 +1367,7 @@ const startSchemaElicitationMcpHarness = (): Promise<McpHarness> =>
         status: "completed",
         result: { result: response.content ?? {} },
       }),
+    grantLiveApproval: (_executionId, response) => Effect.succeed(response),
   });
 
 const startHostServer = (shellUrl: string, mcp: McpHarness): Promise<HostServer> =>

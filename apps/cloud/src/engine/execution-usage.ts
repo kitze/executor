@@ -20,6 +20,7 @@ export const withExecutionUsageTracking = <E extends Cause.YieldableError>(
       .pipe(Effect.tap(() => Effect.sync(() => trackUsage(organizationId)))),
   // resume doesn't count as usage
   resume: (executionId, response) => engine.resume(executionId, response),
+  grantLiveApproval: (executionId, response) => engine.grantLiveApproval(executionId, response),
   isExecutionSettled: engine.isExecutionSettled,
   getPausedExecution: (executionId) => engine.getPausedExecution(executionId),
   pausedExecutionCount: () => engine.pausedExecutionCount(),

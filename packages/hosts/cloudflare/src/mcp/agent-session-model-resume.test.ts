@@ -118,8 +118,28 @@ class FakeStorage implements DurableObjectStorage {
     this.alarmAt = null;
   }
 
-  transaction<T>(_closure: (txn: DurableObjectTransaction) => Promise<T>): Promise<T> {
-    return Promise.resolve(undefined as T);
+  transaction<T>(closure: (txn: DurableObjectTransaction) => Promise<T>): Promise<T> {
+    const storage = this;
+    const transaction: DurableObjectTransaction = {
+      get: ((keyOrKeys: string | string[]) =>
+        Array.isArray(keyOrKeys)
+          ? storage.get(keyOrKeys)
+          : storage.get(keyOrKeys)) as DurableObjectTransaction["get"],
+      list: (() => storage.list()) as DurableObjectTransaction["list"],
+      put: ((keyOrEntries: string | Record<string, unknown>, value?: unknown) =>
+        typeof keyOrEntries === "string"
+          ? storage.put(keyOrEntries, value)
+          : storage.put(keyOrEntries)) as DurableObjectTransaction["put"],
+      delete: ((keyOrKeys: string | string[]) =>
+        Array.isArray(keyOrKeys)
+          ? storage.delete(keyOrKeys)
+          : storage.delete(keyOrKeys)) as DurableObjectTransaction["delete"],
+      rollback: () => undefined,
+      getAlarm: (() => storage.getAlarm()) as DurableObjectTransaction["getAlarm"],
+      setAlarm: ((time) => storage.setAlarm(time)) as DurableObjectTransaction["setAlarm"],
+      deleteAlarm: (() => storage.deleteAlarm()) as DurableObjectTransaction["deleteAlarm"],
+    };
+    return closure(transaction);
   }
 
   transactionSync<T>(_closure: () => T): T {
@@ -259,6 +279,7 @@ const makeEngine = (
     execute: () => Effect.succeed({ result: "execute-result" }),
     executeWithPause: () => Effect.succeed(completed("execute-result")),
     resume,
+    grantLiveApproval: (_executionId, response) => Effect.succeed(response),
     getPausedExecution: () => Effect.succeed(null),
     pausedExecutionCount: () => Effect.succeed(0),
     hasPausedExecutions: () => Effect.succeed(false),

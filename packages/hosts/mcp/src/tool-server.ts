@@ -263,6 +263,8 @@ export type ExecutorMcpServerConfig<E extends Cause.YieldableError = Cause.Yield
 export type BrowserApprovalStore = {
   readonly takeResponse: (executionId: string) => Effect.Effect<ResumeResponse | null>;
   readonly waitForResponse?: (executionId: string) => Effect.Effect<ResumeResponse | null>;
+  /** Remove a terminal browser decision after its owning live pause settles. */
+  readonly forget?: (executionId: string) => void;
 };
 
 export const PAUSED_APPROVAL_TIMEOUT_MS = 4 * 60 * 1000;
@@ -1100,11 +1102,55 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
       config.pausedExecutionHooks?.onResumeStarted?.(executionId) ?? Effect.void;
     const onResumeSettled = (executionId: string): Effect.Effect<void> =>
       config.pausedExecutionHooks?.onResumeSettled?.(executionId) ?? Effect.void;
-    const resumeWithLifecycle = (executionId: string, response: ResumeResponse) =>
+    /**
+     * A raw `accept` must not disturb the lease or stored browser decision for
+     * a live opaque pause.  `engine.resume` deliberately leaves that pause in
+     * place when the object was not minted by `grantLiveApproval`; running the
+     * normal lifecycle around that no-op used to clear the legitimate browser
+     * decision before its waiter could consume it.
+     *
+     * Browser mode passes the exact in-process grant object.  We still wait to
+     * forget its terminal decision until the engine proves it consumed the
+     * pause (a stale serialized decision after a restart is not a grant).
+     */
+    const resumeWithLifecycle = (
+      executionId: string,
+      response: ResumeResponse,
+      options?: { readonly browserApproval?: boolean },
+    ) =>
       Effect.gen(function* () {
+        const current = yield* engine.getPausedExecution(executionId);
+        if (!current) {
+          // Preserve the ordinary retry/missing-execution lifecycle contract.
+          // There is no live pause (and therefore no browser grant or decision)
+          // left to accidentally clear in this branch.
+          yield* onResumeStarted(executionId);
+          return yield* engine
+            .resume(executionId, response)
+            .pipe(Effect.ensuring(onResumeSettled(executionId)));
+        }
+
+        const mayRequireLiveGrant =
+          current.requiresLiveApproval === true && response.action === "accept";
+        if (mayRequireLiveGrant) {
+          const outcome = yield* engine.resume(executionId, response);
+          const consumed =
+            outcome !== null &&
+            (outcome.status !== "paused" || outcome.execution.id !== current.id);
+          if (consumed) {
+            yield* onResumeSettled(executionId);
+            if (options?.browserApproval) {
+              yield* Effect.sync(() => config.browserApprovalStore?.forget?.(executionId));
+            }
+          }
+          return outcome;
+        }
+
         yield* onResumeStarted(executionId);
-        return yield* engine.resume(executionId, response);
-      }).pipe(Effect.ensuring(onResumeSettled(executionId)));
+        return yield* engine
+          .resume(executionId, response)
+          .pipe(Effect.ensuring(onResumeSettled(executionId)));
+      });
 
     const localExecutionAlreadySettled = (executionId: string): Effect.Effect<boolean> =>
       engine.isExecutionSettled?.(executionId) ?? Effect.succeed(false);
@@ -1431,7 +1477,9 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         const response = yield* waitForBrowserApprovalResponse(executionId);
         if (!response) return yield* requireUserResumeApproval(executionId);
 
-        const outcome = yield* resumeWithLifecycle(executionId, response);
+        const outcome = yield* resumeWithLifecycle(executionId, response, {
+          browserApproval: true,
+        });
         if (!outcome) {
           return missingExecutionResult(executionId);
         }
