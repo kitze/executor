@@ -4,11 +4,13 @@ import type * as Tracer from "effect/Tracer";
 
 import {
   ElicitationResponse,
+  ElicitationId,
   FormElicitation,
   ToolAddress,
   isOpaqueValueReference,
   makeOpaqueValueHandoff,
   ToolResult,
+  UrlElicitation,
   createExecutor,
   definePlugin,
   tool,
@@ -44,6 +46,9 @@ const arbitrarySourceTransforms = (value: string): readonly string[] => [
   Buffer.from(value).toString("base64url"),
   [...value].reverse().join(""),
 ];
+
+const customSandboxTransform = (value: string): string =>
+  [...value].map((character) => String.fromCharCode(character.charCodeAt(0) ^ 23)).join("");
 
 type RecordedSpan = {
   readonly name: string;
@@ -560,17 +565,25 @@ describe("opaque sensitive value execution", () => {
         for (const scenario of [
           {
             marker: GENERATED_MARKER,
+            direct: true,
             firstRequiresLiveApproval: false,
             fail: false,
             code: `
               const generated = ${JSON.stringify(GENERATED_MARKER)};
-              return await tools.opaque.writeAndElicit({
+              const custom = [...generated]
+                .map((character) => String.fromCharCode(character.charCodeAt(0) ^ 23))
+                .join("");
+              console.log(custom);
+              emit(custom);
+              const result = await tools.opaque.writeAndElicit({
                 body: { value: generated, fail: false }
               });
+              return { result, custom };
             `,
           },
           {
             marker: MARKER,
+            direct: false,
             firstRequiresLiveApproval: true,
             fail: true,
             code: `
@@ -642,22 +655,27 @@ describe("opaque sensitive value execution", () => {
             readonly body?: { readonly value?: unknown };
           };
           expect(latestWrite.body?.value).toBe(scenario.marker);
-          expect(completed.result.result).toEqual(
-            scenario.fail
-              ? {
-                  ok: false,
-                  error: {
-                    code: "UPSTREAM_REQUEST_FAILED",
-                    message: "Upstream request failed.",
-                    status: 422,
-                  },
-                }
-              : {
-                  ok: true,
-                  data: null,
-                  http: { status: 202, headers: {} },
-                },
-          );
+          const expectedCompleted = scenario.direct
+            ? { result: null }
+            : {
+                result: scenario.fail
+                  ? {
+                      ok: false,
+                      error: {
+                        code: "UPSTREAM_REQUEST_FAILED",
+                        message: "Upstream request failed.",
+                        status: 422,
+                      },
+                    }
+                  : {
+                      ok: true,
+                      data: null,
+                      http: { status: 202, headers: {} },
+                    },
+                output: undefined,
+                logs: [],
+              };
+          expect(completed.result).toEqual(expectedCompleted);
 
           const scenarioSurface = cycleSafeStringify(observedBoundaries);
           for (const secret of [scenario.marker, ...arbitrarySourceTransforms(scenario.marker)]) {
@@ -673,6 +691,7 @@ describe("opaque sensitive value execution", () => {
           MARKER,
           ...arbitrarySourceTransforms(GENERATED_MARKER),
           ...arbitrarySourceTransforms(MARKER),
+          customSandboxTransform(GENERATED_MARKER),
           REPOSITORY_CREDENTIAL_MARKER,
           ...repositoryCredentialUrls,
         ]) {
@@ -680,6 +699,40 @@ describe("opaque sensitive value execution", () => {
         }
       }),
   );
+
+  it("reconstructs a live-sensitive pause again at the public formatter boundary", () => {
+    const marker = "formatter-live-sensitive-regression-marker";
+    const formatted = formatPausedExecution({
+      id: "exec_formatter_boundary",
+      requiresLiveApproval: true,
+      elicitationContext: {
+        address: ToolAddress.make("opaque.org.main.writeAndElicit"),
+        request: {
+          ...UrlElicitation.make({
+            message: `Approve ${marker}`,
+            url: `https://fixture.invalid/approve?token=${marker}`,
+            elicitationId: ElicitationId.make(marker),
+          }),
+          requestedSchema: {
+            type: "object",
+            properties: { secret: { description: marker } },
+          },
+        } as never,
+      },
+    });
+
+    expect(JSON.stringify(formatted)).not.toContain(marker);
+    expect(formatted.structured).toMatchObject({
+      status: "waiting_for_interaction",
+      executionId: "exec_formatter_boundary",
+      requiresLiveApproval: true,
+      interaction: {
+        kind: "form",
+        message: "Approve continuation of opaque.org.main.writeAndElicit?",
+        requestedSchema: { type: "object", properties: {} },
+      },
+    });
+  });
 
   it.effect("does not invoke an opaque sink after a decline", () =>
     Effect.gen(function* () {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Ref } from "effect";
+import { Effect, Logger, Ref } from "effect";
 import type * as Tracer from "effect/Tracer";
 import { HttpServerResponse } from "effect/unstable/http";
 
@@ -670,6 +670,196 @@ describe("OpenAPI sensitive transport tracing", () => {
         for (const transform of sourceTransforms) expect(publicSurface).not.toContain(transform);
       }),
     ),
+  );
+
+  it.effect(
+    "keeps verified Coolify database credentials inside opaque source and sink boundaries",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const internalUrl = "postgresql://user:coolify-db-internal-canary@db.internal:5432/app";
+          const externalUrl = "postgresql://user:coolify-db-external-canary@db.example:5432/app";
+          const password = "coolify-db-password-canary";
+          const postgresPassword = "coolify-db-postgres-password-canary";
+          const transform = [...internalUrl]
+            .map((character) => String.fromCharCode(character.charCodeAt(0) ^ 31))
+            .join("");
+          const receivedBodies = yield* Ref.make<readonly unknown[]>([]);
+          const server = yield* serveTestHttpApp((request) =>
+            request.method === "GET"
+              ? Effect.succeed(
+                  HttpServerResponse.jsonUnsafe({
+                    internal_db_url: internalUrl,
+                    external_db_url: externalUrl,
+                    password,
+                    postgres_password: postgresPassword,
+                    transformed: transform,
+                    logs: [internalUrl, transform],
+                    trace: { "http.response.body": `${internalUrl}|${transform}` },
+                  }),
+                )
+              : Effect.gen(function* () {
+                  const body = yield* request.json.pipe(Effect.catch(() => Effect.succeed(null)));
+                  yield* Ref.update(receivedBodies, (all) => [...all, body]);
+                  return HttpServerResponse.jsonUnsafe({
+                    internal_db_url: internalUrl,
+                    password,
+                    transformed: transform,
+                  });
+                }),
+          );
+          const specJson = JSON.stringify({
+            openapi: "3.0.0",
+            info: { title: "Coolify database fixture", version: "1.0.0" },
+            servers: [{ url: server.baseUrl }],
+            paths: {
+              "/databases/{uuid}": {
+                get: {
+                  operationId: "getDatabaseByUuid",
+                  tags: ["Databases"],
+                  parameters: [
+                    {
+                      name: "uuid",
+                      in: "path",
+                      required: true,
+                      schema: { type: "string" },
+                    },
+                  ],
+                  responses: {
+                    "200": {
+                      description: "OK",
+                      content: {
+                        "application/json": {
+                          schema: {
+                            type: "object",
+                            properties: {
+                              internal_db_url: { type: "string" },
+                              external_db_url: { type: "string" },
+                              password: { type: "string" },
+                              postgres_password: { type: "string" },
+                              transformed: { type: "string" },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+                patch: {
+                  operationId: "updateDatabaseByUuid",
+                  tags: ["Databases"],
+                  parameters: [
+                    {
+                      name: "uuid",
+                      in: "path",
+                      required: true,
+                      schema: { type: "string" },
+                    },
+                  ],
+                  requestBody: {
+                    required: true,
+                    content: {
+                      "application/json": {
+                        schema: {
+                          type: "object",
+                          properties: {
+                            password: { type: "string" },
+                            postgres_password: { type: "string" },
+                            name: { type: "string" },
+                          },
+                        },
+                      },
+                    },
+                  },
+                  responses: {
+                    "200": {
+                      description: "OK",
+                      content: {
+                        "application/json": { schema: { type: "object" } },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          });
+          const executor = yield* createExecutor(
+            makeTestConfig({
+              plugins: [
+                openApiPlugin({ httpClientLayer: server.httpClientLayer }),
+                memoryCredentialsPlugin(),
+              ] as const,
+            }),
+          );
+          const connection = yield* addOpenApiTestConnection(
+            executor,
+            { ...server, specJson },
+            { slug: "coolify_database_boundary" },
+          );
+          const handoff = makeOpaqueValueHandoff();
+          const { tracer, spans } = makeRecordingTracer();
+          const recordedLogs: unknown[] = [];
+          const logger = Logger.make<unknown, void>((options) =>
+            recordedLogs.push(options.message),
+          );
+          const source = (yield* executor
+            .execute(
+              connection.address("databases.getDatabaseByUuid"),
+              { uuid: "db-1" },
+              {
+                opaqueValueHandoff: handoff,
+              },
+            )
+            .pipe(Effect.withTracer(tracer), Effect.withLogger(logger))) as {
+            readonly data?: Record<string, unknown>;
+          };
+
+          expect(Object.keys(source.data ?? {}).sort()).toEqual([
+            "external_db_url",
+            "internal_db_url",
+            "password",
+            "postgres_password",
+          ]);
+          for (const value of Object.values(source.data ?? {})) {
+            expect(isOpaqueValueReference(value)).toBe(true);
+          }
+
+          const approvalContexts: unknown[] = [];
+          const sink = yield* executor
+            .execute(
+              connection.address("databases.updateDatabaseByUuid"),
+              { uuid: "db-1", body: { password: source.data?.password } },
+              {
+                opaqueValueHandoff: handoff,
+                onElicitation: (context) =>
+                  Effect.sync(() => {
+                    approvalContexts.push(context);
+                    return { action: "accept" as const };
+                  }),
+              },
+            )
+            .pipe(Effect.withTracer(tracer), Effect.withLogger(logger));
+
+          expect(yield* Ref.get(receivedBodies)).toEqual([{ password }]);
+          expect(sink).toEqual({ ok: true, data: null, http: { status: 200, headers: {} } });
+          expect(approvalContexts).toHaveLength(1);
+          expect(approvalContexts[0]).toMatchObject({
+            requiresLiveApproval: true,
+            request: {
+              _tag: "FormElicitation",
+              message: "PATCH /databases/{uuid}",
+              requestedSchema: { type: "object", properties: {} },
+            },
+          });
+
+          const publicSurface = `${JSON.stringify(source)}\n${JSON.stringify(sink)}\n${JSON.stringify(
+            approvalContexts,
+          )}\n${JSON.stringify(recordedLogs)}\n${spanSurface(spans)}`;
+          for (const canary of [internalUrl, externalUrl, password, postgresPassword, transform]) {
+            expect(publicSurface).not.toContain(canary);
+          }
+        }),
+      ),
   );
 
   it.effect("suppresses transport spans for unannotated custom-header and query API keys", () =>

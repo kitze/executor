@@ -208,7 +208,7 @@ const toBinding = (def: ToolDefinition): OperationBinding =>
       ? { sensitiveOutputSafeScalars: def.operation.sensitiveOutputSafeScalars }
       : {}),
     ...(def.operation.sensitiveResponseHeaders ? { sensitiveResponseHeaders: true } : {}),
-    sensitivityVersion: 1,
+    sensitivityVersion: 2,
     ...(def.operation.requiredScopeAlternatives
       ? { requiredScopeAlternatives: def.operation.requiredScopeAlternatives }
       : {}),
@@ -223,13 +223,13 @@ const descriptionFor = (def: ToolDefinition): string => {
 
 /** Bindings written before opaque sensitivity extraction have no trustworthy
  * source metadata. Do not turn their unknown inputs into secret sinks, but do
- * seal every output and header until a normal connection refresh writes a v1
+ * seal every output and header until a normal connection refresh writes a v2
  * binding from the saved specification. */
 const annotationsForStoredOperation = (binding: OperationBinding) =>
   annotationsForOperation(
     binding.method,
     binding.pathTemplate,
-    binding.sensitivityVersion === 1
+    binding.sensitivityVersion === 2
       ? binding
       : {
           ...binding,

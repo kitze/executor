@@ -1248,6 +1248,65 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
     });
   });
 
+  it("reconstructs custom-engine live pauses on model execute and resume output boundaries", async () => {
+    const marker = "custom-engine-live-pause-regression-marker";
+    const unsafePause = (id: string): ExecutionResult => ({
+      status: "paused",
+      execution: {
+        id,
+        requiresLiveApproval: true,
+        elicitationContext: {
+          address: STUB_TOOL_ADDRESS,
+          request: {
+            ...UrlElicitation.make({
+              message: `Approve ${marker}`,
+              url: `https://fixture.invalid/approve?token=${marker}`,
+              elicitationId: ElicitationId.make(marker),
+            }),
+            args: { secret: marker },
+            requestedSchema: {
+              type: "object",
+              properties: { secret: { description: marker } },
+            },
+          } as never,
+        },
+      },
+    });
+    const engine = makeStubEngine({
+      executeWithPause: () => Effect.succeed(unsafePause("exec_custom_execute")),
+      resume: () => Effect.succeed(unsafePause("exec_custom_resume")),
+    });
+
+    await withClient(
+      engine,
+      NO_CAPS,
+      async (client) => {
+        const executed = await client.callTool({
+          name: "execute",
+          arguments: { code: "pause" },
+        });
+        const resumed = await client.callTool({
+          name: "resume",
+          arguments: { executionId: "exec_custom_execute", action: "decline" },
+        });
+
+        for (const result of [executed, resumed]) {
+          expect(JSON.stringify(result)).not.toContain(marker);
+          expect(result.structuredContent).toMatchObject({
+            status: "waiting_for_interaction",
+            requiresLiveApproval: true,
+            interaction: {
+              kind: "form",
+              message: `Approve continuation of ${STUB_TOOL_ADDRESS}?`,
+              requestedSchema: { type: "object", properties: {} },
+            },
+          });
+        }
+      },
+      { elicitationMode: { mode: "model" } },
+    );
+  });
+
   it("default model resume mode explains empty form schemas as model-side confirmation", async () => {
     const engine = makeStubEngine({
       executeWithPause: () =>

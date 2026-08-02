@@ -240,7 +240,7 @@ export const OperationBinding = Schema.Struct({
   sensitiveResponseHeaders: Schema.optional(Schema.Boolean),
   /** Fresh bindings carry complete sensitivity extraction. Older bindings
    * intentionally fail closed at runtime until their connection is refreshed. */
-  sensitivityVersion: Schema.optional(Schema.Literal(1)),
+  sensitivityVersion: Schema.optional(Schema.Literals([1, 2])),
   /** Declared OAuth scope alternatives (see
    *  ExtractedOperation.requiredScopeAlternatives), persisted with the
    *  binding so the invoke path can annotate a scope-insufficient rejection

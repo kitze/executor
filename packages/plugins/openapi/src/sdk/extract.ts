@@ -3,15 +3,21 @@ import type { SensitiveOutputSafeScalar } from "@executor-js/sdk/core";
 
 import { planToolPaths, type OperationPathInput, type PlannedToolPath } from "./definitions";
 import {
+  coolifyDatabaseResponseSensitiveFields,
+  coolifyDatabaseUpdateSensitiveFields,
   coolifyApplicationResponseSafeFields,
   coolifyEnvironmentResponseSafeFields,
   coolifyEnvironmentWriteKind,
   isCoolifyApplicationListResponseSchema,
   isCoolifyApplicationResponseSchema,
+  isCoolifyDatabaseResponseSchema,
+  isCoolifyDatabaseUpdateRequestSchema,
   isCoolifyEnvironmentListResponseSchema,
   isCoolifyEnvironmentWriteResponseSchema,
   isVerifiedCoolifyApplicationReadOperation,
   isVerifiedCoolifyApplicationListOperation,
+  isVerifiedCoolifyDatabaseReadOperation,
+  isVerifiedCoolifyDatabaseUpdateOperation,
   isVerifiedCoolifyEnvironmentListOperation,
   isVerifiedCoolifyEnvironmentWriteRequest,
   type CoolifyOperationIdentity,
@@ -595,6 +601,30 @@ const addCoolifySensitivity = (
         // projection. Coolify has returned credential-bearing URL userinfo in
         // these fields, so they remain provenance-tainted and are dropped.
         addSafeScalar(`/*/${field.name}`, field);
+      }
+    }
+  }
+
+  if (
+    isVerifiedCoolifyDatabaseReadOperation(input.identity) &&
+    input.responseSchemas.some(isCoolifyDatabaseResponseSchema)
+  ) {
+    for (const schema of input.responseSchemas) {
+      for (const field of coolifyDatabaseResponseSensitiveFields(schema)) {
+        sensitiveOutputPaths.add(`/${field}`);
+      }
+    }
+  }
+
+  if (
+    isVerifiedCoolifyDatabaseUpdateOperation(input.identity) &&
+    input.requestSchemas.length > 0 &&
+    input.requestSchemas.every(isCoolifyDatabaseUpdateRequestSchema)
+  ) {
+    for (const schema of input.requestSchemas) {
+      for (const field of coolifyDatabaseUpdateSensitiveFields(schema)) {
+        sensitiveInputPaths.add(`/body/${field}`);
+        sensitiveInputPaths.add(`/input/${field}`);
       }
     }
   }
@@ -1310,7 +1340,7 @@ export const streamOperationBindings = <E, R>(
           parameters,
           requestBody: Option.fromNullishOr(requestBody),
           responseBody: Option.fromNullishOr(responseBody),
-          sensitivityVersion: 1,
+          sensitivityVersion: 2,
           ...sensitivity,
           ...(requiredScopeAlternatives ? { requiredScopeAlternatives } : {}),
         }),
@@ -1460,7 +1490,7 @@ export const streamOperationBindingsFromStructure = <E, R>(
             parameters,
             requestBody: Option.fromNullishOr(requestBody),
             responseBody: Option.fromNullishOr(responseBody),
-            sensitivityVersion: 1,
+            sensitivityVersion: 2,
             ...sensitivity,
             ...(requiredScopeAlternatives ? { requiredScopeAlternatives } : {}),
           }),

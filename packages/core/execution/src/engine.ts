@@ -1,4 +1,4 @@
-import { Deferred, Effect, Fiber, Predicate, Queue } from "effect";
+import { Deferred, Effect, Fiber, Predicate, Queue, References } from "effect";
 import type * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
 
@@ -76,6 +76,29 @@ export type ResumeResponse = {
 
 const MAX_PREVIEW_CHARS = 30_000;
 
+const publicTerminalResult = (
+  opaqueValueHandoff: ReturnType<typeof makeOpaqueValueHandoff>,
+  result: ExecuteResult,
+): ExecuteResult =>
+  opaqueValueHandoff.hasDirectSensitiveInputValues()
+    ? // A sandbox can derive unbounded transforms after materializing its own
+      // secret. Exact-value redaction cannot prove any terminal result, log,
+      // error, or emitted item safe, so discard the whole surface.
+      { result: null }
+    : (opaqueValueHandoff.redact(result) as ExecuteResult);
+
+/** Sandbox code can derive an unbounded transform before its first sensitive
+ * tool await. At that point an inner runtime span may already own the raw
+ * terminal value, so post-execution redaction is too late. Run the untrusted
+ * sandbox under a no-op observation parent; the enclosing engine span remains
+ * enabled and sees only `publicTerminalResult`. */
+const suppressSandboxObservability = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.withSpan("executor.code.untrusted-sandbox"),
+    Effect.withTracerEnabled(false),
+    Effect.provideService(References.MinimumLogLevel, "None"),
+  );
+
 const truncate = (value: string, max: number): string =>
   value.length > max
     ? `${value.slice(0, max)}\n... [truncated ${value.length - max} chars]`
@@ -145,7 +168,11 @@ export const formatPausedExecution = (
   text: string;
   structured: Record<string, unknown>;
 } => {
-  const req = paused.elicitationContext.request;
+  // Treat formatters as public serialization boundaries in their own right.
+  // Hosts may supply a custom engine, so a caller-provided pause must not be
+  // trusted merely because the built-in engine already reconstructs its own.
+  const publicPaused = publicPausedExecution(paused);
+  const req = publicPaused.elicitationContext.request;
   const lines: string[] = [`Execution paused: ${req.message}`];
   const deadline = options?.deadline;
   const isUrlElicitation = Predicate.isTagged(req, "UrlElicitation");
@@ -153,14 +180,14 @@ export const formatPausedExecution = (
   const requestedSchema = isFormElicitation ? req.requestedSchema : undefined;
   const hasRequestedSchema =
     requestedSchema !== undefined && Object.keys(requestedSchema).length > 0;
-  const requiresLiveApproval = paused.requiresLiveApproval === true;
+  const requiresLiveApproval = publicPaused.requiresLiveApproval === true;
   const baseInstructions = isUrlElicitation
-    ? `The user needs to open this URL in a browser and complete the flow. After the user finishes, call the resume tool with executionId "${paused.id}" and action "accept".`
+    ? `The user needs to open this URL in a browser and complete the flow. After the user finishes, call the resume tool with executionId "${publicPaused.id}" and action "accept".`
     : requiresLiveApproval
       ? "A trusted human approval endpoint must accept this action before it can resume. A model or app-provided raw accept cannot release it."
       : hasRequestedSchema
-        ? `Ask the user for values matching requestedSchema. Then call the resume tool with executionId "${paused.id}", action "accept", and content matching requestedSchema. If the user declines, call resume with action "decline" or "cancel".`
-        : `This is a model-side confirmation gate; there is no browser form to open. Ask the user whether to approve the paused tool call. If the user approves, call the resume tool with executionId "${paused.id}" and action "accept". If the user declines, call resume with action "decline" or "cancel".`;
+        ? `Ask the user for values matching requestedSchema. Then call the resume tool with executionId "${publicPaused.id}", action "accept", and content matching requestedSchema. If the user declines, call resume with action "decline" or "cancel".`
+        : `This is a model-side confirmation gate; there is no browser form to open. Ask the user whether to approve the paused tool call. If the user approves, call the resume tool with executionId "${publicPaused.id}" and action "accept". If the user declines, call resume with action "decline" or "cancel".`;
   const deadlineInstructions = deadline
     ? ` Resume before ${deadline.expiresAt}; this approval window lasts ${formatTtlDuration(deadline.ttlMs)}.`
     : "";
@@ -180,7 +207,7 @@ export const formatPausedExecution = (
     );
   }
 
-  lines.push(`\nexecutionId: ${paused.id}`);
+  lines.push(`\nexecutionId: ${publicPaused.id}`);
   if (deadline) {
     lines.push(
       `\nresumeDeadline: ${deadline.expiresAt} (${formatTtlDuration(deadline.ttlMs)} approval window)`,
@@ -192,14 +219,14 @@ export const formatPausedExecution = (
     text: lines.join("\n"),
     structured: {
       status: "waiting_for_interaction",
-      executionId: paused.id,
+      executionId: publicPaused.id,
       ...(requiresLiveApproval ? { requiresLiveApproval: true } : {}),
       ...(deadline ? { expiresAt: deadline.expiresAt, ttlMs: deadline.ttlMs } : {}),
       interaction: {
         kind: isUrlElicitation ? "url" : "form",
         message: req.message,
         instructions,
-        address: String(paused.elicitationContext.address),
+        address: String(publicPaused.elicitationContext.address),
         ...(isUrlElicitation ? { url: req.url } : {}),
         ...(isFormElicitation ? { requestedSchema: req.requestedSchema } : {}),
       },
@@ -261,12 +288,22 @@ const publicElicitationContext = (context: ElicitationContext): ElicitationConte
   return { address: context.address, request };
 };
 
-const publicPausedExecution = <E>(paused: InternalPausedExecution<E>): PausedExecution => ({
-  id: paused.id,
-  elicitationContext: publicElicitationContext(paused.elicitationContext),
-  ...(paused.requiresLiveApproval === true ? { requiresLiveApproval: true } : {}),
-  ...(paused.hasOpaqueValues === true ? { hasOpaqueValues: true } : {}),
-});
+const publicPausedExecution = (paused: PausedExecution): PausedExecution => {
+  const requiresLiveApproval =
+    paused.requiresLiveApproval === true ||
+    paused.hasOpaqueValues === true ||
+    paused.elicitationContext.requiresLiveApproval === true;
+  return {
+    id: paused.id,
+    elicitationContext: publicElicitationContext(
+      requiresLiveApproval
+        ? { ...paused.elicitationContext, requiresLiveApproval: true }
+        : paused.elicitationContext,
+    ),
+    ...(requiresLiveApproval ? { requiresLiveApproval: true } : {}),
+    ...(paused.hasOpaqueValues === true ? { hasOpaqueValues: true } : {}),
+  };
+};
 
 const readOptionalLimit = (value: unknown, toolName: string): number | ExecutionToolError => {
   if (value === undefined) {
@@ -650,7 +687,8 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
     fiber = yield* Effect.forkDetach(
       codeExecutor
         .execute(code, invoker)
-        .pipe(Effect.map((result) => opaqueValueHandoff.redact(result) as ExecuteResult))
+        .pipe(suppressSandboxObservability)
+        .pipe(Effect.map((result) => publicTerminalResult(opaqueValueHandoff, result)))
         .pipe(Effect.withSpan("executor.code.exec")),
     );
 
@@ -782,7 +820,8 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
     );
     return yield* codeExecutor
       .execute(code, invoker)
-      .pipe(Effect.map((result) => opaqueValueHandoff.redact(result) as ExecuteResult))
+      .pipe(suppressSandboxObservability)
+      .pipe(Effect.map((result) => publicTerminalResult(opaqueValueHandoff, result)))
       .pipe(Effect.withSpan("executor.code.exec"))
       .pipe(Effect.ensuring(Effect.sync(() => opaqueValueHandoff.dispose())));
   });
