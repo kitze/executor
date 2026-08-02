@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect } from "effect";
+import { Effect, Logger } from "effect";
+import type * as Tracer from "effect/Tracer";
 
 import {
   ElicitationResponse,
@@ -14,8 +15,91 @@ import { makeQuickJsExecutor } from "@executor-js/runtime-quickjs";
 
 import { createExecutionEngine, formatPausedExecution } from "./engine";
 
-const MARKER = "opaque-execution-regression-marker";
+const MARKER = 'opaque execution "line1\r\nline2" * / marker';
 const DIRECT_ARGUMENT_MARKER = "approval-argument-regression-marker";
+
+const adversarialEchoes = (value: string): readonly string[] => {
+  const json = JSON.stringify(value);
+  const uri = encodeURIComponent(value);
+  return [
+    encodeURIComponent(json),
+    new URLSearchParams([["value", json]]).toString(),
+    encodeURIComponent(value.replaceAll("\r\n", "\n")),
+    uri.replaceAll("*", "%2A"),
+    encodeURIComponent(uri),
+  ];
+};
+
+type RecordedSpan = {
+  readonly name: string;
+  readonly attributes: ReadonlyMap<string, unknown>;
+  readonly events: readonly {
+    readonly name: string;
+    readonly attributes: Readonly<Record<string, unknown>> | undefined;
+  }[];
+  status: Tracer.SpanStatus;
+};
+
+const makeRecordingTracer = (): {
+  readonly tracer: Tracer.Tracer;
+  readonly spans: RecordedSpan[];
+} => {
+  const spans: RecordedSpan[] = [];
+  const tracer: Tracer.Tracer = {
+    span: (options) => {
+      const attributes = new Map<string, unknown>();
+      const events: {
+        readonly name: string;
+        readonly attributes: Readonly<Record<string, unknown>> | undefined;
+      }[] = [];
+      let status: Tracer.SpanStatus = { _tag: "Started", startTime: options.startTime };
+      const recorded: RecordedSpan = {
+        name: options.name,
+        attributes,
+        events,
+        status,
+      };
+      spans.push(recorded);
+      return {
+        _tag: "Span",
+        name: options.name,
+        spanId: `span-${spans.length}`,
+        traceId: "trace-opaque-execution",
+        parent: options.parent,
+        annotations: options.annotations,
+        get status() {
+          return status;
+        },
+        attributes,
+        links: options.links,
+        sampled: options.sampled,
+        kind: options.kind,
+        end: (endTime, exit) => {
+          status = { _tag: "Ended", startTime: options.startTime, endTime, exit };
+          recorded.status = status;
+        },
+        attribute: (key, value) => {
+          attributes.set(key, value);
+        },
+        event: (name, _startTime, eventAttributes) => {
+          events.push({ name, attributes: eventAttributes });
+        },
+        addLinks: () => undefined,
+      };
+    },
+  };
+  return { tracer, spans };
+};
+
+const spanSurface = (spans: readonly RecordedSpan[]): string =>
+  JSON.stringify(
+    spans.map((span) => ({
+      name: span.name,
+      attributes: [...span.attributes.entries()],
+      events: span.events,
+    })),
+    (_key, value) => (typeof value === "bigint" ? value.toString() : value),
+  );
 
 type Ledger = {
   readonly writes: unknown[];
@@ -44,11 +128,56 @@ const makePlugin = (ledger: Ledger) =>
             description: "Write an environment value",
             annotations: { sensitiveInputPaths: ["/body/value"] },
             execute: (args) =>
+              Effect.gen(function* () {
+                ledger.writes.push(args);
+                const value = (args as { readonly body?: { readonly value?: unknown } }).body
+                  ?.value;
+                const echoes = adversarialEchoes(String(value));
+                yield* Effect.log("opaque sink response", { echoes });
+                yield* Effect.annotateCurrentSpan({
+                  "opaque.adversarial.echo": echoes.join("|"),
+                });
+                return ToolResult.ok(
+                  {
+                    success: echoes.map((echo) => ({ body: echo })),
+                    error: echoes.map((echo) => ({ message: echo })),
+                    logs: echoes,
+                    trace: echoes.map((echo) => ({ "http.response.body": echo })),
+                    directText: echoes.join("\n"),
+                  },
+                  { http: { status: 202, headers: { "x-opaque-echo": echoes.join(",") } } },
+                );
+              }),
+          }),
+          tool({
+            name: "writeFailure",
+            description: "Reject an environment value",
+            annotations: { sensitiveInputPaths: ["/body/value"] },
+            execute: (args) =>
               Effect.sync(() => {
                 ledger.writes.push(args);
-                return {
-                  echoed: (args as { readonly body?: { readonly value?: unknown } }).body?.value,
-                };
+                const value = (args as { readonly body?: { readonly value?: unknown } }).body
+                  ?.value;
+                const echoes = adversarialEchoes(String(value));
+                return ToolResult.fail({
+                  code: echoes[0] ?? "UPSTREAM_REJECTED",
+                  message: `rejected ${echoes[0]}`,
+                  details: { echoes },
+                  status: 422,
+                  retryable: false,
+                });
+              }),
+          }),
+          tool({
+            name: "writeText",
+            description: "Write an environment value and return text",
+            annotations: { sensitiveInputPaths: ["/body/value"] },
+            execute: (args) =>
+              Effect.sync(() => {
+                ledger.writes.push(args);
+                const value = (args as { readonly body?: { readonly value?: unknown } }).body
+                  ?.value;
+                return adversarialEchoes(String(value)).join("\n");
               }),
           }),
           tool({
@@ -92,6 +221,11 @@ describe("opaque sensitive value execution", () => {
     () =>
       Effect.gen(function* () {
         const { executor, engine, ledger } = yield* makeHarness();
+        const { tracer, spans } = makeRecordingTracer();
+        const recordedLogs: string[] = [];
+        const logger = Logger.make<unknown, void>((options) => {
+          recordedLogs.push(JSON.stringify(options.message));
+        });
         // This rule normally bypasses a write approval. An opaque input must
         // still stop for a live human decision.
         yield* executor.policies.create({
@@ -100,7 +234,9 @@ describe("opaque sensitive value execution", () => {
           action: "approve",
         });
 
-        const paused = yield* engine.executeWithPause(handoffCode);
+        const paused = yield* engine
+          .executeWithPause(handoffCode)
+          .pipe(Effect.withTracer(tracer), Effect.withLogger(logger));
         expect(paused.status, "an opaque-consuming call still pauses under an approve policy").toBe(
           "paused",
         );
@@ -117,14 +253,18 @@ describe("opaque sensitive value execution", () => {
         expect(formatted.text).not.toContain(MARKER);
         expect(ledger.writes, "the sink has not received a value before approval").toEqual([]);
 
-        const rawResume = yield* engine.resume(paused.execution.id, { action: "accept" });
+        const rawResume = yield* engine
+          .resume(paused.execution.id, { action: "accept" })
+          .pipe(Effect.withTracer(tracer), Effect.withLogger(logger));
         expect(rawResume?.status, "raw model/API JSON cannot release the secret").toBe("paused");
         expect(ledger.writes, "a rejected raw accept does not invoke the sink").toEqual([]);
 
         const granted = yield* engine.grantLiveApproval(paused.execution.id, { action: "accept" });
         expect(granted, "an authenticated browser/native endpoint mints the grant").not.toBeNull();
         if (!granted) return;
-        const resumed = yield* engine.resume(paused.execution.id, granted);
+        const resumed = yield* engine
+          .resume(paused.execution.id, granted)
+          .pipe(Effect.withTracer(tracer), Effect.withLogger(logger));
         expect(resumed?.status).toBe("completed");
         if (resumed?.status !== "completed") return;
 
@@ -137,8 +277,87 @@ describe("opaque sensitive value execution", () => {
         expect(resumed.result.logs?.join("\n") ?? "", "sandbox logs are redacted").not.toContain(
           MARKER,
         );
+        const sandboxResult = resumed.result.result as {
+          readonly source?: unknown;
+          readonly written?: unknown;
+        };
+        expect(sandboxResult.written).toEqual({
+          ok: true,
+          data: null,
+          http: { status: 202, headers: {} },
+        });
         expect(JSON.stringify(resumed.result.result)).toContain("ExecutorOpaqueValue");
+
+        const echoes = adversarialEchoes(MARKER);
+        expect(echoes[0], "JSON.stringify followed by URI encoding").toContain("%5C%22");
+        expect(echoes[1], "JSON.stringify followed by form encoding").toContain("+");
+        expect(echoes[2], "CRLF normalization leaves only an encoded LF").toContain("%0A");
+        expect(echoes[2]).not.toContain("%0D%0A");
+        expect(echoes[3], "strict RFC3986 encoding escapes star").toContain("%2A");
+        expect(echoes[4], "double encoding escapes the first percent bytes").toContain("%25");
+        const publicSurface = JSON.stringify(resumed);
+        const observedSpans = spanSurface(spans);
+        const observedLogs = recordedLogs.join("\n");
+        for (const echo of echoes) {
+          expect(publicSurface).not.toContain(echo);
+          expect(observedSpans).not.toContain(echo);
+          expect(observedLogs).not.toContain(echo);
+        }
       }),
+  );
+
+  it.effect("suppresses transformed opaque echoes in failures and raw text results", () =>
+    Effect.gen(function* () {
+      const { executor, engine, ledger } = yield* makeHarness();
+      const { tracer, spans } = makeRecordingTracer();
+      for (const operation of ["writeFailure", "writeText"] as const) {
+        yield* executor.policies.create({
+          owner: "org",
+          pattern: `opaque.${operation}`,
+          action: "approve",
+        });
+
+        const paused = yield* Effect.withTracer(
+          engine.executeWithPause(`
+            const source = await tools.opaque.read({});
+            const reference = source.data.envs[0].value;
+            return await tools.opaque.${operation}({ body: { value: reference } });
+          `),
+          tracer,
+        );
+        expect(paused.status).toBe("paused");
+        if (paused.status !== "paused") continue;
+        const grant = yield* engine.grantLiveApproval(paused.execution.id, { action: "accept" });
+        expect(grant).not.toBeNull();
+        if (!grant) continue;
+        const resumed = yield* Effect.withTracer(engine.resume(paused.execution.id, grant), tracer);
+        expect(resumed?.status).toBe("completed");
+        if (resumed?.status !== "completed") continue;
+
+        const expectedResult =
+          operation === "writeFailure"
+            ? {
+                ok: false,
+                error: {
+                  code: "UPSTREAM_REQUEST_FAILED",
+                  message: "Upstream request failed.",
+                  status: 422,
+                  retryable: false,
+                },
+              }
+            : { ok: true, data: null };
+        expect(resumed.result.result).toEqual(expectedResult);
+        expect(JSON.stringify(resumed)).not.toContain(MARKER);
+        for (const echo of adversarialEchoes(MARKER)) {
+          expect(JSON.stringify(resumed)).not.toContain(echo);
+        }
+      }
+      expect(ledger.writes).toEqual([{ body: { value: MARKER } }, { body: { value: MARKER } }]);
+      const observedSpans = spanSurface(spans);
+      for (const echo of adversarialEchoes(MARKER)) {
+        expect(observedSpans).not.toContain(echo);
+      }
+    }),
   );
 
   it.effect("does not invoke an opaque sink after a decline", () =>

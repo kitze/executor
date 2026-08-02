@@ -1,4 +1,4 @@
-import { Effect, Inspectable, Layer, Option, Predicate, Schema } from "effect";
+import { Effect, Inspectable, Layer, Option, Predicate, References, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 import { fumadb } from "@executor-js/fumadb";
 import { memoryAdapter } from "@executor-js/fumadb/adapters/memory";
@@ -4377,6 +4377,19 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               )
             : args;
 
+        // `withTracerEnabled(false)` prevents child spans, but by itself an
+        // effect can still annotate the executor's current parent span. Open
+        // a span while tracing is disabled so Effect installs a no-op parent
+        // for the entire untrusted invocation/validation boundary as well.
+        // Suppress Effect logs in the same boundary: plugin/transport loggers
+        // cannot be trusted to avoid transformed secret-bearing payloads.
+        const suppressSensitiveTransportObservability = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          effect.pipe(
+            Effect.withSpan("executor.tool.sensitive-transport"),
+            Effect.withTracerEnabled(false),
+            Effect.provideService(References.MinimumLogLevel, "None"),
+          );
+
         // Protect declared sensitive response fields, then redact every value
         // already sealed in this execution from all success/result envelopes.
         // The latter catches an upstream echo of a source value in a different
@@ -4385,6 +4398,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           value: unknown,
           annotations: ToolAnnotations | undefined,
           context: OpaqueValueCallContext,
+          consumedOpaqueInput: boolean,
         ): unknown => {
           if (!opaqueValues) return value;
           if (isToolResult(value)) {
@@ -4392,7 +4406,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               (annotations?.sensitiveOutputPaths?.length ?? 0) > 0 ||
               annotations?.sensitiveResponseHeaders === true;
             const hasSensitiveTransport =
-              hasSensitiveOutput || (annotations?.sensitiveInputPaths?.length ?? 0) > 0;
+              consumedOpaqueInput ||
+              hasSensitiveOutput ||
+              (annotations?.sensitiveInputPaths?.length ?? 0) > 0;
             if (!value.ok) {
               // Error payloads are upstream-controlled and can contain the
               // same secret-bearing response shape as a successful call. They
@@ -4403,7 +4419,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 return {
                   ok: false,
                   error: {
-                    code: value.error.code,
+                    code: "UPSTREAM_REQUEST_FAILED",
                     message: "Upstream request failed.",
                     ...(value.error.status !== undefined ? { status: value.error.status } : {}),
                     ...(value.error.retryable !== undefined
@@ -4413,6 +4429,20 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 };
               }
               return opaqueValues.redact(value);
+            }
+            // Once an invocation materializes an opaque capability, every
+            // byte controlled by its upstream is tainted by provenance. Do
+            // not try to enumerate JSON/URI/form/CRLF/double-encoding
+            // transforms: retain only executor-owned success metadata and
+            // discard the body plus arbitrary response headers. Calls that
+            // merely *produce* opaque handles do not enter this branch, so
+            // their protected source shape remains available to the sandbox.
+            if (consumedOpaqueInput) {
+              return {
+                ok: true,
+                data: null,
+                ...(value.http ? { http: { status: value.http.status, headers: {} } } : {}),
+              };
             }
             return opaqueValues.redact({
               ...value,
@@ -4429,6 +4459,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 : {}),
             });
           }
+          if (consumedOpaqueInput) return null;
           return opaqueValues.protectOutput(value, annotations?.sensitiveOutputPaths, context);
         };
 
@@ -4517,11 +4548,16 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           });
           const result = yield* wrapInvocationError(
             staticSensitiveTransportTracingDisabled
-              ? invocation.pipe(Effect.withTracerEnabled(false))
+              ? suppressSensitiveTransportObservability(invocation)
               : invocation,
             staticEntry.tool.annotations,
           );
-          return protectInvocationResult(result, staticEntry.tool.annotations, opaqueContext);
+          return protectInvocationResult(
+            result,
+            staticEntry.tool.annotations,
+            opaqueContext,
+            prepared.containsOpaqueValue,
+          );
         }
 
         const parsed = parseToolAddress(String(address));
@@ -4640,7 +4676,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             })
             .pipe(
               sensitiveTransportTracingDisabled
-                ? Effect.withTracerEnabled(false)
+                ? suppressSensitiveTransportObservability
                 : (effect) => effect,
               wrapInvocationError,
             );
@@ -4701,7 +4737,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           // declared sensitive transport in either direction.
           return wrapInvocationError(
             sensitiveTransportTracingDisabled
-              ? invocation.pipe(Effect.withTracerEnabled(false))
+              ? suppressSensitiveTransportObservability(invocation)
               : invocation,
             resolvedAnnotations,
           );
@@ -4724,7 +4760,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // still surfaces the upstream's own auth failure and its reconnect
         // guidance rather than a masked one.
         if (!isUnauthorizedToolFailure(first)) {
-          return protectInvocationResult(first, resolvedAnnotations, opaqueContext);
+          return protectInvocationResult(
+            first,
+            resolvedAnnotations,
+            opaqueContext,
+            prepared.containsOpaqueValue,
+          );
         }
         const refreshed = yield* forceRefreshConnectionValues(connectionRow).pipe(
           // A failed re-mint is not this call's failure to report: the upstream
@@ -4732,12 +4773,20 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           // strictly more actionable than a refresh-plumbing error. Keep it.
           Effect.catchTag("CredentialResolutionError", () => Effect.succeed(null)),
         );
-        if (!refreshed) return protectInvocationResult(first, resolvedAnnotations, opaqueContext);
+        if (!refreshed) {
+          return protectInvocationResult(
+            first,
+            resolvedAnnotations,
+            opaqueContext,
+            prepared.containsOpaqueValue,
+          );
+        }
         yield* Effect.annotateCurrentSpan({ "executor.oauth.refresh.retried": true });
         return protectInvocationResult(
           yield* invokeWith(refreshed),
           resolvedAnnotations,
           opaqueContext,
+          prepared.containsOpaqueValue,
         );
       }).pipe(
         // Expected tool failures (`ToolResult.fail`) resolve through the
