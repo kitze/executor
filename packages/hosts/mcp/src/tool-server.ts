@@ -20,7 +20,7 @@ import type {
 import { Validator } from "@cfworker/json-schema";
 import * as z from "zod/v4";
 
-import { isToolFile, sanitizeArtifactPreviewMarkup } from "@executor-js/sdk";
+import { FormElicitation, isToolFile, sanitizeArtifactPreviewMarkup } from "@executor-js/sdk";
 import type {
   Artifact,
   ArtifactBinding,
@@ -373,17 +373,34 @@ const elicitationRequestToParams: (request: ElicitationRequest) => ElicitInputPa
     Match.exhaustive,
   );
 
+const publicMcpElicitationContext = (context: ElicitationContext): ElicitationContext =>
+  context.requiresLiveApproval === true
+    ? {
+        address: context.address,
+        request: FormElicitation.make({
+          message: `Approve continuation of ${context.address}?`,
+          requestedSchema: { type: "object", properties: {} },
+        }),
+        requiresLiveApproval: true,
+      }
+    : context;
+
 const makeMcpElicitationHandler =
   (
     server: McpServer,
     debugLog?: (event: string, data: Record<string, unknown>) => void,
   ): ElicitationHandler =>
   (ctx: ElicitationContext): Effect.Effect<typeof ElicitationResponse.Type> => {
+    // The SDK/engine already reconstruct live-sensitive requests, but the MCP
+    // bridge is also a console/debug and native-client boundary. Rebuild here
+    // so a custom engine or cast-only excess field cannot put a raw message,
+    // URL, schema, or argument into MCP output or debug logs.
+    const publicContext = publicMcpElicitationContext(ctx);
     const { url: supportsUrl } = getElicitationSupport(server);
 
     // If client doesn't support url mode, fall back to a form asking the user
     // to visit the URL manually and confirm when done.
-    const params = Match.value(ctx.request).pipe(
+    const params = Match.value(publicContext.request).pipe(
       Match.tag(
         "UrlElicitation",
         (req): ElicitInputParams =>
@@ -399,13 +416,13 @@ const makeMcpElicitationHandler =
     );
 
     return Effect.promise(async (): Promise<typeof ElicitationResponse.Type> => {
-      const requestTag = elicitationRequestTag(ctx.request);
+      const requestTag = elicitationRequestTag(publicContext.request);
       debugLog?.("elicitation.request", {
         requestTag,
         supportsUrl,
-        message: ctx.request.message,
-        hasRequestedSchema: requestedSchemaIsNonEmpty(ctx.request),
-        url: elicitationRequestUrl(ctx.request),
+        message: publicContext.request.message,
+        hasRequestedSchema: requestedSchemaIsNonEmpty(publicContext.request),
+        url: elicitationRequestUrl(publicContext.request),
         clientCapabilities: server.server.getClientCapabilities() ?? null,
       });
 

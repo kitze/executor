@@ -1,5 +1,7 @@
 import { Predicate } from "effect";
 
+import type { SensitiveOutputSafeScalar } from "./tool";
+
 // ---------------------------------------------------------------------------
 // Opaque sensitive values — per-execution, in-memory capabilities.
 //
@@ -113,7 +115,7 @@ export interface OpaqueValueHandoff {
     value: unknown,
     paths: readonly string[] | undefined,
     context?: OpaqueValueCallContext,
-    safePaths?: readonly string[],
+    safeScalars?: readonly SensitiveOutputSafeScalar[],
   ) => unknown;
   /**
    * Replace permitted opaque input values with type-compatible, non-secret
@@ -218,6 +220,54 @@ const matchingSuffixes = (
     .filter((pattern) => isWildcard(pattern[0]) || pattern[0]?.value === segment)
     .map((pattern) => pattern.slice(1));
 
+const matchingLiteralSuffixes = (
+  patterns: readonly PathSegment[][],
+  segment: string,
+): readonly PathSegment[][] =>
+  patterns
+    .filter((pattern) => !isWildcard(pattern[0]) && pattern[0]?.value === segment)
+    .map((pattern) => pattern.slice(1));
+
+type SafeScalarPattern = {
+  readonly segments: readonly PathSegment[];
+  readonly type: SensitiveOutputSafeScalar["type"];
+};
+
+const patternsOverlap = (left: readonly PathSegment[], right: readonly PathSegment[]): boolean => {
+  const sharedLength = Math.min(left.length, right.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const leftSegment = left[index];
+    const rightSegment = right[index];
+    if (
+      !isWildcard(leftSegment) &&
+      !isWildcard(rightSegment) &&
+      leftSegment?.value !== rightSegment?.value
+    ) {
+      return false;
+    }
+  }
+  return true;
+};
+
+const matchesSafeScalarType = (value: unknown, pattern: SafeScalarPattern): boolean => {
+  if (pattern.type === "boolean") return typeof value === "boolean";
+  if (pattern.type === "integer") return typeof value === "number" && Number.isSafeInteger(value);
+  return typeof value === "number" && Number.isFinite(value);
+};
+
+const matchingSafeSuffixes = (
+  patterns: readonly SafeScalarPattern[],
+  segment: string,
+  allowWildcard: boolean,
+): readonly SafeScalarPattern[] =>
+  patterns
+    .filter(
+      (pattern) =>
+        (allowWildcard && isWildcard(pattern.segments[0])) ||
+        (!isWildcard(pattern.segments[0]) && pattern.segments[0]?.value === segment),
+    )
+    .map((pattern) => ({ ...pattern, segments: pattern.segments.slice(1) }));
+
 const validationValueFor = (value: unknown, seen = new WeakMap<object, unknown>()): unknown => {
   if (value === null || value === undefined) return value;
   if (typeof value === "string") {
@@ -309,24 +359,47 @@ const cloneAndReplaceOutput = (
  * later capability to a different JSON Pointer. */
 const projectSourceOutput = (
   value: unknown,
-  patterns: readonly PathSegment[][],
+  sensitivePatterns: readonly PathSegment[][],
+  safePatterns: readonly SafeScalarPattern[],
   depth = 0,
 ): unknown => {
-  if (patterns.some((pattern) => pattern.length === 0)) return value;
+  if (sensitivePatterns.some((pattern) => pattern.length === 0)) return value;
+  if (
+    safePatterns.some(
+      (pattern) => pattern.segments.length === 0 && matchesSafeScalarType(value, pattern),
+    )
+  ) {
+    return value;
+  }
   if (depth > MAX_REDACTION_DEPTH) return null;
   if (Array.isArray(value)) {
     return value.map((item, index) => {
-      const suffixes = matchingSuffixes(patterns, String(index));
-      return suffixes.length > 0 ? projectSourceOutput(item, suffixes, depth + 1) : null;
+      const segment = String(index);
+      const sensitiveSuffixes = matchingSuffixes(sensitivePatterns, segment);
+      const safeSuffixes = matchingSafeSuffixes(safePatterns, segment, true);
+      return sensitiveSuffixes.length > 0 || safeSuffixes.length > 0
+        ? projectSourceOutput(item, sensitiveSuffixes, safeSuffixes, depth + 1)
+        : null;
     });
   }
   if (!isRecord(value)) return undefined;
   const out: Record<string, unknown> = {};
+  let included = false;
   for (const [key, item] of Object.entries(value)) {
-    const suffixes = matchingSuffixes(patterns, key);
-    if (suffixes.length > 0) out[key] = projectSourceOutput(item, suffixes, depth + 1);
+    // Wildcards over object keys would expose arbitrary upstream-controlled
+    // key names as an untyped side channel. They are supported for arrays,
+    // whose indexes are executor-derived, but dropped fail-closed for objects.
+    const sensitiveSuffixes = matchingLiteralSuffixes(sensitivePatterns, key);
+    const safeSuffixes = matchingSafeSuffixes(safePatterns, key, false);
+    if (sensitiveSuffixes.length > 0 || safeSuffixes.length > 0) {
+      const projected = projectSourceOutput(item, sensitiveSuffixes, safeSuffixes, depth + 1);
+      if (projected !== undefined) {
+        out[key] = projected;
+        included = true;
+      }
+    }
   }
-  return out;
+  return included ? out : undefined;
 };
 
 type OpaqueOccurrence = {
@@ -441,6 +514,37 @@ const replaceOpaqueInputs = (
     );
   };
   return visit(value, 0);
+};
+
+/** Record caller-generated values at declared sensitive sink paths before an
+ * approval can suspend the execution. Unlike opaque handles these values do
+ * not need resolving, but later sandbox results/logs still need exact and
+ * common transport-form redaction. */
+const visitSensitiveInputValues = (
+  value: unknown,
+  patterns: readonly PathSegment[][],
+  visit: (value: unknown) => void,
+  depth = 0,
+): void => {
+  if (depth > MAX_REDACTION_DEPTH) return;
+  if (patterns.some((pattern) => pattern.length === 0)) {
+    if (!isOpaqueValueReference(value)) visit(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const suffixes = matchingSuffixes(patterns, String(index));
+      if (suffixes.length > 0) {
+        visitSensitiveInputValues(value[index], suffixes, visit, depth + 1);
+      }
+    }
+    return;
+  }
+  if (!isRecord(value)) return;
+  for (const [key, item] of Object.entries(value)) {
+    const suffixes = matchingSuffixes(patterns, key);
+    if (suffixes.length > 0) visitSensitiveInputValues(item, suffixes, visit, depth + 1);
+  }
 };
 
 // OpenAPI `allowReserved: true` preserves both RFC 3986 unreserved characters
@@ -610,6 +714,13 @@ export const makeOpaqueValueHandoff = (
     }
   };
 
+  const rememberSensitiveValue = (value: unknown): void => {
+    redactionValues.push(value);
+    for (const needle of stringsIn(value)) {
+      for (const form of redactionFormsFor(needle)) redactionNeedles.add(form);
+    }
+  };
+
   const redactText = (value: string): string => replaceText(value, [...redactionNeedles]);
 
   const redact = (value: unknown, depth = 0, seen = new WeakMap<object, unknown>()): unknown => {
@@ -638,7 +749,7 @@ export const makeOpaqueValueHandoff = (
 
   return {
     hasOpaqueValues: () => hasSealedValues,
-    protectOutput: (value, paths, context = defaultContext, safePaths = []) => {
+    protectOutput: (value, paths, context = defaultContext, safeScalars = []) => {
       const patterns = decodePointers(paths);
       if (patterns.length === 0) return redact(value);
       assertAvailable();
@@ -646,14 +757,23 @@ export const makeOpaqueValueHandoff = (
       // opaque capability. Project structurally before sealing so base64,
       // base64url, hashes, or any future sibling transform never reaches a
       // result/redaction/trace boundary in the first place.
-      const projected = projectSourceOutput(value, [...patterns, ...decodePointers(safePaths)]);
+      const safePatterns = safeScalars
+        .map(
+          (projection): SafeScalarPattern => ({
+            segments: decodePointer(projection.path),
+            type: projection.type,
+          }),
+        )
+        .filter(
+          (projection) =>
+            !patterns.some((sensitivePattern) =>
+              patternsOverlap(projection.segments, sensitivePattern),
+            ),
+        );
+      const projected = projectSourceOutput(value, patterns, safePatterns);
       const sealed = cloneAndReplaceOutput(projected, patterns, (sensitiveValue, path) => {
         const id = crypto.randomUUID();
-        const needles = [...stringsIn(sensitiveValue)];
-        redactionValues.push(sensitiveValue);
-        for (const needle of needles) {
-          for (const form of redactionFormsFor(needle)) redactionNeedles.add(form);
-        }
+        rememberSensitiveValue(sensitiveValue);
         entries.set(id, {
           value: sensitiveValue,
           validationValue: validationValueFor(sensitiveValue),
@@ -669,14 +789,12 @@ export const makeOpaqueValueHandoff = (
       return redact(sealed);
     },
     prepareInputForValidation: (value, paths, context = defaultContext) => {
-      const inspected = inspectOpaqueInputs(
-        value,
-        decodePointers(paths),
-        entries,
-        context,
-        executionId,
-        now,
-      );
+      const patterns = decodePointers(paths);
+      if (patterns.length > 0) {
+        assertAvailable();
+        visitSensitiveInputValues(value, patterns, rememberSensitiveValue);
+      }
+      const inspected = inspectOpaqueInputs(value, patterns, entries, context, executionId, now);
       // Bind only after every referenced handle passed validation. A malformed
       // multi-handle input cannot leave a partial sink reservation behind.
       const nextBindings = inspected.occurrences.map((occurrence) => ({

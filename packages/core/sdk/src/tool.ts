@@ -22,13 +22,10 @@ export interface ToolAnnotations {
    * `/credentials/password` and a wildcard beneath `/items` are valid paths.
    */
   readonly sensitiveOutputPaths?: readonly string[];
-  /**
-   * Trusted JSON Pointer paths that may remain visible beside an opaque
-   * sensitive output. Once a response mints a capability, every other
-   * upstream-controlled leaf is dropped; plugins must opt specific metadata
-   * leaves back in rather than relying on transform-by-transform redaction.
-   */
-  readonly sensitiveOutputSafePaths?: readonly string[];
+  /** Trusted, terminal scalar projections that may remain visible beside an
+   * opaque sensitive output. Runtime values must match the declared scalar
+   * type, and any path overlapping a sensitive path is dropped fail-closed. */
+  readonly sensitiveOutputSafeScalars?: readonly SensitiveOutputSafeScalar[];
   /** The operation can return a sensitive HTTP response header. Headers have
    * no JSON-pointer projection, so the executor strips the entire response
    * header envelope before it crosses a sandbox or tracing boundary. */
@@ -41,6 +38,13 @@ export interface ToolAnnotations {
    */
   readonly sensitiveInputPaths?: readonly string[];
 }
+
+export type SensitiveOutputSafeScalar = {
+  readonly path: string;
+  /** Arbitrary upstream strings can always be token-shaped or transformed
+   * secrets. Only finite numeric and boolean leaves may be projected. */
+  readonly type: "number" | "integer" | "boolean";
+};
 
 /** A tool as produced by a plugin — the definition, no address yet (the SDK
  *  stamps that from the owning connection). */

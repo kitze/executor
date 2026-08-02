@@ -4136,12 +4136,27 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         ? resolveElicitationHandler(options.onElicitation)
         : defaultElicitationHandler;
 
-    const buildElicit = (address: ToolAddress, handler: ElicitationHandler): Elicit => {
+    const buildElicit = (
+      address: ToolAddress,
+      handler: ElicitationHandler,
+      containsSensitiveValues: boolean,
+    ): Elicit => {
       return (request: ElicitationRequest) =>
         Effect.gen(function* () {
+          // Once a handler can observe a declared sensitive input/output, its
+          // request text, URL, schema, and even cast-only excess properties are
+          // untrusted output channels. Keep the raw request inside the active
+          // invocation and expose only executor-owned approval metadata.
+          const publicRequest = containsSensitiveValues
+            ? FormElicitation.make({
+                message: `Approve continuation of ${address}?`,
+                requestedSchema: { type: "object", properties: {} },
+              })
+            : request;
           const response: ElicitationResponse = yield* handler({
             address,
-            request,
+            request: publicRequest,
+            ...(containsSensitiveValues ? { requiresLiveApproval: true } : {}),
           });
           if (response.action !== "accept") {
             return yield* new ElicitationDeclinedError({
@@ -4331,6 +4346,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           consumedOpaqueInput: boolean,
         ): unknown => {
           if (!opaqueValues) return value;
+          const hasSensitiveInput = (annotations?.sensitiveInputPaths?.length ?? 0) > 0;
           if (isToolResult(value)) {
             const hasSensitiveOutput =
               (annotations?.sensitiveOutputPaths?.length ?? 0) > 0 ||
@@ -4368,35 +4384,38 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             // merely *produce* opaque handles do not enter this branch, so
             // their fail-closed projected source shape remains available to
             // the sandbox.
-            if (consumedOpaqueInput) {
+            if (consumedOpaqueInput || hasSensitiveInput) {
               return {
                 ok: true,
                 data: null,
                 ...(value.http ? { http: { status: value.http.status, headers: {} } } : {}),
               };
             }
-            return opaqueValues.redact({
-              ...value,
-              data: opaqueValues.protectOutput(
-                value.data,
-                annotations?.sensitiveOutputPaths,
-                context,
-                annotations?.sensitiveOutputSafePaths,
-              ),
-              // Response headers have no schema-level projection today. When
-              // a response body contains a declared secret, do not make an
-              // unclassified header an alternate plaintext output channel.
-              ...(hasSensitiveTransport && value.http
-                ? { http: { ...value.http, headers: {} } }
-                : {}),
-            });
+            const protectedData = opaqueValues.protectOutput(
+              value.data,
+              annotations?.sensitiveOutputPaths,
+              context,
+              annotations?.sensitiveOutputSafeScalars,
+            );
+            if (hasSensitiveTransport) {
+              // ToolResult decoding is intentionally permissive about excess
+              // properties. Reconstruct the public envelope instead of
+              // spreading an upstream/plugin object that can hide a sibling
+              // transform beside `ok`, `data`, or inside transport metadata.
+              return opaqueValues.redact({
+                ok: true,
+                data: protectedData,
+                ...(value.http ? { http: { status: value.http.status, headers: {} } } : {}),
+              });
+            }
+            return opaqueValues.redact({ ...value, data: protectedData });
           }
-          if (consumedOpaqueInput) return null;
+          if (consumedOpaqueInput || hasSensitiveInput) return null;
           return opaqueValues.protectOutput(
             value,
             annotations?.sensitiveOutputPaths,
             context,
-            annotations?.sensitiveOutputSafePaths,
+            annotations?.sensitiveOutputSafeScalars,
           );
         };
 
@@ -4495,7 +4514,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             staticEntry.tool.handler({
               ctx: staticEntry.ctx,
               args: invocationArgs,
-              elicit: buildElicit(address, handler),
+              elicit: buildElicit(
+                address,
+                handler,
+                prepared.containsOpaqueValue || staticSensitiveTransportTracingDisabled,
+              ),
             }),
           );
           const result = yield* wrapInvocationError(
@@ -4677,7 +4700,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               toolRow: row,
               credential,
               args: invocationArgs,
-              elicit: buildElicit(address, handler),
+              elicit: buildElicit(
+                address,
+                handler,
+                prepared.containsOpaqueValue || sensitiveTransportTracingDisabled,
+              ),
               invokeOptions: {
                 ...options,
                 ...(sensitiveTransportTracingDisabled

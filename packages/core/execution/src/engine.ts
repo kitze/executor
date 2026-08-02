@@ -9,7 +9,12 @@ import type {
   ElicitationHandler,
   ElicitationContext,
 } from "@executor-js/sdk/core";
-import { makeOpaqueValueHandoff } from "@executor-js/sdk/core";
+import {
+  ElicitationId,
+  FormElicitation,
+  UrlElicitation,
+  makeOpaqueValueHandoff,
+} from "@executor-js/sdk/core";
 import { CodeExecutionError } from "@executor-js/codemode-core";
 import type { CodeExecutor, ExecuteResult, SandboxToolInvoker } from "@executor-js/codemode-core";
 
@@ -217,6 +222,51 @@ export const formatTtlDuration = (ttlMs: number): string => {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const publicElicitationContext = (context: ElicitationContext): ElicitationContext => {
+  if (context.requiresLiveApproval === true) {
+    return {
+      address: context.address,
+      request: FormElicitation.make({
+        message: `Approve continuation of ${context.address}?`,
+        requestedSchema: { type: "object", properties: {} },
+      }),
+      requiresLiveApproval: true,
+    };
+  }
+
+  const rawRequest: unknown = context.request;
+  const requestRecord = isRecord(rawRequest) ? rawRequest : undefined;
+  const request =
+    Predicate.isTagged(rawRequest, "UrlElicitation") &&
+    typeof requestRecord?.message === "string" &&
+    typeof requestRecord.url === "string" &&
+    typeof requestRecord.elicitationId === "string"
+      ? UrlElicitation.make({
+          message: requestRecord.message,
+          url: requestRecord.url,
+          elicitationId: ElicitationId.make(requestRecord.elicitationId),
+        })
+      : Predicate.isTagged(rawRequest, "FormElicitation") &&
+          typeof requestRecord?.message === "string" &&
+          isRecord(requestRecord.requestedSchema)
+        ? FormElicitation.make({
+            message: requestRecord.message,
+            requestedSchema: requestRecord.requestedSchema,
+          })
+        : FormElicitation.make({
+            message: "Tool interaction required.",
+            requestedSchema: { type: "object", properties: {} },
+          });
+  return { address: context.address, request };
+};
+
+const publicPausedExecution = <E>(paused: InternalPausedExecution<E>): PausedExecution => ({
+  id: paused.id,
+  elicitationContext: publicElicitationContext(paused.elicitationContext),
+  ...(paused.requiresLiveApproval === true ? { requiresLiveApproval: true } : {}),
+  ...(paused.hasOpaqueValues === true ? { hasOpaqueValues: true } : {}),
+});
 
 const readOptionalLimit = (value: unknown, toolName: string): number | ExecutionToolError => {
   if (value === undefined) {
@@ -520,7 +570,12 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
         Effect.map((result): ExecutionResult => ({ status: "completed", result })),
       ),
       Queue.take(pauseQueue).pipe(
-        Effect.map((paused): ExecutionResult => ({ status: "paused", execution: paused })),
+        Effect.map(
+          (paused): ExecutionResult => ({
+            status: "paused",
+            execution: publicPausedExecution(paused),
+          }),
+        ),
       ),
     );
 
@@ -556,10 +611,11 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
 
     const elicitationHandler: ElicitationHandler = (ctx) =>
       Effect.gen(function* () {
+        const publicContext = publicElicitationContext(ctx);
         // `autoApprove` is a convenience for ordinary Run/Test flows, not a
         // secret-release authority. Once an opaque value reaches a sink, keep
         // the active fiber and pause it for the browser/MCP human decision.
-        if (autoApprove && !ctx.requiresLiveApproval) {
+        if (autoApprove && !publicContext.requiresLiveApproval) {
           return { action: "accept" };
         }
         const responseDeferred = yield* Deferred.make<typeof ElicitationResponse.Type>();
@@ -571,8 +627,8 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
 
         const paused: InternalPausedExecution<E> = {
           id,
-          elicitationContext: ctx,
-          ...(ctx.requiresLiveApproval ? { requiresLiveApproval: true } : {}),
+          elicitationContext: publicContext,
+          ...(publicContext.requiresLiveApproval ? { requiresLiveApproval: true } : {}),
           ...(opaqueValueHandoff.hasOpaqueValues() ? { hasOpaqueValues: true } : {}),
           response: responseDeferred,
           fiber: fiber!,
@@ -670,7 +726,7 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
       // human decision nor a consumable grant, so it must not become a denial
       // or a release merely by racing the real browser approval.
       yield* Effect.annotateCurrentSpan({ "mcp.execute.resume.live_grant_missing": true });
-      return { status: "paused" as const, execution: paused };
+      return { status: "paused" as const, execution: publicPausedExecution(paused) };
     }
     pausedExecutions.delete(executionId);
 
@@ -746,7 +802,10 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
       }),
     isExecutionSettled: (executionId) => Effect.sync(() => settledExecutionIds.has(executionId)),
     getPausedExecution: (executionId) =>
-      Effect.sync(() => pausedExecutions.get(executionId) ?? null),
+      Effect.sync(() => {
+        const paused = pausedExecutions.get(executionId);
+        return paused ? publicPausedExecution(paused) : null;
+      }),
     pausedExecutionCount: () => Effect.sync(() => pausedExecutions.size),
     hasPausedExecutions: () => Effect.sync(() => pausedExecutions.size > 0),
     getDescription: buildExecuteDescription(executor),

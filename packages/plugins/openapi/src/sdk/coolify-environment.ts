@@ -48,6 +48,12 @@ const APPLICATION_READ_OPERATION_IDS = new Set([
   "applications.getApplicationByUuid",
 ]);
 
+const APPLICATION_LIST_OPERATION_IDS = new Set([
+  "list-applications",
+  "listApplications",
+  "applications.listApplications",
+]);
+
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -100,6 +106,14 @@ export const isVerifiedCoolifyEnvironmentListOperation = (
 export const isVerifiedCoolifyApplicationReadOperation = (
   identity: CoolifyOperationIdentity,
 ): boolean => hasIdentity(identity, APPLICATION_READ_OPERATION_IDS, "get", "/applications/{uuid}");
+
+export const isVerifiedCoolifyApplicationListOperation = (
+  identity: CoolifyOperationIdentity,
+): boolean =>
+  APPLICATION_LIST_OPERATION_IDS.has(identity.operationId) &&
+  identity.method === "get" &&
+  identity.pathTemplate === "/applications" &&
+  !identity.parameters.some((parameter) => parameter.location === "path");
 
 const ENVIRONMENT_REQUEST_FIELD_TYPES = {
   key: "string",
@@ -165,8 +179,6 @@ const isCoolifyEnvironmentVariableResponseSchema = (schema: unknown): boolean =>
 
 const ENVIRONMENT_SAFE_RESPONSE_FIELD_TYPES = {
   id: new Set(["integer", "number"]),
-  uuid: new Set(["string"]),
-  key: new Set(["string"]),
   is_preview: new Set(["boolean"]),
   is_literal: new Set(["boolean"]),
   is_multiline: new Set(["boolean"]),
@@ -177,22 +189,27 @@ const ENVIRONMENT_SAFE_RESPONSE_FIELD_TYPES = {
 
 const APPLICATION_SAFE_RESPONSE_FIELD_TYPES = {
   id: new Set(["integer", "number"]),
-  uuid: new Set(["string"]),
-  name: new Set(["string"]),
 } as const;
+
+export type CoolifySafeScalarField = {
+  readonly name: string;
+  readonly type: "number" | "integer" | "boolean";
+};
+
+const isSafeScalarType = (value: unknown): value is CoolifySafeScalarField["type"] =>
+  value === "number" || value === "integer" || value === "boolean";
 
 const declaredSafeScalarFields = (
   schema: unknown,
   fields: Readonly<Record<string, ReadonlySet<string>>>,
-): readonly string[] => {
+): readonly CoolifySafeScalarField[] => {
   const properties = asRecord(asRecord(schema)?.properties);
   if (!properties) return [];
-  return Object.entries(fields)
-    .filter(([name, allowedTypes]) => {
-      const type = asRecord(properties[name])?.type;
-      return typeof type === "string" && allowedTypes.has(type);
-    })
-    .map(([name]) => name);
+  return Object.entries(fields).flatMap(([name, allowedTypes]) => {
+    const type = asRecord(properties[name])?.type;
+    if (!isSafeScalarType(type) || !allowedTypes.has(type)) return [];
+    return [{ name, type }];
+  });
 };
 
 export const isCoolifyEnvironmentListResponseSchema = (schema: unknown): boolean => {
@@ -211,7 +228,9 @@ export const isCoolifyEnvironmentWriteResponseSchema = (
 /** Exact scalar metadata fields that a verified environment response may keep
  * beside opaque values. Unknown response properties never become safe merely
  * because Coolify returned them. */
-export const coolifyEnvironmentResponseSafeFields = (schema: unknown): readonly string[] => {
+export const coolifyEnvironmentResponseSafeFields = (
+  schema: unknown,
+): readonly CoolifySafeScalarField[] => {
   const object = asRecord(schema);
   const itemSchema = object?.type === "array" ? object.items : schema;
   return isCoolifyEnvironmentVariableResponseSchema(itemSchema)
@@ -232,8 +251,18 @@ export const isCoolifyApplicationResponseSchema = (schema: unknown): boolean => 
   ].every((name) => asRecord(properties[name])?.type === "string");
 };
 
+export const isCoolifyApplicationListResponseSchema = (schema: unknown): boolean => {
+  const object = asRecord(schema);
+  return object?.type === "array" && isCoolifyApplicationResponseSchema(object.items);
+};
+
 /** Exact identifiers retained from a verified application read. */
-export const coolifyApplicationResponseSafeFields = (schema: unknown): readonly string[] =>
-  isCoolifyApplicationResponseSchema(schema)
-    ? declaredSafeScalarFields(schema, APPLICATION_SAFE_RESPONSE_FIELD_TYPES)
+export const coolifyApplicationResponseSafeFields = (
+  schema: unknown,
+): readonly CoolifySafeScalarField[] => {
+  const object = asRecord(schema);
+  const itemSchema = object?.type === "array" ? object.items : schema;
+  return isCoolifyApplicationResponseSchema(itemSchema)
+    ? declaredSafeScalarFields(itemSchema, APPLICATION_SAFE_RESPONSE_FIELD_TYPES)
     : [];
+};
