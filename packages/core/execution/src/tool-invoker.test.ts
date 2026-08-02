@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Data, Effect, Fiber, Schema } from "effect";
+import { Data, Effect, Schema } from "effect";
 
 import {
   AuthTemplateSlug,
@@ -1814,21 +1814,13 @@ describe("pause/resume with multiple elicitations", () => {
     const paused1 = outcome1 as Extract<typeof outcome1, { status: "paused" }>;
     expect(paused1.execution.elicitationContext.request.message).toBe("Only approval");
 
-    // `execution.fiber` is on `InternalPausedExecution`; the exported
-    // `PausedExecution` type doesn't carry it. Cast to read.
-    const pausedWithFiber = (
-      value: unknown,
-    ): {
-      readonly fiber: Fiber.Fiber<unknown, unknown>;
-    } => value as { readonly fiber: Fiber.Fiber<unknown, unknown> };
-    const sandboxFiber = pausedWithFiber(paused1.execution).fiber;
-    const exitProbe = await Effect.runPromise(
-      Effect.race(
-        Fiber.await(sandboxFiber),
-        Effect.map(Effect.sleep("50 millis"), () => "still-running" as const),
-      ),
-    );
-    expect(exitProbe).toBe("still-running");
+    // Observe the live pause through the public lookup boundary. Internal
+    // fibers must not escape in an execution snapshot merely to support this
+    // liveness regression.
+    await Effect.runPromise(Effect.sleep("50 millis"));
+    const observedPause = await Effect.runPromise(engine.getPausedExecution(paused1.execution.id));
+    expect(observedPause).not.toBeNull();
+    expect(observedPause).not.toHaveProperty("fiber");
 
     const outcome2 = await Effect.runPromise(
       Effect.race(

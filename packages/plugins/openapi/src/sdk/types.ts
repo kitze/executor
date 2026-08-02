@@ -185,7 +185,14 @@ export const ExtractedOperation = Schema.Struct({
    * output paths are relative to `ToolResult.data`. */
   sensitiveInputPaths: Schema.optional(Schema.Array(Schema.String)),
   sensitiveOutputPaths: Schema.optional(Schema.Array(Schema.String)),
-  sensitiveOutputSafePaths: Schema.optional(Schema.Array(Schema.String)),
+  sensitiveOutputSafeScalars: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        path: Schema.String,
+        type: Schema.Literals(["number", "integer", "boolean"]),
+      }),
+    ),
+  ),
   sensitiveResponseHeaders: Schema.optional(Schema.Boolean),
   /** OAuth scope requirements from `security`, alternatives preserved: each
    *  inner array is one acceptable Security Requirement Object's scope set
@@ -222,7 +229,14 @@ export const OperationBinding = Schema.Struct({
    * reparsing the source OpenAPI document. Optional for legacy bindings. */
   sensitiveInputPaths: Schema.optional(Schema.Array(Schema.String)),
   sensitiveOutputPaths: Schema.optional(Schema.Array(Schema.String)),
-  sensitiveOutputSafePaths: Schema.optional(Schema.Array(Schema.String)),
+  sensitiveOutputSafeScalars: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        path: Schema.String,
+        type: Schema.Literals(["number", "integer", "boolean"]),
+      }),
+    ),
+  ),
   sensitiveResponseHeaders: Schema.optional(Schema.Boolean),
   /** Fresh bindings carry complete sensitivity extraction. Older bindings
    * intentionally fail closed at runtime until their connection is refreshed. */

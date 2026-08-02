@@ -1,6 +1,10 @@
 import { Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
-import type { ToolAnnotations, ToolFileValue } from "@executor-js/sdk/core";
+import type {
+  SensitiveOutputSafeScalar,
+  ToolAnnotations,
+  ToolFileValue,
+} from "@executor-js/sdk/core";
 
 import { OpenApiInvocationError } from "./errors";
 import { isNdjsonMediaType, NDJSON_MEDIA_TYPES, resolveServerUrl } from "./openapi-utils";
@@ -1391,7 +1395,7 @@ export const annotationsForOperation = (
   sensitivity?: {
     readonly sensitiveInputPaths?: readonly string[];
     readonly sensitiveOutputPaths?: readonly string[];
-    readonly sensitiveOutputSafePaths?: readonly string[];
+    readonly sensitiveOutputSafeScalars?: readonly SensitiveOutputSafeScalar[];
     readonly sensitiveResponseHeaders?: boolean;
   },
 ): ToolAnnotations => {
@@ -1403,8 +1407,8 @@ export const annotationsForOperation = (
     ...(sensitivity?.sensitiveOutputPaths?.length
       ? { sensitiveOutputPaths: sensitivity.sensitiveOutputPaths }
       : {}),
-    ...(sensitivity?.sensitiveOutputSafePaths?.length
-      ? { sensitiveOutputSafePaths: sensitivity.sensitiveOutputSafePaths }
+    ...(sensitivity?.sensitiveOutputSafeScalars?.length
+      ? { sensitiveOutputSafeScalars: sensitivity.sensitiveOutputSafeScalars }
       : {}),
     ...(sensitivity?.sensitiveResponseHeaders ? { sensitiveResponseHeaders: true } : {}),
   };

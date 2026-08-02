@@ -99,7 +99,13 @@ export type {
   UpdateConnectionInput,
   ValidateConnectionInput,
 } from "./connection";
-export type { Tool, ToolDef, ToolListFilter, ToolAnnotations } from "./tool";
+export type {
+  Tool,
+  ToolDef,
+  ToolListFilter,
+  ToolAnnotations,
+  SensitiveOutputSafeScalar,
+} from "./tool";
 export {
   makeOpaqueValueHandoff,
   isOpaqueValueReference,

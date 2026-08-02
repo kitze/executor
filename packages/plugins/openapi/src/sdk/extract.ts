@@ -1,14 +1,17 @@
 import { Effect, Option, Predicate } from "effect";
+import type { SensitiveOutputSafeScalar } from "@executor-js/sdk/core";
 
 import { planToolPaths, type OperationPathInput, type PlannedToolPath } from "./definitions";
 import {
   coolifyApplicationResponseSafeFields,
   coolifyEnvironmentResponseSafeFields,
   coolifyEnvironmentWriteKind,
+  isCoolifyApplicationListResponseSchema,
   isCoolifyApplicationResponseSchema,
   isCoolifyEnvironmentListResponseSchema,
   isCoolifyEnvironmentWriteResponseSchema,
   isVerifiedCoolifyApplicationReadOperation,
+  isVerifiedCoolifyApplicationListOperation,
   isVerifiedCoolifyEnvironmentListOperation,
   isVerifiedCoolifyEnvironmentWriteRequest,
   type CoolifyOperationIdentity,
@@ -494,8 +497,15 @@ const addCoolifySensitivity = (
   },
   sensitiveInputPaths: Set<string>,
   sensitiveOutputPaths: Set<string>,
-  sensitiveOutputSafePaths: Set<string>,
+  sensitiveOutputSafeScalars: Map<string, SensitiveOutputSafeScalar>,
 ): void => {
+  const addSafeScalar = (
+    path: string,
+    field: { readonly type: "number" | "integer" | "boolean" },
+  ): void => {
+    const projection: SensitiveOutputSafeScalar = { path, type: field.type };
+    sensitiveOutputSafeScalars.set(`${path}\u0000${field.type}`, projection);
+  };
   const writeKind = coolifyEnvironmentWriteKind(input.identity);
   if (writeKind && isVerifiedCoolifyEnvironmentWriteRequest(writeKind, input.requestSchemas)) {
     if (writeKind === "single") {
@@ -527,7 +537,7 @@ const addCoolifySensitivity = (
       }
       for (const schema of input.responseSchemas) {
         for (const field of coolifyEnvironmentResponseSafeFields(schema)) {
-          sensitiveOutputSafePaths.add(writeKind === "single" ? `/${field}` : `/*/${field}`);
+          addSafeScalar(writeKind === "single" ? `/${field.name}` : `/*/${field.name}`, field);
         }
       }
     }
@@ -541,7 +551,7 @@ const addCoolifySensitivity = (
     sensitiveOutputPaths.add("/*/real_value");
     for (const schema of input.responseSchemas) {
       for (const field of coolifyEnvironmentResponseSafeFields(schema)) {
-        sensitiveOutputSafePaths.add(`/*/${field}`);
+        addSafeScalar(`/*/${field.name}`, field);
       }
     }
   }
@@ -561,7 +571,30 @@ const addCoolifySensitivity = (
     }
     for (const schema of input.responseSchemas) {
       for (const field of coolifyApplicationResponseSafeFields(schema)) {
-        sensitiveOutputSafePaths.add(`/${field}`);
+        addSafeScalar(`/${field.name}`, field);
+      }
+    }
+  }
+
+  if (
+    isVerifiedCoolifyApplicationListOperation(input.identity) &&
+    input.responseSchemas.some(isCoolifyApplicationListResponseSchema)
+  ) {
+    for (const field of [
+      "manual_webhook_secret_github",
+      "manual_webhook_secret_gitlab",
+      "manual_webhook_secret_bitbucket",
+      "manual_webhook_secret_gitea",
+      "http_basic_auth_password",
+    ]) {
+      sensitiveOutputPaths.add(`/*/${field}`);
+    }
+    for (const schema of input.responseSchemas) {
+      for (const field of coolifyApplicationResponseSafeFields(schema)) {
+        // Repository slugs and URLs are intentionally absent from the safe
+        // projection. Coolify has returned credential-bearing URL userinfo in
+        // these fields, so they remain provenance-tainted and are dropped.
+        addSafeScalar(`/*/${field.name}`, field);
       }
     }
   }
@@ -579,7 +612,7 @@ const operationSensitivity = (input: {
 }): {
   readonly sensitiveInputPaths?: readonly string[];
   readonly sensitiveOutputPaths?: readonly string[];
-  readonly sensitiveOutputSafePaths?: readonly string[];
+  readonly sensitiveOutputSafeScalars?: readonly SensitiveOutputSafeScalar[];
   readonly sensitiveResponseHeaders?: boolean;
 } => {
   const sensitiveInputPaths = new Set<string>();
@@ -610,7 +643,7 @@ const operationSensitivity = (input: {
   for (const path of rawServerVariablePaths(input.rawServers)) sensitiveInputPaths.add(path);
 
   const sensitiveOutputPaths = new Set<string>();
-  const sensitiveOutputSafePaths = new Set<string>();
+  const sensitiveOutputSafeScalars = new Map<string, SensitiveOutputSafeScalar>();
   const responseSensitivity = collectResponseSensitivity(input.rawOperation, input.resolver);
   for (const path of responseSensitivity.paths) sensitiveOutputPaths.add(path);
 
@@ -627,7 +660,7 @@ const operationSensitivity = (input: {
     },
     sensitiveInputPaths,
     sensitiveOutputPaths,
-    sensitiveOutputSafePaths,
+    sensitiveOutputSafeScalars,
   );
 
   return {
@@ -637,8 +670,14 @@ const operationSensitivity = (input: {
     ...(sensitiveOutputPaths.size > 0
       ? { sensitiveOutputPaths: [...sensitiveOutputPaths].sort() }
       : {}),
-    ...(sensitiveOutputSafePaths.size > 0
-      ? { sensitiveOutputSafePaths: [...sensitiveOutputSafePaths].sort() }
+    ...(sensitiveOutputSafeScalars.size > 0
+      ? {
+          sensitiveOutputSafeScalars: [...sensitiveOutputSafeScalars.values()].sort((left, right) =>
+            left.path === right.path
+              ? left.type.localeCompare(right.type)
+              : left.path.localeCompare(right.path),
+          ),
+        }
       : {}),
     ...(responseSensitivity.hasSensitiveHeaders ? { sensitiveResponseHeaders: true } : {}),
   };

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "@effect/vitest";
+import { describe, expect, it, vi } from "@effect/vitest";
 import { Data, Deferred, Effect } from "effect";
 import type * as Tracer from "effect/Tracer";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -813,6 +813,60 @@ describe("MCP host server — native elicitation mode", () => {
       });
       expect(result.content).toEqual([{ type: "text", text: "action:decline" }]);
     });
+  });
+
+  it("reconstructs live-sensitive native elicitation before MCP params or debug logs", async () => {
+    const marker = "native-elicitation-sensitive-regression-marker";
+    const rawUrl = `https://fixture.invalid/approve?token=${marker}`;
+    const engine = makeStubEngine({
+      execute: (_code, { onElicitation }) =>
+        Effect.gen(function* () {
+          const response = yield* onElicitation({
+            address: STUB_TOOL_ADDRESS,
+            request: {
+              ...UrlElicitation.make({
+                message: `Approve ${marker}`,
+                url: rawUrl,
+                elicitationId: ElicitationId.make(marker),
+              }),
+              args: { value: marker },
+            } as never,
+            requiresLiveApproval: true,
+          });
+          return { result: response.action };
+        }),
+    });
+    const debug = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let receivedParams: Record<string, unknown> | undefined;
+    let debugSurface = "";
+
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: test must restore the process-global console spy even if the in-memory MCP client fails
+    try {
+      await withClient(
+        engine,
+        ELICITATION_CAPS,
+        async (client) => {
+          client.setRequestHandler(ElicitRequestSchema, async (request) => {
+            receivedParams = request.params as Record<string, unknown>;
+            return { action: "accept" as const, content: {} };
+          });
+          await client.callTool({ name: "execute", arguments: { code: "run" } });
+        },
+        { elicitationMode: { mode: "native" }, debug: true },
+      );
+    } finally {
+      debugSurface = JSON.stringify(debug.mock.calls);
+      debug.mockRestore();
+    }
+
+    expect(receivedParams).toEqual({
+      mode: "form",
+      message: `Approve continuation of ${STUB_TOOL_ADDRESS}?`,
+      requestedSchema: { type: "object", properties: {} },
+    });
+    expect(JSON.stringify(receivedParams)).not.toContain(marker);
+    expect(debugSurface).not.toContain(marker);
+    expect(JSON.stringify(receivedParams)).not.toContain(rawUrl);
   });
 
   it("browser approval mode does not auto-switch to native elicitation", async () => {

@@ -4,6 +4,7 @@ import type * as Tracer from "effect/Tracer";
 
 import {
   ElicitationResponse,
+  FormElicitation,
   ToolAddress,
   isOpaqueValueReference,
   makeOpaqueValueHandoff,
@@ -19,6 +20,12 @@ import { createExecutionEngine, formatPausedExecution } from "./engine";
 
 const MARKER = 'opaque execution "line1\r\nline2" * / marker';
 const DIRECT_ARGUMENT_MARKER = "approval-argument-regression-marker";
+const GENERATED_MARKER = "generated-sensitive-sink-regression-marker";
+const REPOSITORY_CREDENTIAL_MARKER = "repository-userinfo-regression-marker";
+const repositoryCredentialUrls = [
+  `https://fixture-user:${REPOSITORY_CREDENTIAL_MARKER}@example.invalid/org/repository.git`,
+  `https://example.invalid/org/repository?access_token=${REPOSITORY_CREDENTIAL_MARKER}`,
+] as const;
 
 const adversarialEchoes = (value: string): readonly string[] => {
   const json = JSON.stringify(value);
@@ -142,24 +149,47 @@ const makePlugin = (ledger: Ledger) =>
             execute: () =>
               Effect.gen(function* () {
                 const transforms = arbitrarySourceTransforms(MARKER);
-                yield* Effect.log("opaque source response", { transforms });
+                yield* Effect.log("opaque source response", {
+                  transforms,
+                  repositoryCredentialUrls,
+                });
                 yield* Effect.annotateCurrentSpan({
-                  "opaque.source.transforms": transforms.join("|"),
+                  "opaque.source.transforms": [...transforms, ...repositoryCredentialUrls].join(
+                    "|",
+                  ),
                 });
-                return ToolResult.ok({
-                  envs: [
-                    {
-                      key: "SOURCE_VALUE",
-                      value: MARKER,
-                      base64Echo: transforms[0],
-                      base64urlEcho: transforms[1],
-                      arbitraryEcho: transforms[2],
-                      error: { message: transforms[0] },
-                      logs: transforms,
-                      trace: { "http.response.body": transforms.join("|") },
-                    },
-                  ],
-                });
+                return {
+                  ok: true,
+                  data: {
+                    envs: [
+                      {
+                        key: "SOURCE_VALUE",
+                        value: MARKER,
+                        base64Echo: transforms[0],
+                        base64urlEcho: transforms[1],
+                        arbitraryEcho: transforms[2],
+                        git_repository: repositoryCredentialUrls[0],
+                        git_full_url: repositoryCredentialUrls[1],
+                        error: { message: transforms[0] },
+                        logs: [...transforms, ...repositoryCredentialUrls],
+                        trace: {
+                          "http.response.body": [...transforms, ...repositoryCredentialUrls].join(
+                            "|",
+                          ),
+                        },
+                      },
+                    ],
+                  },
+                  envelopeEcho: transforms[0],
+                  error: { message: transforms[1] },
+                  logs: [...transforms, ...repositoryCredentialUrls],
+                  trace: { "http.response.body": transforms[2] },
+                  http: {
+                    status: 200,
+                    headers: { "x-source-echo": transforms[0] },
+                    envelopeEcho: transforms[1],
+                  },
+                } as never;
               }),
           }),
           tool({
@@ -235,6 +265,65 @@ const makePlugin = (ledger: Ledger) =>
                 });
                 // oxlint-disable-next-line executor/no-error-constructor -- regression boundary: prove an untrusted built-in Error defect carrying source material is normalized before Cause.pretty/trace surfaces
                 return yield* Effect.die(new Error(`${String(value)}|${transforms.join("|")}`));
+              }),
+          }),
+          tool({
+            name: "writeAndElicit",
+            description: "Write a sensitive value, then request another approval",
+            annotations: {
+              requiresApproval: true,
+              mayElicit: true,
+              sensitiveInputPaths: ["/body/value"],
+            },
+            execute: (args, { elicit }) =>
+              Effect.gen(function* () {
+                ledger.writes.push(args);
+                const body = (
+                  args as {
+                    readonly body?: { readonly value?: unknown; readonly fail?: unknown };
+                  }
+                ).body;
+                const value = String(body?.value);
+                const transforms = arbitrarySourceTransforms(value);
+                yield* Effect.log("sensitive handler before elicitation", {
+                  value,
+                  transforms,
+                });
+                yield* Effect.annotateCurrentSpan({
+                  "opaque.elicitation.raw": `${value}|${transforms.join("|")}`,
+                });
+                yield* elicit({
+                  ...FormElicitation.make({
+                    message: `Confirm ${value} ${transforms.join(" ")}`,
+                    requestedSchema: {
+                      type: "object",
+                      properties: {
+                        confirmation: { description: `${value}|${transforms.join("|")}` },
+                      },
+                    },
+                  }),
+                  args: { body: { value }, transforms },
+                } as never);
+                if (body?.fail === true) {
+                  return ToolResult.fail({
+                    code: transforms[0] ?? "FAILED",
+                    message: `${value}|${transforms.join("|")}`,
+                    details: { value, transforms },
+                    status: 422,
+                  });
+                }
+                return {
+                  ok: true,
+                  data: { value, transforms },
+                  envelopeEcho: transforms[0],
+                  error: { message: transforms[1] },
+                  logs: transforms,
+                  http: {
+                    status: 202,
+                    headers: { "x-sensitive-echo": value },
+                    envelopeEcho: transforms[2],
+                  },
+                } as never;
               }),
           }),
           tool({
@@ -346,6 +435,10 @@ describe("opaque sensitive value execution", () => {
           data: null,
           http: { status: 202, headers: {} },
         });
+        expect(sandboxResult.source).toMatchObject({
+          http: { status: 200, headers: {} },
+        });
+        expect(Object.keys(sandboxResult.source ?? {}).sort()).toEqual(["data", "http", "ok"]);
         expect(JSON.stringify(resumed.result.result)).toContain("ExecutorOpaqueValue");
 
         const echoes = adversarialEchoes(MARKER);
@@ -358,7 +451,12 @@ describe("opaque sensitive value execution", () => {
         const publicSurface = JSON.stringify(resumed);
         const observedSpans = spanSurface(spans);
         const observedLogs = recordedLogs.join("\n");
-        for (const echo of [...echoes, ...arbitrarySourceTransforms(MARKER)]) {
+        for (const echo of [
+          ...echoes,
+          ...arbitrarySourceTransforms(MARKER),
+          ...repositoryCredentialUrls,
+          REPOSITORY_CREDENTIAL_MARKER,
+        ]) {
           expect(publicSurface).not.toContain(echo);
           expect(observedSpans).not.toContain(echo);
           expect(observedLogs).not.toContain(echo);
@@ -445,6 +543,142 @@ describe("opaque sensitive value execution", () => {
         expect(observedSpans).not.toContain(echo);
       }
     }),
+  );
+
+  it.effect(
+    "keeps resolved and runtime-generated sink values internal across consecutive pauses",
+    () =>
+      Effect.gen(function* () {
+        const { engine, ledger } = yield* makeHarness();
+        const { tracer, spans } = makeRecordingTracer();
+        const recordedLogs: string[] = [];
+        const logger = Logger.make<unknown, void>((options) => {
+          recordedLogs.push(cycleSafeStringify(options.message));
+        });
+        const observedBoundaries: unknown[] = [];
+
+        for (const scenario of [
+          {
+            marker: GENERATED_MARKER,
+            firstRequiresLiveApproval: false,
+            fail: false,
+            code: `
+              const generated = ${JSON.stringify(GENERATED_MARKER)};
+              return await tools.opaque.writeAndElicit({
+                body: { value: generated, fail: false }
+              });
+            `,
+          },
+          {
+            marker: MARKER,
+            firstRequiresLiveApproval: true,
+            fail: true,
+            code: `
+              const source = await tools.opaque.read({});
+              return await tools.opaque.writeAndElicit({
+                body: { value: source.data.envs[0].value, fail: true }
+              });
+            `,
+          },
+        ] as const) {
+          const first = yield* engine
+            .executeWithPause(scenario.code)
+            .pipe(Effect.withTracer(tracer), Effect.withLogger(logger));
+          expect(first.status).toBe("paused");
+          if (first.status !== "paused") continue;
+          expect(first.execution.requiresLiveApproval === true).toBe(
+            scenario.firstRequiresLiveApproval,
+          );
+          observedBoundaries.push(first, formatPausedExecution(first.execution));
+
+          const firstResponse = scenario.firstRequiresLiveApproval
+            ? yield* engine.grantLiveApproval(first.execution.id, { action: "accept" })
+            : ({ action: "accept" } as const);
+          expect(firstResponse).not.toBeNull();
+          if (!firstResponse) continue;
+          const second = yield* engine
+            .resume(first.execution.id, firstResponse)
+            .pipe(Effect.withTracer(tracer), Effect.withLogger(logger));
+          expect(second?.status).toBe("paused");
+          if (second?.status !== "paused") continue;
+          expect(second.execution.requiresLiveApproval).toBe(true);
+          expect(Object.keys(second.execution.elicitationContext).sort()).toEqual([
+            "address",
+            "request",
+            "requiresLiveApproval",
+          ]);
+          expect(Object.keys(second.execution.elicitationContext.request).sort()).toEqual([
+            "_tag",
+            "message",
+            "requestedSchema",
+          ]);
+
+          const persisted = yield* engine.getPausedExecution(second.execution.id);
+          expect(persisted).not.toBeNull();
+          const rawAccept = yield* engine
+            .resume(second.execution.id, { action: "accept" })
+            .pipe(Effect.withTracer(tracer), Effect.withLogger(logger));
+          expect(rawAccept?.status).toBe("paused");
+          observedBoundaries.push(
+            second,
+            persisted,
+            rawAccept,
+            formatPausedExecution(second.execution),
+          );
+
+          const grant = yield* engine.grantLiveApproval(second.execution.id, {
+            action: "accept",
+          });
+          expect(grant).not.toBeNull();
+          if (!grant) continue;
+          const completed = yield* engine
+            .resume(second.execution.id, grant)
+            .pipe(Effect.withTracer(tracer), Effect.withLogger(logger));
+          expect(completed?.status).toBe("completed");
+          if (completed?.status !== "completed") continue;
+          observedBoundaries.push(completed);
+
+          const latestWrite = ledger.writes.at(-1) as {
+            readonly body?: { readonly value?: unknown };
+          };
+          expect(latestWrite.body?.value).toBe(scenario.marker);
+          expect(completed.result.result).toEqual(
+            scenario.fail
+              ? {
+                  ok: false,
+                  error: {
+                    code: "UPSTREAM_REQUEST_FAILED",
+                    message: "Upstream request failed.",
+                    status: 422,
+                  },
+                }
+              : {
+                  ok: true,
+                  data: null,
+                  http: { status: 202, headers: {} },
+                },
+          );
+
+          const scenarioSurface = cycleSafeStringify(observedBoundaries);
+          for (const secret of [scenario.marker, ...arbitrarySourceTransforms(scenario.marker)]) {
+            expect(scenarioSurface).not.toContain(secret);
+          }
+        }
+
+        const completeSurface = `${cycleSafeStringify(observedBoundaries)}\n${recordedLogs.join(
+          "\n",
+        )}\n${spanSurface(spans)}`;
+        for (const secret of [
+          GENERATED_MARKER,
+          MARKER,
+          ...arbitrarySourceTransforms(GENERATED_MARKER),
+          ...arbitrarySourceTransforms(MARKER),
+          REPOSITORY_CREDENTIAL_MARKER,
+          ...repositoryCredentialUrls,
+        ]) {
+          expect(completeSurface).not.toContain(secret);
+        }
+      }),
   );
 
   it.effect("does not invoke an opaque sink after a decline", () =>

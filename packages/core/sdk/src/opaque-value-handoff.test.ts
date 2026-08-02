@@ -76,22 +76,55 @@ describe("opaque sensitive value handoff", () => {
     const handoff = makeOpaqueValueHandoff();
     const protectedValue = handoff.protectOutput(
       {
-        envs: [{ key: "SOURCE_ENV", value: MARKER, unknown: "drop-me" }],
-        requestId: "request-1",
+        envs: [{ id: 42, value: MARKER, unknown: "drop-me" }],
+        requestId: 7,
         unknown: "drop-me-too",
       },
       ["/envs/*/value"],
       undefined,
-      ["/envs/*/key", "/requestId"],
+      [
+        { path: "/envs/*/id", type: "integer" },
+        { path: "/requestId", type: "integer" },
+      ],
     );
 
     expect(protectedValue).toMatchObject({
-      envs: [{ key: "SOURCE_ENV" }],
-      requestId: "request-1",
+      envs: [{ id: 42 }],
+      requestId: 7,
     });
     expect(isOpaqueValueReference(valueAt(protectedValue, ["envs", "0", "value"]))).toBe(true);
     expect(valueAt(protectedValue, ["envs", "0", "unknown"])).toBeUndefined();
     expect(valueAt(protectedValue, ["unknown"])).toBeUndefined();
+  });
+
+  it("drops safe ancestors, runtime type mismatches, and object-key wildcards", () => {
+    const handoff = makeOpaqueValueHandoff();
+    const transformed = Buffer.from(MARKER).toString("base64");
+    const protectedValue = handoff.protectOutput(
+      {
+        credentials: { password: MARKER, transformed },
+        entries: {
+          hostile: { value: MARKER, key: { transformed } },
+        },
+        metadata: { key: { transformed } },
+        repository: "https://user:token@example.invalid/org/repository.git",
+      },
+      ["/credentials/password", "/entries/*/value"],
+      undefined,
+      [
+        { path: "/credentials", type: "number" },
+        { path: "/entries/*/key", type: "number" },
+        { path: "/metadata/key", type: "number" },
+        { path: "/repository", type: "number" },
+      ],
+    );
+
+    expect(isOpaqueValueReference(valueAt(protectedValue, ["credentials", "password"]))).toBe(true);
+    expect(valueAt(protectedValue, ["credentials", "transformed"])).toBeUndefined();
+    expect(valueAt(protectedValue, ["entries"])).toBeUndefined();
+    expect(valueAt(protectedValue, ["metadata"])).toBeUndefined();
+    expect(valueAt(protectedValue, ["repository"])).toBeUndefined();
+    expect(JSON.stringify(protectedValue)).not.toContain(transformed);
   });
 
   it("uses a non-secret type-compatible value for validation and resolves only afterwards", () => {
