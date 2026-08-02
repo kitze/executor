@@ -13,6 +13,12 @@ export const RELEASE_EVIDENCE_ALGORITHM = "Ed25519" as const;
 export const PREFLIGHT_ACTION = "coolify.glink.authorizeReleaseEnvironment.v1" as const;
 export const POSTDEPLOY_ACTION = "coolify.glink.collectReleaseEvidence.v1" as const;
 export const PUBLIC_BUILD_MANIFEST_STAGE = "public-build-environment-manifest" as const;
+/**
+ * The runtime image digest is returned by Coolify's fixed, app/deployment
+ * scoped runtime-image observation. It is deliberately distinct from an app
+ * log line, a build argument, a tag, or a mutable application configuration.
+ */
+export const COOLIFY_RUNTIME_IMAGE_SOURCE = "coolify-deployment-runtime-image-v1" as const;
 
 export const GLINK_ROOT_STARTUP_MARKERS = [
   { stage: "prisma-migrate", marker: "Prisma migration deploy succeeded." },
@@ -110,8 +116,6 @@ export interface StartupMarker {
   readonly stage: string;
   readonly marker: string;
   readonly observedAt: string;
-  /** Present only for the image-emitted public-build-manifest marker. */
-  readonly manifestDigest?: string;
 }
 
 /** Pinned public Docker ARG defaults used for a versioned manifest digest. */
@@ -179,11 +183,8 @@ export interface ApplicationConfigurationObservation extends ApplicationIdentity
 
 export interface DeploymentObservation {
   readonly uuid: string;
-  /**
-   * Coolify's numeric deployment id when both the selected history row and
-   * detail response expose it. Older provider shapes omit it from both.
-   */
-  readonly deploymentId: string | null;
+  /** Coolify's non-null numeric deployment identifier. */
+  readonly deploymentId: string;
   readonly applicationUuid: string;
   readonly applicationId: string;
   readonly sourceCommit: string;
@@ -200,6 +201,14 @@ export interface DeploymentObservation {
   /** Fixed, sanitized lifecycle markers; never raw Coolify log records. */
   readonly startupMarkers: readonly StartupMarker[];
   readonly startupMarkersDigest: string;
+  /**
+   * Immutable digest of the image attached to this deployed container, read
+   * from Coolify's fixed runtime-image observation. It is not app stdout.
+   */
+  readonly runtimeImage: {
+    readonly source: typeof COOLIFY_RUNTIME_IMAGE_SOURCE;
+    readonly digest: string;
+  };
 }
 
 export interface ApplicationReleaseObservation {
@@ -220,7 +229,6 @@ export interface PreflightObservation {
 export interface PostdeployObservation {
   readonly root: ApplicationReleaseObservation;
   readonly zero: ApplicationReleaseObservation;
-  readonly publicBuildEnvironmentManifest: { readonly actualDigest: string };
   readonly environmentPolicy: EnvironmentPolicyEvidence;
 }
 
@@ -260,7 +268,6 @@ export interface PostdeployReceiptPayload {
   readonly publicBuildEnvironmentManifest: {
     readonly version: number;
     readonly expectedDigest: string;
-    readonly actualDigest: string;
   };
   readonly environmentPolicy: EnvironmentPolicyEvidence;
 }
@@ -302,6 +309,7 @@ export interface ReleaseEvidenceVerificationKey {
 const asciiIdentifier = /^[A-Za-z0-9._:-]{1,256}$/u;
 const decimalIdentifier = /^[1-9][0-9]*$/u;
 const sha256Pattern = /^[0-9a-f]{64}$/u;
+const imageDigestPattern = /^sha256:[0-9a-f]{64}$/u;
 const fullMainShaPattern = /^[0-9a-f]{40}$/u;
 const noncePattern = /^[A-Za-z0-9_-]{22,256}$/u;
 const base64UrlPattern = /^[A-Za-z0-9_-]+$/u;
@@ -629,21 +637,39 @@ const validIso = (value: unknown): value is string =>
 const identityMatches = (left: ApplicationIdentity, right: ApplicationIdentity): boolean =>
   left.uuid === right.uuid && left.applicationId === right.applicationId;
 
-export interface ReceiptReplayStore {
-  readonly has: (receiptId: string) => boolean;
-  readonly add: (receiptId: string) => void;
-}
-
-export interface ReceiptVerificationInput extends ReleaseEvidenceCaller {
-  readonly action: ReleaseEvidenceAction;
+interface ReceiptVerificationBase extends ReleaseEvidenceCaller {
   readonly nonce: string;
   readonly proposedMainSha: string;
   readonly root: ApplicationIdentity;
   readonly zero: ApplicationIdentity;
   readonly now?: string;
   readonly verificationKeys: readonly ReleaseEvidenceVerificationKey[];
-  readonly replayStore?: ReceiptReplayStore;
 }
+
+export interface DeploymentVerificationExpectation {
+  readonly deploymentUuid: string;
+  readonly deploymentId: string;
+  /** Exact `sha256:<64 lowercase hex>` runtime image digest expected by the verifier. */
+  readonly runtimeImageDigest: string;
+}
+
+export interface PreflightReceiptVerificationInput extends ReceiptVerificationBase {
+  readonly action: typeof PREFLIGHT_ACTION;
+}
+
+export interface PostdeployReceiptVerificationInput extends ReceiptVerificationBase {
+  readonly action: typeof POSTDEPLOY_ACTION;
+  /**
+   * Expected deployment identities come from the release caller, not fields
+   * copied back out of the signed receipt.
+   */
+  readonly rootDeployment: DeploymentVerificationExpectation;
+  readonly zeroDeployment: DeploymentVerificationExpectation;
+}
+
+export type ReceiptVerificationInput =
+  | PreflightReceiptVerificationInput
+  | PostdeployReceiptVerificationInput;
 
 const assertReceiptEnvelope = (receipt: AnySignedReceipt): void => {
   if (
@@ -665,7 +691,82 @@ const assertReceiptEnvelope = (receipt: AnySignedReceipt): void => {
   }
 };
 
-/** Verify signature plus immutable envelope/action/tenant/app/SHA constraints. */
+const expectedDeployment = (value: DeploymentVerificationExpectation): boolean =>
+  asciiIdentifier.test(value.deploymentUuid) &&
+  decimalIdentifier.test(value.deploymentId) &&
+  imageDigestPattern.test(value.runtimeImageDigest);
+
+const expectedLifecycle = (
+  deployment: DeploymentObservation,
+  expectedMarkers: readonly Pick<StartupMarker, "stage" | "marker">[],
+): boolean => {
+  if (
+    deployment.startupMarkers.length !== expectedMarkers.length ||
+    deployment.startupMarkersDigest !== startupMarkersDigest(deployment.startupMarkers)
+  ) {
+    return false;
+  }
+  const startedAt = Date.parse(deployment.createdAt);
+  const finishedAt = Date.parse(deployment.finishedAt);
+  let previous = Number.NEGATIVE_INFINITY;
+  return deployment.startupMarkers.every((marker, index) => {
+    const expected = expectedMarkers[index];
+    const observedAt = Date.parse(marker.observedAt);
+    const matches =
+      expected !== undefined &&
+      marker.stage === expected.stage &&
+      marker.marker === expected.marker &&
+      validIso(marker.observedAt) &&
+      startedAt <= observedAt &&
+      observedAt <= finishedAt &&
+      previous < observedAt;
+    previous = observedAt;
+    return matches;
+  });
+};
+
+const expectedRelease = (input: {
+  readonly release: ApplicationReleaseObservation;
+  readonly application: ApplicationIdentity;
+  readonly deployment: DeploymentVerificationExpectation;
+  readonly proposedMainSha: string;
+  readonly markers: readonly Pick<StartupMarker, "stage" | "marker">[];
+}): boolean => {
+  const { release, application, deployment, proposedMainSha, markers } = input;
+  const observedDeployment = release.deployment;
+  return (
+    expectedDeployment(deployment) &&
+    identityMatches(release.application, application) &&
+    release.application.reportedCommit === proposedMainSha &&
+    observedDeployment.applicationUuid === application.uuid &&
+    observedDeployment.applicationId === application.applicationId &&
+    observedDeployment.uuid === deployment.deploymentUuid &&
+    observedDeployment.deploymentId === deployment.deploymentId &&
+    observedDeployment.sourceCommit === proposedMainSha &&
+    observedDeployment.status === "finished" &&
+    observedDeployment.releaseKind === "webhook-main" &&
+    observedDeployment.restartOnly === false &&
+    observedDeployment.rollback === false &&
+    validIso(observedDeployment.createdAt) &&
+    validIso(observedDeployment.finishedAt) &&
+    Date.parse(observedDeployment.finishedAt) >= Date.parse(observedDeployment.createdAt) &&
+    sha256Pattern.test(observedDeployment.configurationHash) &&
+    sha256Pattern.test(observedDeployment.deploymentHistoryDigest) &&
+    Number.isSafeInteger(observedDeployment.deploymentHistoryCount) &&
+    observedDeployment.deploymentHistoryCount > 0 &&
+    observedDeployment.runtimeImage?.source === COOLIFY_RUNTIME_IMAGE_SOURCE &&
+    observedDeployment.runtimeImage.digest === deployment.runtimeImageDigest &&
+    imageDigestPattern.test(observedDeployment.runtimeImage.digest) &&
+    expectedLifecycle(observedDeployment, markers)
+  );
+};
+
+/**
+ * Verify the Ed25519 signature and caller-supplied immutable constraints.
+ * This primitive does not accept a release; production acceptance must use
+ * `verifyAndConsumePostdeployBinding`, which atomically consumes its nonce in
+ * a durable verifier-owned ledger.
+ */
 export const verifyReleaseEvidenceReceipt = (
   receipt: AnySignedReceipt,
   input: ReceiptVerificationInput,
@@ -692,7 +793,7 @@ export const verifyReleaseEvidenceReceipt = (
       throw new ReleaseEvidenceError("invalid-signature");
     }
     const now = input.now ?? new Date().toISOString();
-    if (!validIso(now) || Date.parse(receipt.expiresAt) < Date.parse(now)) {
+    if (!validIso(now) || Date.parse(receipt.expiresAt) <= Date.parse(now)) {
       throw new ReleaseEvidenceError("receipt-expired");
     }
     if (
@@ -704,6 +805,9 @@ export const verifyReleaseEvidenceReceipt = (
       throw new ReleaseEvidenceError("receipt-constraint-mismatch");
     }
     if (receipt.action === PREFLIGHT_ACTION) {
+      if (input.action !== PREFLIGHT_ACTION) {
+        throw new ReleaseEvidenceError("receipt-constraint-mismatch");
+      }
       const payload = receipt.payload as PreflightReceiptPayload;
       if (
         payload.phase !== "preflight" ||
@@ -716,6 +820,9 @@ export const verifyReleaseEvidenceReceipt = (
         throw new ReleaseEvidenceError("receipt-constraint-mismatch");
       }
     } else {
+      if (input.action !== POSTDEPLOY_ACTION) {
+        throw new ReleaseEvidenceError("receipt-constraint-mismatch");
+      }
       const payload = receipt.payload as PostdeployReceiptPayload;
       if (
         payload.phase !== "postdeploy" ||
@@ -727,17 +834,23 @@ export const verifyReleaseEvidenceReceipt = (
         !sha256Pattern.test(payload.preflightPayloadDigest) ||
         payload.publicBuildEnvironmentManifest.version !== 1 ||
         !sha256Pattern.test(payload.publicBuildEnvironmentManifest.expectedDigest) ||
-        !sha256Pattern.test(payload.publicBuildEnvironmentManifest.actualDigest) ||
-        payload.publicBuildEnvironmentManifest.actualDigest !==
-          payload.publicBuildEnvironmentManifest.expectedDigest
+        !expectedRelease({
+          release: payload.root,
+          application: input.root,
+          deployment: input.rootDeployment,
+          proposedMainSha: input.proposedMainSha,
+          markers: GLINK_ROOT_STARTUP_MARKERS,
+        }) ||
+        !expectedRelease({
+          release: payload.zero,
+          application: input.zero,
+          deployment: input.zeroDeployment,
+          proposedMainSha: input.proposedMainSha,
+          markers: GLINK_ZERO_STARTUP_MARKERS,
+        })
       ) {
         throw new ReleaseEvidenceError("receipt-constraint-mismatch");
       }
-    }
-    if (input.replayStore) {
-      if (input.replayStore.has(receipt.receiptId))
-        throw new ReleaseEvidenceError("receipt-replayed");
-      input.replayStore.add(receipt.receiptId);
     }
     return receipt;
   } catch (error) {
@@ -746,33 +859,45 @@ export const verifyReleaseEvidenceReceipt = (
   }
 };
 
-/** Verify both signatures and the one-way preflight-to-postdeploy binding. */
-export const verifyPostdeployBinding = (input: {
+export interface PostdeployBindingVerificationInput extends ReleaseEvidenceCaller {
   readonly preflight: SignedReceipt<PreflightReceiptPayload>;
   readonly postdeploy: SignedReceipt<PostdeployReceiptPayload>;
   readonly verificationKeys: readonly ReleaseEvidenceVerificationKey[];
+  readonly nonce: string;
+  readonly proposedMainSha: string;
+  readonly root: ApplicationIdentity;
+  readonly zero: ApplicationIdentity;
+  readonly rootDeployment: DeploymentVerificationExpectation;
+  readonly zeroDeployment: DeploymentVerificationExpectation;
   readonly now?: string;
-}): SignedReceipt<PostdeployReceiptPayload> => {
-  const preflightPayload = input.preflight.payload;
+}
+
+/** Verify both signatures and their one-way, caller-constrained binding. */
+export const verifyPostdeployBinding = (
+  input: PostdeployBindingVerificationInput,
+): SignedReceipt<PostdeployReceiptPayload> => {
   verifyReleaseEvidenceReceipt(input.preflight, {
     action: PREFLIGHT_ACTION,
-    tenantId: input.preflight.tenantId,
-    principalId: input.preflight.principalId,
-    nonce: input.preflight.nonce,
-    proposedMainSha: preflightPayload.proposedMainSha,
-    root: preflightPayload.root,
-    zero: preflightPayload.zero,
+    tenantId: input.tenantId,
+    principalId: input.principalId,
+    nonce: input.nonce,
+    proposedMainSha: input.proposedMainSha,
+    root: input.root,
+    zero: input.zero,
     now: input.now,
     verificationKeys: input.verificationKeys,
   });
+  const preflightPayload = input.preflight.payload;
   const verified = verifyReleaseEvidenceReceipt(input.postdeploy, {
     action: POSTDEPLOY_ACTION,
-    tenantId: input.preflight.tenantId,
-    principalId: input.preflight.principalId,
-    nonce: input.preflight.nonce,
-    proposedMainSha: preflightPayload.proposedMainSha,
-    root: preflightPayload.root,
-    zero: preflightPayload.zero,
+    tenantId: input.tenantId,
+    principalId: input.principalId,
+    nonce: input.nonce,
+    proposedMainSha: input.proposedMainSha,
+    root: input.root,
+    zero: input.zero,
+    rootDeployment: input.rootDeployment,
+    zeroDeployment: input.zeroDeployment,
     now: input.now,
     verificationKeys: input.verificationKeys,
   }) as SignedReceipt<PostdeployReceiptPayload>;
@@ -783,11 +908,54 @@ export const verifyPostdeployBinding = (input: {
     verified.payload.publicBuildEnvironmentManifest.version !==
       preflightPayload.publicBuildEnvironmentManifest.version ||
     verified.payload.publicBuildEnvironmentManifest.expectedDigest !==
-      preflightPayload.publicBuildEnvironmentManifest.expectedDigest ||
-    verified.payload.publicBuildEnvironmentManifest.actualDigest !==
       preflightPayload.publicBuildEnvironmentManifest.expectedDigest
   ) {
     throw new ReleaseEvidenceError("receipt-constraint-mismatch");
   }
+  return verified;
+};
+
+/**
+ * Durable, verifier-owned one-time nonce ledger. The receipt issuer's nonce
+ * table prevents endpoint replay; this independent ledger prevents a copied
+ * signed receipt chain from being accepted twice by the release verifier.
+ */
+export interface ReleaseEvidenceVerifierLedger {
+  readonly consumeNonce: (input: {
+    readonly tenantId: string;
+    readonly principalId: string;
+    readonly nonceDigest: string;
+    readonly expiresAt: string;
+    readonly now: string;
+  }) => Promise<"consumed" | "replayed" | "full">;
+}
+
+export interface PostdeployBindingAcceptanceInput extends PostdeployBindingVerificationInput {
+  readonly ledger: ReleaseEvidenceVerifierLedger;
+}
+
+/**
+ * The only accepting verifier entry point. It validates exact caller-provided
+ * app/deployment/image constraints, then atomically spends the nonce.
+ */
+export const verifyAndConsumePostdeployBinding = async (
+  input: PostdeployBindingAcceptanceInput,
+): Promise<SignedReceipt<PostdeployReceiptPayload>> => {
+  const now = input.now ?? new Date().toISOString();
+  const verified = verifyPostdeployBinding({ ...input, now });
+  let result: "consumed" | "replayed" | "full";
+  try {
+    result = await input.ledger.consumeNonce({
+      tenantId: input.tenantId,
+      principalId: input.principalId,
+      nonceDigest: nonceDigest(input.nonce),
+      expiresAt: verified.expiresAt,
+      now,
+    });
+  } catch {
+    throw new ReleaseEvidenceError("storage-unavailable");
+  }
+  if (result === "replayed") throw new ReleaseEvidenceError("receipt-replayed");
+  if (result !== "consumed") throw new ReleaseEvidenceError("storage-unavailable");
   return verified;
 };

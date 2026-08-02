@@ -15,8 +15,9 @@ signs short-lived Ed25519 receipts. Glink treats the two endpoints below as an
 external-envelope seam: it requests a preflight receipt before promotion and a
 postdeploy receipt afterwards.
 
-The receipts prove the configured, app-scoped Coolify observations. They do
-not prove an immutable runtime image or a public HTTP response.
+The receipts prove the configured, app-scoped Coolify observations and the
+immutable `sha256:` runtime-image digest that Coolify reports for each selected
+deployment. They do not prove a public HTTP response.
 
 ## Enable it
 
@@ -223,10 +224,11 @@ Root/Zero application configuration, and the server-derived
 plus environment-policy flags. The caller cannot supply or choose that digest.
 Postdeploy payloads contain `phase: "postdeploy"`, the preflight receipt ID and
 payload digest, proposed and observed SHA, reduced Root/Zero application plus
-selected deployment evidence, the versioned expected digest, the image-emitted
-actual digest, and the environment-policy flags. Each deployment includes its
-app/deployment IDs, configuration hash, complete app-scoped deployment-history
-digest/count, selected timestamps, and fixed startup-marker digest.
+selected deployment evidence, the versioned expected configuration digest, and
+the environment-policy flags. Each deployment includes its non-null numeric
+app/deployment IDs, immutable Coolify runtime-image digest, configuration hash,
+complete final app-scoped deployment-history digest/count, selected timestamps,
+and fixed startup-marker digest.
 
 ## Public build manifest digest
 
@@ -253,37 +255,42 @@ preflight `expectedDigest`; values and raw environment records do not enter a
 receipt.
 
 Postdeploy never rereads current environment values to recreate that expected
-digest. Instead it extracts `actualDigest` from exactly one visible stdout Root
-log line emitted by the image:
-
-```text
-Public build environment manifest sha256: <64 lowercase hex>.
-```
-
-It accepts the deployment only when the emitted digest equals the signed
-preflight expectation. This is a source-faithful, capability-faithful binding;
-it is not immutable runtime-image provenance.
+digest. The public-manifest log line is retained only as an ordered lifecycle
+marker; its text and any digest it contains are never copied into a receipt or
+treated as provenance. The postdeploy runtime binding instead comes from
+Coolify's fixed, app/deployment-scoped runtime-image observation, which returns
+only `{ application_uuid, application_id, deployment_uuid, deployment_id,
+image_digest }`. `image_digest` must be an immutable lowercase
+`sha256:<64-hex>` digest. If the Coolify control plane cannot supply that
+observation, the endpoint fails closed; it never falls back to a tag, app
+stdout, build environment, or caller-provided value.
 
 ## Verify receipts offline
 
-Fetch `/api/release-evidence/v1/keys`, retain keys by `keyId`, and verify the
-base64url Ed25519 signature over the canonical JSON bytes of the receipt with
-`signature` omitted. Then enforce all caller-side constraints:
+Fetch `/api/release-evidence/v1/keys`, retain keys by `keyId`, and use
+`verifyAndConsumePostdeployBinding` with a verifier-owned, persistent SQLite
+nonce ledger. It verifies the base64url Ed25519 signature over canonical JSON
+bytes with `signature` omitted and atomically consumes the chain nonce. Then
+enforce all caller-side constraints:
 
 - receipt version, protocol version, algorithm, issue/expiry time, and a
-  one-time local receipt-ID replay store;
+  one-time durable nonce ledger. Retain nonce digests through expiry plus a
+  clock-skew grace period; bounded, rate-controlled cleanup must fail closed
+  when the ledger is full;
 - expected action, tenant, principal, nonce, full lowercase `main` SHA, and
   Root/Zero `{ uuid, applicationId }` pairs;
-- postdeploy `observedMainSha`, deployment configuration/history/marker data,
-  and expected versus actual public-manifest digest; and
+- postdeploy `observedMainSha`, exact Root/Zero deployment UUIDs and numeric
+  deployment IDs, Coolify runtime-image digests, and configuration/history/
+  marker data; and
 - the link from postdeploy `preflightReceiptId` and
   `preflightPayloadDigest` to the exact preflight receipt and canonical
   payload digest.
 
-The protocol module exposes `verifyReleaseEvidenceReceipt` for one receipt and
-`verifyPostdeployBinding` for the two-receipt chain. A verifier must use its
-own expected IDs and SHA; it must not treat values copied from a receipt as the
-expected constraints.
+`verifyReleaseEvidenceReceipt` is a non-accepting cryptographic primitive and
+`verifyPostdeployBinding` is a non-accepting chain validator. A release
+verifier must use `verifyAndConsumePostdeployBinding`; it must provide its own
+expected app IDs, deployment UUIDs/numeric IDs, runtime-image digests, and SHA
+instead of treating values copied from a receipt as expected constraints.
 
 ## Rotate signing keys
 
@@ -307,7 +314,8 @@ configuration.
 
 The configured control-plane token needs only the fixed app-scoped reads used
 by this capability: application, application deployment history, selected
-deployment detail, and application environments. The observer fails closed
+deployment detail, the fixed selected-deployment runtime-image observation,
+and application environments. The observer fails closed
 unless it can bind both apps to the configured IDs and exact policy
 configuration, read complete bounded deployment histories, select a finished
 non-restart/non-rollback non-PR webhook deployment for the promoted SHA, and
@@ -319,4 +327,9 @@ changes, and non-increasing timestamps are rejected.
 Root must emit, in order: Prisma migration success, the public-manifest line,
 runtime preflight, Zero public readiness, and Next.js readiness. Zero must emit
 its publication apply, preflight, and ops-monitor markers in order. Root and
-Zero also need compatible deployment metadata and configuration hashes.
+Zero also need compatible deployment metadata and configuration hashes. The
+final application observations must name the exact requested SHA—`HEAD` is
+never accepted as runtime confirmation. After selected deployment detail, logs,
+runtime-image observation, and final application reads, the observer rereads
+each complete app-scoped deployment history and rejects any later queued,
+running, or finished entry before signing.

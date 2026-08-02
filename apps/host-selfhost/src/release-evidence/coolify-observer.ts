@@ -1,6 +1,7 @@
 /* oxlint-disable executor/no-try-catch-or-throw, executor/no-double-cast, executor/no-json-parse -- boundary: this host-only reducer parses untrusted provider JSON and log payloads once, then returns only the typed secret-free observation model */
 
 import {
+  COOLIFY_RUNTIME_IMAGE_SOURCE,
   PUBLIC_BUILD_MANIFEST_STAGE,
   ReleaseEvidenceError,
   payloadDigest,
@@ -32,6 +33,12 @@ export interface CoolifyApplicationApi {
     readonly take: number;
   }) => Promise<unknown>;
   readonly getDeploymentByUuid: (input: { readonly uuid: string }) => Promise<unknown>;
+  /**
+   * Fixed Coolify control-plane observation of the image currently attached to
+   * one finished deployment. This is not a deployment log, app environment,
+   * tag, or caller-supplied URL.
+   */
+  readonly getDeploymentRuntimeImageByUuid: (input: { readonly uuid: string }) => Promise<unknown>;
   readonly listEnvsByApplicationUuid: (input: { readonly uuid: string }) => Promise<unknown>;
 }
 
@@ -44,6 +51,7 @@ export interface CreateCoolifyReleaseEvidenceObserverOptions {
 }
 
 const sha256Pattern = /^[0-9a-f]{64}$/u;
+const imageDigestPattern = /^sha256:[0-9a-f]{64}$/u;
 const fullShaPattern = /^[0-9a-f]{40}$/u;
 const decimalIdentifier = /^[1-9][0-9]*$/u;
 const safeIdentifier = /^[A-Za-z0-9._:-]{1,256}$/u;
@@ -87,6 +95,11 @@ const environmentName = (value: unknown): string => {
 const digest = (value: unknown): string => {
   const result = string(value).toLowerCase();
   return sha256Pattern.test(result) ? result : rejected();
+};
+
+const runtimeImageDigest = (value: unknown): string => {
+  const result = string(value).toLowerCase();
+  return imageDigestPattern.test(result) ? result : rejected();
 };
 
 const commit = (value: unknown): string => {
@@ -179,7 +192,12 @@ const configuredHealthCheck = (
 
 const reportedCommit = (value: unknown, expectedCommit?: string): string => {
   const raw = string(value);
-  if (raw.toUpperCase() === "HEAD") return "HEAD";
+  // `HEAD` is a source-faithful application read before promotion, but it can
+  // never prove that the running deployment is the caller's requested SHA.
+  if (raw.toUpperCase() === "HEAD") {
+    if (expectedCommit) return rejected();
+    return "HEAD";
+  }
   const normalized = commit(raw);
   if (expectedCommit && normalized !== expectedCommit) return rejected();
   return normalized;
@@ -229,7 +247,7 @@ const normalizeApplication = (input: {
 interface HistoryEntry {
   readonly uuid: string;
   readonly applicationId: string;
-  readonly deploymentId: string | null;
+  readonly deploymentId: string;
   readonly commit: string;
   readonly status: string;
   readonly createdAt: string;
@@ -247,7 +265,9 @@ const historyEntry = (value: unknown): HistoryEntry => {
   return {
     uuid: uuid(entry.deployment_uuid),
     applicationId: positiveId(entry.application_id),
-    deploymentId: entry.id === null || entry.id === undefined ? null : positiveId(entry.id),
+    // A deployment without its numeric Coolify id cannot be linked to the
+    // runtime-image observation, so the receipt must fail closed.
+    deploymentId: positiveId(entry.id),
     commit: commit(entry.commit),
     status: string(entry.status).toLowerCase(),
     createdAt: createdAt.value,
@@ -272,6 +292,16 @@ const historyDigest = (entries: readonly HistoryEntry[], count: number): string 
       uuid: entry.uuid,
     })),
   } as unknown as JsonValue);
+
+const sameHistoryEntry = (left: HistoryEntry, right: HistoryEntry): boolean =>
+  left.uuid === right.uuid &&
+  left.applicationId === right.applicationId &&
+  left.deploymentId === right.deploymentId &&
+  left.commit === right.commit &&
+  left.status === right.status &&
+  left.createdAtPosition === right.createdAtPosition &&
+  left.finishedAtPosition === right.finishedAtPosition &&
+  left.configurationHash === right.configurationHash;
 
 const historyEnvelope = (
   value: unknown,
@@ -323,8 +353,11 @@ const selectDeployment = (input: {
     input.entries.some(
       (entry) =>
         entry.uuid !== selected.uuid &&
-        entry.createdAtPosition > selected.createdAtPosition &&
-        ["finished", "queued", "running"].includes(entry.status),
+        // Equal source timestamps are ambiguous rather than harmless. Coolify
+        // commonly calls an active row `in_progress`; treat that synonym as a
+        // running release as well.
+        entry.createdAtPosition >= selected.createdAtPosition &&
+        ["finished", "queued", "running", "in_progress", "in-progress"].includes(entry.status),
     )
   ) {
     return rejected();
@@ -359,29 +392,29 @@ const prismaSucceeded = (line: string): boolean =>
 const nextReady = (line: string): boolean => /^✓\s+Ready in \d+(?:\.\d+)?(?:ms|s)$/u.test(line);
 
 /**
- * A marker match returns only the image-emitted digest needed by the receipt.
- * The raw line is deliberately discarded at this boundary.
+ * Lifecycle logs prove ordering only. They never contribute an image or
+ * build-environment digest to a receipt; runtime provenance has a separate
+ * Coolify control-plane source below.
  */
 const markerMatch = (input: {
   readonly stage: string;
   readonly marker: string;
   readonly line: string;
-}): { readonly manifestDigest?: string } | null => {
+}): boolean => {
   const line = exactLogLine(input.line);
   if (input.stage === "prisma-migrate" && input.marker === "Prisma migration deploy succeeded.") {
-    return prismaSucceeded(line) ? {} : null;
+    return prismaSucceeded(line);
   }
   if (
     input.stage === PUBLIC_BUILD_MANIFEST_STAGE &&
     input.marker === "Public build environment manifest sha256 emitted."
   ) {
-    const matched = line.match(/^Public build environment manifest sha256: ([0-9a-f]{64})\.$/u);
-    return matched ? { manifestDigest: matched[1]! } : null;
+    return /^Public build environment manifest sha256: [0-9a-f]{64}\.$/u.test(line);
   }
   if (input.stage === "next-ready" && input.marker === "Next.js server ready.") {
-    return nextReady(line) ? {} : null;
+    return nextReady(line);
   }
-  return line === input.marker ? {} : null;
+  return line === input.marker;
 };
 
 interface SelectedStartupMarker extends StartupMarker {
@@ -394,7 +427,6 @@ interface StartupMarkerObservation {
   readonly markers: readonly StartupMarker[];
   /** Internal-only source timestamp positions aligned with `markers`. */
   readonly positions: readonly bigint[];
-  readonly manifestDigest?: string;
 }
 
 /**
@@ -420,8 +452,7 @@ const startupMarkers = (
     if (!isRecord(candidate) || typeof candidate.output !== "string") continue;
     for (const [lineIndex, sourceLine] of candidate.output.split(/\r?\n/u).entries()) {
       for (const expected of policy.requiredStartupMarkers) {
-        const matched = markerMatch({ ...expected, line: sourceLine });
-        if (!matched) continue;
+        if (!markerMatch({ ...expected, line: sourceLine })) continue;
         // An absent or arbitrary row field must not be treated as deployment
         // stdout. Fail on a matching line instead of silently selecting a later
         // convenient marker.
@@ -431,9 +462,6 @@ const startupMarkers = (
         selected.set(expected.stage, {
           stage: expected.stage,
           marker: expected.marker,
-          ...(matched.manifestDigest === undefined
-            ? {}
-            : { manifestDigest: matched.manifestDigest }),
           observedAt: observed.value,
           recordIndex,
           lineIndex,
@@ -458,7 +486,6 @@ const startupMarkers = (
       return rejected();
     }
   }
-  const manifest = ordered.find((candidate) => candidate.stage === PUBLIC_BUILD_MANIFEST_STAGE);
   const markers = ordered.map(
     ({ lineIndex: _lineIndex, position: _position, recordIndex: _recordIndex, ...marker }) =>
       marker,
@@ -466,32 +493,52 @@ const startupMarkers = (
   return {
     markers,
     positions: ordered.map((candidate) => candidate.position),
-    ...(manifest?.manifestDigest === undefined ? {} : { manifestDigest: manifest.manifestDigest }),
   };
 };
 
 interface NormalizedDeployment {
-  readonly deployment: DeploymentObservation;
-  readonly manifestDigest?: string;
+  readonly deployment: Omit<
+    DeploymentObservation,
+    "deploymentHistoryDigest" | "deploymentHistoryCount"
+  >;
 }
 
-const nullableDeploymentId = (value: unknown): string | null =>
-  value === null || value === undefined ? null : positiveId(value);
+const runtimeImage = (input: {
+  readonly raw: unknown;
+  readonly selected: HistoryEntry;
+  readonly policy: ApplicationTargetPolicy;
+}): DeploymentObservation["runtimeImage"] => {
+  const observed = record(input.raw);
+  // This response comes from the fixed Coolify runtime-image endpoint. Its
+  // app/deployment identity is checked before its one safe digest crosses the
+  // raw-provider boundary.
+  if (
+    uuid(observed.application_uuid) !== input.policy.uuid ||
+    positiveId(observed.application_id) !== input.policy.applicationId ||
+    uuid(observed.deployment_uuid) !== input.selected.uuid ||
+    positiveId(observed.deployment_id) !== input.selected.deploymentId
+  ) {
+    return rejected();
+  }
+  return {
+    source: COOLIFY_RUNTIME_IMAGE_SOURCE,
+    digest: runtimeImageDigest(observed.image_digest),
+  };
+};
 
 const normalizeDeployment = (input: {
   readonly raw: unknown;
+  readonly runtimeImageRaw: unknown;
   readonly selected: HistoryEntry;
   readonly application: ApplicationConfigurationObservation;
   readonly policy: ApplicationTargetPolicy;
   readonly proposedMainSha: string;
-  readonly deploymentHistoryDigest: string;
-  readonly deploymentHistoryCount: number;
 }): NormalizedDeployment => {
   const detail = record(input.raw);
   const nestedApplication = record(detail.application);
   const createdAt = timestampValue(detail.created_at);
   const finishedAt = timestampValue(detail.finished_at);
-  const detailDeploymentId = nullableDeploymentId(detail.id);
+  const detailDeploymentId = positiveId(detail.id);
   if (
     uuid(detail.deployment_uuid) !== input.selected.uuid ||
     commit(detail.commit) !== input.proposedMainSha ||
@@ -527,14 +574,25 @@ const normalizeDeployment = (input: {
       createdAt: input.selected.createdAt,
       finishedAt: input.selected.finishedAt,
       configurationHash: input.selected.configurationHash,
-      deploymentHistoryDigest: input.deploymentHistoryDigest,
-      deploymentHistoryCount: input.deploymentHistoryCount,
       startupMarkers: startup.markers,
       startupMarkersDigest: startupMarkersDigest(startup.markers),
+      runtimeImage: runtimeImage({
+        raw: input.runtimeImageRaw,
+        selected: input.selected,
+        policy: input.policy,
+      }),
     },
-    ...(startup.manifestDigest === undefined ? {} : { manifestDigest: startup.manifestDigest }),
   };
 };
+
+const withFinalHistory = (
+  deployment: NormalizedDeployment["deployment"],
+  history: readonly HistoryEntry[],
+): DeploymentObservation => ({
+  ...deployment,
+  deploymentHistoryDigest: historyDigest(history, history.length),
+  deploymentHistoryCount: history.length,
+});
 
 const environmentFlagMatches = (
   entry: Record<string, unknown>,
@@ -707,33 +765,37 @@ export const createCoolifyReleaseEvidenceObserver = (
         proposedMainSha,
         notBefore,
       });
-      const [rootDetail, zeroDetail] = await Promise.all([
+      const [rootDetail, zeroDetail, rootRuntimeImage, zeroRuntimeImage] = await Promise.all([
         options.api.getDeploymentByUuid({ uuid: selectedRoot.uuid }),
         options.api.getDeploymentByUuid({ uuid: selectedZero.uuid }),
+        options.api.getDeploymentRuntimeImageByUuid({ uuid: selectedRoot.uuid }),
+        options.api.getDeploymentRuntimeImageByUuid({ uuid: selectedZero.uuid }),
       ]);
-      // These final application reads deliberately happen after selection. They
-      // prove final configuration, not immutable runtime-image provenance.
+      // These final application reads deliberately happen after selection.
+      // They prove final configuration; runtime provenance is separately bound
+      // to the fixed Coolify runtime-image read above.
       const [root, zero] = await Promise.all([
         applicationPair(policy.root, proposedMainSha),
         applicationPair(policy.zero, proposedMainSha),
       ]);
-      const rootDeployment = normalizeDeployment({
+      // Reduce detail/log/runtime-image observations before taking the final
+      // complete history snapshots below. A later active/finished deployment
+      // must invalidate this release rather than being omitted from a receipt.
+      const normalizedRootDeployment = normalizeDeployment({
         raw: rootDetail,
+        runtimeImageRaw: rootRuntimeImage,
         selected: selectedRoot,
         application: root,
         policy: policy.root,
         proposedMainSha,
-        deploymentHistoryDigest: historyDigest(rootHistory, rootHistory.length),
-        deploymentHistoryCount: rootHistory.length,
       });
-      const zeroDeployment = normalizeDeployment({
+      const normalizedZeroDeployment = normalizeDeployment({
         raw: zeroDetail,
+        runtimeImageRaw: zeroRuntimeImage,
         selected: selectedZero,
         application: zero,
         policy: policy.zero,
         proposedMainSha,
-        deploymentHistoryDigest: historyDigest(zeroHistory, zeroHistory.length),
-        deploymentHistoryCount: zeroHistory.length,
       });
       // Keep the initial reads semantically meaningful: their identities and
       // static configuration must agree with the final observations, so a
@@ -744,13 +806,37 @@ export const createCoolifyReleaseEvidenceObserver = (
       ) {
         return rejected();
       }
-      if (!rootDeployment.manifestDigest) return rejected();
+      const [finalRootHistory, finalZeroHistory] = await Promise.all([
+        allHistory(policy.root.uuid),
+        allHistory(policy.zero.uuid),
+      ]);
+      const finalRoot = selectDeployment({
+        entries: finalRootHistory,
+        policy: policy.root,
+        proposedMainSha,
+        notBefore,
+      });
+      const finalZero = selectDeployment({
+        entries: finalZeroHistory,
+        policy: policy.zero,
+        proposedMainSha,
+        notBefore,
+      });
+      if (
+        !sameHistoryEntry(finalRoot, selectedRoot) ||
+        !sameHistoryEntry(finalZero, selectedZero)
+      ) {
+        return rejected();
+      }
       return {
-        root: { application: root, deployment: rootDeployment.deployment },
-        zero: { application: zero, deployment: zeroDeployment.deployment },
-        // The actual value is image-emitted deployment stdout—not a digest
-        // reconstructed from mutable current environment records.
-        publicBuildEnvironmentManifest: { actualDigest: rootDeployment.manifestDigest },
+        root: {
+          application: root,
+          deployment: withFinalHistory(normalizedRootDeployment.deployment, finalRootHistory),
+        },
+        zero: {
+          application: zero,
+          deployment: withFinalHistory(normalizedZeroDeployment.deployment, finalZeroHistory),
+        },
         // This exact policy was checked in preflight and is not reread here.
         environmentPolicy: policy.environmentPolicy,
       };

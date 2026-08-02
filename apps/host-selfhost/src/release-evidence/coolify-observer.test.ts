@@ -2,7 +2,13 @@ import { expect, test } from "@effect/vitest";
 
 import { createCoolifyReleaseEvidenceObserver } from "./coolify-observer";
 import { publicBuildEnvironmentManifestDigest } from "./protocol";
-import { EXPECTED_MANIFEST_DIGEST, MAIN_SHA, POLICY } from "./test-fixtures";
+import {
+  EXPECTED_MANIFEST_DIGEST,
+  MAIN_SHA,
+  POLICY,
+  ROOT_RUNTIME_IMAGE_DIGEST,
+  ZERO_RUNTIME_IMAGE_DIGEST,
+} from "./test-fixtures";
 
 const CONFIG_HASH = "ab".repeat(32);
 
@@ -59,7 +65,7 @@ const application = (kind: "root" | "zero") => {
     git_branch: "main",
     build_pack: policy.buildPack,
     git_repository: `https://github.com/${policy.repository}.git`,
-    git_commit_sha: "HEAD",
+    git_commit_sha: MAIN_SHA,
     start_command: "",
     config_hash: CONFIG_HASH,
     status: "running:unknown",
@@ -102,6 +108,15 @@ const detail = (kind: "root" | "zero") => ({
   logs: JSON.stringify(kind === "root" ? rootLogRecords() : zeroLogRecords()),
 });
 
+const runtimeImage = (kind: "root" | "zero") => ({
+  application_uuid: POLICY[kind].uuid,
+  application_id: POLICY[kind].applicationId,
+  deployment_uuid: `${kind}-deployment-uuid`,
+  deployment_id: kind === "root" ? 9001 : 9002,
+  image_digest: kind === "root" ? ROOT_RUNTIME_IMAGE_DIGEST : ZERO_RUNTIME_IMAGE_DIGEST,
+  opaque_provider_metadata: "secret-from-runtime-image-observation",
+});
+
 const rootEnvironment = () => ({
   key: "NEXT_PUBLIC_ZERO_SERVER",
   // The production image receives this field; `value` is intentionally not
@@ -129,15 +144,21 @@ const zeroEnvironment = () => ({
 const rawApi = () => {
   const calls: string[] = [];
   const details = { root: detail("root"), zero: detail("zero") };
+  const applications = { root: application("root"), zero: application("zero") };
+  const histories = { root: [listEntry("root")], zero: [listEntry("zero")] };
+  const runtimeImages = { root: runtimeImage("root"), zero: runtimeImage("zero") };
   const environments = { root: [rootEnvironment()], zero: [zeroEnvironment()] };
   return {
     calls,
     details,
+    applications,
     environments,
+    histories,
+    runtimeImages,
     api: {
       getApplicationByUuid: async ({ uuid }: { readonly uuid: string }) => {
         calls.push(`application:${uuid}`);
-        return uuid === POLICY.root.uuid ? application("root") : application("zero");
+        return uuid === POLICY.root.uuid ? applications.root : applications.zero;
       },
       listDeploymentsByAppUuid: async ({
         uuid,
@@ -150,11 +171,16 @@ const rawApi = () => {
       }) => {
         calls.push(`deployments:${uuid}:${skip}:${take}`);
         const kind = uuid === POLICY.root.uuid ? "root" : "zero";
-        return { count: 1, deployments: [listEntry(kind)] };
+        const history = histories[kind];
+        return { count: history.length, deployments: history.slice(skip, skip + take) };
       },
       getDeploymentByUuid: async ({ uuid }: { readonly uuid: string }) => {
         calls.push(`deployment:${uuid}`);
         return uuid === "root-deployment-uuid" ? details.root : details.zero;
+      },
+      getDeploymentRuntimeImageByUuid: async ({ uuid }: { readonly uuid: string }) => {
+        calls.push(`runtime-image:${uuid}`);
+        return uuid === "root-deployment-uuid" ? runtimeImages.root : runtimeImages.zero;
       },
       listEnvsByApplicationUuid: async ({ uuid }: { readonly uuid: string }) => {
         calls.push(`environments:${uuid}`);
@@ -208,19 +234,32 @@ test("derives a Root-only expected digest and reduces secret-free app-scoped evi
   ]);
   expect(postdeployObservation.root.deployment.deploymentHistoryCount).toBe(1);
   expect(postdeployObservation.root.deployment.deploymentHistoryDigest).toMatch(/^[0-9a-f]{64}$/u);
-  expect(postdeployObservation.publicBuildEnvironmentManifest.actualDigest).toBe(
-    EXPECTED_MANIFEST_DIGEST,
-  );
+  expect(postdeployObservation.root.deployment.runtimeImage).toEqual({
+    source: "coolify-deployment-runtime-image-v1",
+    digest: ROOT_RUNTIME_IMAGE_DIGEST,
+  });
+  expect(postdeployObservation.zero.deployment.runtimeImage.digest).toBe(ZERO_RUNTIME_IMAGE_DIGEST);
   const serialized = JSON.stringify({ preflight, postdeployObservation });
   expect(serialized).not.toContain("secret-from-environment");
   expect(serialized).not.toContain("secret-from-log");
   expect(serialized).not.toContain("untrusted-provider-output");
+  expect(serialized).not.toContain("secret-from-runtime-image-observation");
   expect(raw.calls).toContain(`environments:${POLICY.root.uuid}`);
   expect(raw.calls).not.toContain(`environments:${POLICY.zero.uuid}`);
   expect(raw.calls.filter((call) => call.startsWith("environments:"))).toHaveLength(1);
   expect(raw.calls.every((call) => !call.includes("global"))).toBe(true);
   expect(raw.calls).toContain(`deployments:${POLICY.root.uuid}:0:100`);
   expect(raw.calls).toContain(`deployments:${POLICY.zero.uuid}:0:100`);
+  expect(raw.calls).toContain("runtime-image:root-deployment-uuid");
+  expect(raw.calls).toContain("runtime-image:zero-deployment-uuid");
+  // The complete app-scoped histories are read again after detail/log/final
+  // application observations, not merely before selecting a deployment.
+  expect(raw.calls.filter((call) => call === `deployments:${POLICY.root.uuid}:0:100`)).toHaveLength(
+    2,
+  );
+  expect(raw.calls.filter((call) => call === `deployments:${POLICY.zero.uuid}:0:100`)).toHaveLength(
+    2,
+  );
 });
 
 test("rejects a non-webhook/PR-like deployment before any raw diagnostic is exposed", async () => {
@@ -228,6 +267,69 @@ test("rejects a non-webhook/PR-like deployment before any raw diagnostic is expo
   raw.details.root.is_webhook = false;
   await expect(postdeploy(raw)).rejects.toMatchObject({ code: "evidence-rejected" });
 });
+
+test.each([
+  [
+    "history",
+    (raw: ReturnType<typeof rawApi>) => ((raw.histories.root[0] as { id: unknown }).id = null),
+  ],
+  ["detail", (raw: ReturnType<typeof rawApi>) => ((raw.details.zero as { id: unknown }).id = null)],
+])("rejects a null numeric deployment id from the %s source", async (_source, mutate) => {
+  const raw = rawApi();
+  mutate(raw);
+  await expect(postdeploy(raw)).rejects.toMatchObject({ code: "evidence-rejected" });
+});
+
+test("rejects HEAD as a postdeploy runtime-SHA confirmation", async () => {
+  const raw = rawApi();
+  raw.applications.root.git_commit_sha = "HEAD";
+  await expect(postdeploy(raw)).rejects.toMatchObject({ code: "evidence-rejected" });
+});
+
+test.each([
+  [
+    "another application",
+    (raw: ReturnType<typeof rawApi>) =>
+      (raw.runtimeImages.root.application_uuid = POLICY.zero.uuid),
+  ],
+  [
+    "another deployment",
+    (raw: ReturnType<typeof rawApi>) =>
+      (raw.runtimeImages.zero.deployment_uuid = "root-deployment-uuid"),
+  ],
+  [
+    "a non-digest image reference",
+    (raw: ReturnType<typeof rawApi>) => (raw.runtimeImages.root.image_digest = "glink:latest"),
+  ],
+])("rejects a runtime-image observation substituted from %s", async (_source, mutate) => {
+  const raw = rawApi();
+  mutate(raw);
+  await expect(postdeploy(raw)).rejects.toMatchObject({ code: "evidence-rejected" });
+});
+
+test.each(["queued", "running", "in_progress", "finished"] as const)(
+  "rejects a later %s deployment after the initial snapshot but before receipt issuance",
+  async (status) => {
+    const raw = rawApi();
+    const list = raw.api.listDeploymentsByAppUuid;
+    let rootHistoryReads = 0;
+    raw.api.listDeploymentsByAppUuid = async (input) => {
+      if (input.uuid === POLICY.root.uuid && rootHistoryReads++ === 1) {
+        raw.histories.root.push({
+          ...listEntry("root"),
+          id: 9003,
+          deployment_uuid: "root-later-deployment-uuid",
+          commit: "f".repeat(40),
+          status,
+          created_at: "2026-08-02T12:01:11.000000Z",
+          finished_at: "2026-08-02T12:01:12.000000Z",
+        });
+      }
+      return list(input);
+    };
+    await expect(postdeploy(raw)).rejects.toMatchObject({ code: "evidence-rejected" });
+  },
+);
 
 test("uses the pinned Docker default when a public Root variable is runtime-only", async () => {
   const raw = rawApi();
@@ -325,9 +427,10 @@ test("rejects a duplicate Zero lifecycle marker", async () => {
   await expect(postdeploy(raw)).rejects.toMatchObject({ code: "evidence-rejected" });
 });
 
-test("retains an emitted digest for the service to compare against preflight", async () => {
+test("uses lifecycle stdout for ordering only, never as the runtime-image digest", async () => {
   const raw = rawApi();
-  raw.details.root.logs = JSON.stringify(rootLogRecords("ab".repeat(32)));
+  raw.details.root.logs = JSON.stringify(rootLogRecords("fe".repeat(32)));
   const observation = await postdeploy(raw);
-  expect(observation.publicBuildEnvironmentManifest.actualDigest).toBe("ab".repeat(32));
+  expect(observation.root.deployment.runtimeImage.digest).toBe(ROOT_RUNTIME_IMAGE_DIGEST);
+  expect(JSON.stringify(observation)).not.toContain("fe".repeat(32));
 });

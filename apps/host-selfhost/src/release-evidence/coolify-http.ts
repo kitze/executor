@@ -16,6 +16,11 @@ export interface CoolifyEndpointPaths {
     readonly take: number;
   }) => string;
   readonly deployment: (uuid: string) => string;
+  /**
+   * Coolify's control-plane runtime-image inspection for one deployment. The
+   * observer fails closed when this fixed read capability is unavailable.
+   */
+  readonly deploymentRuntimeImage: (uuid: string) => string;
   readonly environments: (uuid: string) => string;
 }
 
@@ -35,6 +40,7 @@ const defaultPaths: CoolifyEndpointPaths = {
     return `/api/v1/deployments?${params.toString()}`;
   },
   deployment: (uuid) => `/api/v1/deployments/${encodeURIComponent(uuid)}`,
+  deploymentRuntimeImage: (uuid) => `/api/v1/deployments/${encodeURIComponent(uuid)}/runtime-image`,
   environments: (uuid) => `/api/v1/applications/${encodeURIComponent(uuid)}/envs`,
 };
 
@@ -114,6 +120,7 @@ export const createCoolifyHttpApplicationApi = (
     getApplicationByUuid: ({ uuid }) => get(paths.application(uuid)),
     listDeploymentsByAppUuid: (input) => get(paths.deployments(input)),
     getDeploymentByUuid: ({ uuid }) => get(paths.deployment(uuid)),
+    getDeploymentRuntimeImageByUuid: ({ uuid }) => get(paths.deploymentRuntimeImage(uuid)),
     listEnvsByApplicationUuid: ({ uuid }) => get(paths.environments(uuid)),
   };
 };

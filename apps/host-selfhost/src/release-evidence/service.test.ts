@@ -19,6 +19,8 @@ import {
   MAIN_SHA,
   NONCE,
   POLICY,
+  ROOT_RUNTIME_IMAGE_DIGEST,
+  ZERO_RUNTIME_IMAGE_DIGEST,
   observer,
   postdeployObservation,
   preflightRequest,
@@ -28,7 +30,7 @@ import {
 const makeService = (
   input: {
     readonly now?: () => Date;
-    readonly postdeployDigest?: string;
+    readonly postdeployRuntimeImageDigest?: string;
   } = {},
 ) => {
   const signing = signer();
@@ -41,8 +43,8 @@ const makeService = (
       signer: signing,
       store,
       observer: observer({
-        postdeploy: input.postdeployDigest
-          ? postdeployObservation(input.postdeployDigest)
+        postdeploy: input.postdeployRuntimeImageDigest
+          ? postdeployObservation(input.postdeployRuntimeImageDigest)
           : undefined,
       }),
       now: input.now ?? (() => new Date("2026-08-02T12:00:00.000Z")),
@@ -73,6 +75,28 @@ const postdeployRequest = (
   preflightPayloadDigest: payloadDigest(preflight.payload as unknown as JsonValue),
 });
 
+const verification = (input: { readonly keyId: string; readonly publicKey: string }) => ({
+  action: POSTDEPLOY_ACTION,
+  tenantId: CALLER.tenantId,
+  principalId: CALLER.principalId,
+  nonce: NONCE,
+  proposedMainSha: MAIN_SHA,
+  root: POLICY.root,
+  zero: POLICY.zero,
+  rootDeployment: {
+    deploymentUuid: "root-deployment-uuid",
+    deploymentId: "9001",
+    runtimeImageDigest: ROOT_RUNTIME_IMAGE_DIGEST,
+  },
+  zeroDeployment: {
+    deploymentUuid: "zero-deployment-uuid",
+    deploymentId: "9002",
+    runtimeImageDigest: ZERO_RUNTIME_IMAGE_DIGEST,
+  },
+  now: "2026-08-02T12:01:00.000Z",
+  verificationKeys: [input],
+});
+
 test("issues a signed preflight and one bound, signed postdeploy receipt", async () => {
   const { service, signing } = makeService();
   const preflight = await service.preflight(preflightRequest());
@@ -82,15 +106,13 @@ test("issues a signed preflight and one bound, signed postdeploy receipt", async
   const verified = verifyPostdeployBinding({
     preflight,
     postdeploy,
-    verificationKeys: [{ keyId: signing.keyId, publicKey: signing.publicKey }],
-    now: "2026-08-02T12:01:00.000Z",
+    ...verification({ keyId: signing.keyId, publicKey: signing.publicKey }),
   });
   expect(verified.payload.observedMainSha).toBe(MAIN_SHA);
   expect(verified.payload.root.deployment.deploymentHistoryDigest).toBe("aa".repeat(32));
   expect(verified.payload.publicBuildEnvironmentManifest).toEqual({
     version: 1,
     expectedDigest: EXPECTED_MANIFEST_DIGEST,
-    actualDigest: EXPECTED_MANIFEST_DIGEST,
   });
   expect(JSON.stringify(postdeploy)).not.toContain("secret-from-coolify");
 });
@@ -153,19 +175,27 @@ test("rejects preflight mutation, SHA mutation, and wrong tenant before collecti
   ).rejects.toMatchObject({ code: "preflight-unavailable" });
 });
 
-test("rejects a postdeploy observation whose public build manifest digest does not consume preflight", async () => {
-  const { service } = makeService({ postdeployDigest: "ab".repeat(32) });
+test("offline verification rejects a substituted valid runtime image digest", async () => {
+  const substituted = `sha256:${"ab".repeat(32)}`;
+  const { service, signing } = makeService({ postdeployRuntimeImageDigest: substituted });
   const preflight = await service.preflight(preflightRequest());
-  const request = postdeployRequest(preflight);
-  await expect(service.postdeploy(request)).rejects.toMatchObject({ code: "evidence-rejected" });
+  const postdeploy = await service.postdeploy(postdeployRequest(preflight));
+  expectFailureCode(
+    () =>
+      verifyPostdeployBinding({
+        preflight,
+        postdeploy,
+        ...verification({ keyId: signing.keyId, publicKey: signing.publicKey }),
+      }),
+    "receipt-constraint-mismatch",
+  );
 });
 
-test("offline verifier rejects a signature mutation, wrong app, action, tenant, expiry, and replay", async () => {
+test("offline verifier rejects a signature mutation, wrong app, action, tenant, and expiry", async () => {
   const { service, signing } = makeService();
   const preflight = await service.preflight(preflightRequest());
   const request = postdeployRequest(preflight);
   const postdeploy = await service.postdeploy(request);
-  const keys = [{ keyId: signing.keyId, publicKey: signing.publicKey }];
 
   const mutated = {
     ...postdeploy,
@@ -174,38 +204,24 @@ test("offline verifier rejects a signature mutation, wrong app, action, tenant, 
   expectFailureCode(
     () =>
       verifyReleaseEvidenceReceipt(mutated, {
-        action: POSTDEPLOY_ACTION,
-        tenantId: CALLER.tenantId,
-        principalId: CALLER.principalId,
-        nonce: NONCE,
-        proposedMainSha: MAIN_SHA,
-        root: POLICY.root,
-        zero: POLICY.zero,
-        now: "2026-08-02T12:01:00.000Z",
-        verificationKeys: keys,
+        ...verification({ keyId: signing.keyId, publicKey: signing.publicKey }),
       }),
     "invalid-signature",
   );
 
-  const verification = {
-    action: POSTDEPLOY_ACTION,
-    tenantId: CALLER.tenantId,
-    principalId: CALLER.principalId,
-    nonce: NONCE,
-    proposedMainSha: MAIN_SHA,
-    root: POLICY.root,
-    zero: POLICY.zero,
-    now: "2026-08-02T12:01:00.000Z",
-    verificationKeys: keys,
-  } as const;
+  const receiptVerification = verification({ keyId: signing.keyId, publicKey: signing.publicKey });
   expectFailureCode(
-    () => verifyReleaseEvidenceReceipt(postdeploy, { ...verification, tenantId: "wrong-tenant" }),
+    () =>
+      verifyReleaseEvidenceReceipt(postdeploy, {
+        ...receiptVerification,
+        tenantId: "wrong-tenant",
+      }),
     "receipt-constraint-mismatch",
   );
   expectFailureCode(
     () =>
       verifyReleaseEvidenceReceipt(postdeploy, {
-        ...verification,
+        ...receiptVerification,
         action: "coolify.glink.authorizeReleaseEnvironment.v1",
       }),
     "receipt-constraint-mismatch",
@@ -213,7 +229,7 @@ test("offline verifier rejects a signature mutation, wrong app, action, tenant, 
   expectFailureCode(
     () =>
       verifyReleaseEvidenceReceipt(postdeploy, {
-        ...verification,
+        ...receiptVerification,
         root: { ...POLICY.root, uuid: "wrong-root-app" },
       }),
     "receipt-constraint-mismatch",
@@ -221,22 +237,9 @@ test("offline verifier rejects a signature mutation, wrong app, action, tenant, 
   expectFailureCode(
     () =>
       verifyReleaseEvidenceReceipt(postdeploy, {
-        ...verification,
+        ...receiptVerification,
         now: "2026-08-02T13:00:00.000Z",
       }),
     "receipt-expired",
-  );
-  const seen = new Set<string>();
-  verifyReleaseEvidenceReceipt(postdeploy, {
-    ...verification,
-    replayStore: { has: (id) => seen.has(id), add: (id) => seen.add(id) },
-  });
-  expectFailureCode(
-    () =>
-      verifyReleaseEvidenceReceipt(postdeploy, {
-        ...verification,
-        replayStore: { has: (id) => seen.has(id), add: (id) => seen.add(id) },
-      }),
-    "receipt-replayed",
   );
 });

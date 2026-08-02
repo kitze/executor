@@ -22,6 +22,8 @@ import type {
 export const MAIN_SHA = "0123456789abcdef0123456789abcdef01234567";
 export const CONFIG_HASH = "ab".repeat(32);
 export const ENVIRONMENT_POLICY_DIGEST = "ef".repeat(32);
+export const ROOT_RUNTIME_IMAGE_DIGEST = `sha256:${"cd".repeat(32)}`;
+export const ZERO_RUNTIME_IMAGE_DIGEST = `sha256:${"de".repeat(32)}`;
 export const CALLER: ReleaseEvidenceCaller = {
   tenantId: "glink-tenant",
   principalId: "glink-release",
@@ -166,7 +168,6 @@ const rootMarkers = [
   {
     stage: "public-build-environment-manifest",
     marker: "Public build environment manifest sha256 emitted.",
-    manifestDigest: EXPECTED_MANIFEST_DIGEST,
     observedAt: "2026-08-02T12:01:02.000Z",
   },
   {
@@ -224,30 +225,27 @@ const release = (kind: "root" | "zero", reportedCommit: string): ApplicationRele
       deploymentHistoryCount: 2,
       startupMarkers: markers,
       startupMarkersDigest: startupMarkersDigest(markers),
+      runtimeImage: {
+        source: "coolify-deployment-runtime-image-v1",
+        digest: kind === "root" ? ROOT_RUNTIME_IMAGE_DIGEST : ZERO_RUNTIME_IMAGE_DIGEST,
+      },
     },
   };
 };
 
 export const postdeployObservation = (
-  actualDigest = EXPECTED_MANIFEST_DIGEST,
+  rootRuntimeImageDigest = ROOT_RUNTIME_IMAGE_DIGEST,
 ): PostdeployObservation => {
-  const root = release("root", "HEAD");
-  const markers = rootMarkers.map((marker) =>
-    marker.stage === "public-build-environment-manifest"
-      ? { ...marker, manifestDigest: actualDigest }
-      : marker,
-  );
+  const root = release("root", MAIN_SHA);
   return {
     root: {
       ...root,
       deployment: {
         ...root.deployment,
-        startupMarkers: markers,
-        startupMarkersDigest: startupMarkersDigest(markers),
+        runtimeImage: { ...root.deployment.runtimeImage, digest: rootRuntimeImageDigest },
       },
     },
-    zero: release("zero", "HEAD"),
-    publicBuildEnvironmentManifest: { actualDigest },
+    zero: release("zero", MAIN_SHA),
     environmentPolicy: ENVIRONMENT_POLICY,
   };
 };

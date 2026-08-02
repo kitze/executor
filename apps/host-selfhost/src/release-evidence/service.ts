@@ -3,9 +3,9 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  COOLIFY_RUNTIME_IMAGE_SOURCE,
   PREFLIGHT_ACTION,
   POSTDEPLOY_ACTION,
-  PUBLIC_BUILD_MANIFEST_STAGE,
   RELEASE_EVIDENCE_PROTOCOL_VERSION,
   ReleaseEvidenceError,
   canonicalJson,
@@ -123,7 +123,7 @@ export class MemoryReleaseEvidenceStore implements ReleaseEvidenceStore {
     ) {
       return "unavailable";
     }
-    if (Date.parse(record.expiresAt) < Date.parse(input.now)) return "expired";
+    if (Date.parse(record.expiresAt) <= Date.parse(input.now)) return "expired";
     if (record.consumed) return "already-consumed";
     record.consumed = true;
     this.#receipts.set(input.finalReceipt.receiptId, input.finalReceipt);
@@ -132,6 +132,7 @@ export class MemoryReleaseEvidenceStore implements ReleaseEvidenceStore {
 }
 
 const sha256Pattern = /^[0-9a-f]{64}$/u;
+const imageDigestPattern = /^sha256:[0-9a-f]{64}$/u;
 const decimalIdentifier = /^[1-9][0-9]*$/u;
 const safeIdentifier = /^[A-Za-z0-9._:-]{1,256}$/u;
 const validIso = (value: unknown): value is string =>
@@ -165,7 +166,6 @@ const configurationMatches = (
 const markersMatch = (
   release: ApplicationReleaseObservation,
   policy: ApplicationTargetPolicy,
-  publicBuildManifestDigest?: string,
 ): boolean => {
   const deployment = release.deployment;
   if (
@@ -180,16 +180,10 @@ const markersMatch = (
   return deployment.startupMarkers.every((marker, index) => {
     const expected = policy.requiredStartupMarkers[index];
     const observedAt = Date.parse(marker.observedAt);
-    const expectsManifestDigest = expected?.stage === PUBLIC_BUILD_MANIFEST_STAGE;
     const matches =
       expected !== undefined &&
       marker.stage === expected.stage &&
       marker.marker === expected.marker &&
-      (expectsManifestDigest
-        ? marker.manifestDigest === publicBuildManifestDigest &&
-          marker.manifestDigest !== undefined &&
-          sha256Pattern.test(marker.manifestDigest)
-        : marker.manifestDigest === undefined) &&
       validIso(marker.observedAt) &&
       start <= observedAt &&
       observedAt <= finish &&
@@ -204,7 +198,6 @@ const releaseMatches = (input: {
   readonly policy: ApplicationTargetPolicy;
   readonly proposedMainSha: string;
   readonly notBefore: string;
-  readonly publicBuildManifestDigest?: string;
 }): boolean => {
   const { observed, policy, proposedMainSha, notBefore } = input;
   const deployment = observed.deployment;
@@ -213,7 +206,7 @@ const releaseMatches = (input: {
     deployment.applicationUuid === policy.uuid &&
     deployment.applicationId === policy.applicationId &&
     safeIdentifier.test(deployment.uuid) &&
-    (deployment.deploymentId === null || decimalIdentifier.test(deployment.deploymentId)) &&
+    decimalIdentifier.test(deployment.deploymentId) &&
     deployment.sourceCommit === proposedMainSha &&
     deployment.status === "finished" &&
     deployment.releaseKind === "webhook-main" &&
@@ -225,10 +218,15 @@ const releaseMatches = (input: {
     Date.parse(deployment.finishedAt) >= Date.parse(deployment.createdAt) &&
     sha256Pattern.test(deployment.configurationHash) &&
     deployment.configurationHash === observed.application.configurationHash &&
+    // Final app reads must name the requested SHA. `HEAD` is source-faithful
+    // before promotion but is never evidence of this runtime.
+    observed.application.reportedCommit === proposedMainSha &&
     sha256Pattern.test(deployment.deploymentHistoryDigest) &&
     Number.isSafeInteger(deployment.deploymentHistoryCount) &&
     deployment.deploymentHistoryCount > 0 &&
-    markersMatch(observed, policy, input.publicBuildManifestDigest)
+    deployment.runtimeImage.source === COOLIFY_RUNTIME_IMAGE_SOURCE &&
+    imageDigestPattern.test(deployment.runtimeImage.digest) &&
+    markersMatch(observed, policy)
   );
 };
 
@@ -272,18 +270,14 @@ const assertPostdeployObservation = (input: {
   readonly policy: ReleaseEvidencePolicy;
   readonly proposedMainSha: string;
   readonly notBefore: string;
-  readonly expectedManifestDigest: string;
 }): void => {
-  const { observation, policy, proposedMainSha, notBefore, expectedManifestDigest } = input;
+  const { observation, policy, proposedMainSha, notBefore } = input;
   if (
-    !sha256Pattern.test(observation.publicBuildEnvironmentManifest.actualDigest) ||
-    observation.publicBuildEnvironmentManifest.actualDigest !== expectedManifestDigest ||
     !releaseMatches({
       observed: observation.root,
       policy: policy.root,
       proposedMainSha,
       notBefore,
-      publicBuildManifestDigest: observation.publicBuildEnvironmentManifest.actualDigest,
     }) ||
     !releaseMatches({
       observed: observation.zero,
@@ -419,7 +413,7 @@ export const createReleaseEvidenceService = (
     } catch {
       throw new ReleaseEvidenceError("storage-unavailable");
     }
-    if (!persisted || Date.parse(persisted.expiresAt) < now().getTime()) {
+    if (!persisted || Date.parse(persisted.expiresAt) <= now().getTime()) {
       throw new ReleaseEvidenceError("preflight-unavailable");
     }
     const preflight = persisted.receipt;
@@ -457,10 +451,9 @@ export const createReleaseEvidenceService = (
       policy: options.policy,
       proposedMainSha: request.proposedMainSha,
       notBefore: preflight.issuedAt,
-      expectedManifestDigest: preflight.payload.publicBuildEnvironmentManifest.expectedDigest,
     });
     const issuedAt = now().toISOString();
-    if (Date.parse(issuedAt) > Date.parse(persisted.expiresAt)) {
+    if (Date.parse(issuedAt) >= Date.parse(persisted.expiresAt)) {
       throw new ReleaseEvidenceError("receipt-expired");
     }
     const payload: PostdeployReceiptPayload = {
@@ -474,7 +467,6 @@ export const createReleaseEvidenceService = (
       publicBuildEnvironmentManifest: {
         version: preflight.payload.publicBuildEnvironmentManifest.version,
         expectedDigest: preflight.payload.publicBuildEnvironmentManifest.expectedDigest,
-        actualDigest: observation.publicBuildEnvironmentManifest.actualDigest,
       },
       environmentPolicy: observation.environmentPolicy,
     };

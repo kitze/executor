@@ -204,7 +204,7 @@ export const createSqliteReleaseEvidenceStore = (client: Client): ReleaseEvidenc
       if (!receiptId || !payloadDigest || !expiresAt) return "unavailable";
       if (receiptId !== input.receiptId || payloadDigest !== input.payloadDigest)
         return "unavailable";
-      if (Date.parse(expiresAt) < Date.parse(input.now)) return "expired";
+      if (Date.parse(expiresAt) <= Date.parse(input.now)) return "expired";
       if (consumedAt) return "already-consumed";
 
       const update = await transaction.execute({
