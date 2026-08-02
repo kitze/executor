@@ -1,5 +1,12 @@
 # @executor-js/plugin-example
 
+## 1.5.38
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.5.38
+
 ## 1.5.37
 
 ### Patch Changes

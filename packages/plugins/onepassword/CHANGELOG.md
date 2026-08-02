@@ -1,5 +1,14 @@
 # @executor-js/plugin-onepassword
 
+## 1.5.38
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.5.38
+  - @executor-js/api@1.4.58
+  - @executor-js/react@1.4.58
+
 ## 1.5.37
 
 ### Patch Changes
