@@ -110,6 +110,10 @@ type ReplacedInput = {
 export interface OpaqueValueHandoff {
   /** Whether this execution has ever sealed a value and must not be made durable. */
   readonly hasOpaqueValues: () => boolean;
+  /** Whether caller-authored plaintext reached a declared sensitive sink.
+   * Arbitrary sandbox transforms of such a value cannot be enumerated, so the
+   * execution engine uses this bit to suppress its entire terminal surface. */
+  readonly hasDirectSensitiveInputValues: () => boolean;
   /** Replace declared sensitive output leaves with opaque capability objects. */
   readonly protectOutput: (
     value: unknown,
@@ -677,6 +681,7 @@ export const makeOpaqueValueHandoff = (
   const redactionNeedles = new Set<string>();
   const redactionValues: unknown[] = [];
   let hasSealedValues = false;
+  let hasDirectSensitiveInputValues = false;
   let disposed = false;
   let expiryTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -721,6 +726,11 @@ export const makeOpaqueValueHandoff = (
     }
   };
 
+  const rememberDirectSensitiveInputValue = (value: unknown): void => {
+    hasDirectSensitiveInputValues = true;
+    rememberSensitiveValue(value);
+  };
+
   const redactText = (value: string): string => replaceText(value, [...redactionNeedles]);
 
   const redact = (value: unknown, depth = 0, seen = new WeakMap<object, unknown>()): unknown => {
@@ -749,6 +759,7 @@ export const makeOpaqueValueHandoff = (
 
   return {
     hasOpaqueValues: () => hasSealedValues,
+    hasDirectSensitiveInputValues: () => hasDirectSensitiveInputValues,
     protectOutput: (value, paths, context = defaultContext, safeScalars = []) => {
       const patterns = decodePointers(paths);
       if (patterns.length === 0) return redact(value);
@@ -792,7 +803,7 @@ export const makeOpaqueValueHandoff = (
       const patterns = decodePointers(paths);
       if (patterns.length > 0) {
         assertAvailable();
-        visitSensitiveInputValues(value, patterns, rememberSensitiveValue);
+        visitSensitiveInputValues(value, patterns, rememberDirectSensitiveInputValue);
       }
       const inspected = inspectOpaqueInputs(value, patterns, entries, context, executionId, now);
       // Bind only after every referenced handle passed validation. A malformed

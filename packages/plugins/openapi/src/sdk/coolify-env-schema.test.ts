@@ -23,6 +23,14 @@ import {
   resolveOpenApiBackedAnnotations,
 } from "./backing";
 import { openApiPlugin } from "./plugin";
+import {
+  coolifyDatabaseResponseSensitiveFields,
+  coolifyDatabaseUpdateSensitiveFields,
+  isCoolifyDatabaseResponseSchema,
+  isCoolifyDatabaseUpdateRequestSchema,
+  isVerifiedCoolifyDatabaseReadOperation,
+  isVerifiedCoolifyDatabaseUpdateOperation,
+} from "./coolify-environment";
 
 type CapturedRequest = {
   readonly method: string;
@@ -400,6 +408,68 @@ const serveCoolifyFixture = (options?: { readonly environmentKey?: unknown }) =>
   });
 
 describe("Coolify application environment variable schema compatibility", () => {
+  it("strictly gates Coolify database credential reads and updates", () => {
+    const parameters = [{ name: "uuid", location: "path", required: true }] as const;
+    const readIdentity = {
+      operationId: "getDatabaseByUuid",
+      method: "get",
+      pathTemplate: "/databases/{uuid}",
+      parameters,
+    } as const;
+    const updateIdentity = {
+      operationId: "databases.updateDatabaseByUuid",
+      method: "patch",
+      pathTemplate: "/databases/{uuid}",
+      parameters,
+    } as const;
+    const responseSchema = {
+      type: "object",
+      properties: {
+        internal_db_url: { type: "string" },
+        external_db_url: { type: "string" },
+        password: { type: "string" },
+        postgres_password: { type: "string" },
+      },
+    };
+    const requestSchema = {
+      type: "object",
+      properties: { password: { type: "string" }, name: { type: "string" } },
+    };
+
+    expect(isVerifiedCoolifyDatabaseReadOperation(readIdentity)).toBe(true);
+    expect(isVerifiedCoolifyDatabaseUpdateOperation(updateIdentity)).toBe(true);
+    expect(isCoolifyDatabaseResponseSchema(responseSchema)).toBe(true);
+    expect(coolifyDatabaseResponseSensitiveFields(responseSchema)).toEqual([
+      "internal_db_url",
+      "external_db_url",
+      "password",
+      "postgres_password",
+    ]);
+    expect(isCoolifyDatabaseUpdateRequestSchema(requestSchema)).toBe(true);
+    expect(coolifyDatabaseUpdateSensitiveFields(requestSchema)).toEqual(["password"]);
+
+    expect(
+      isVerifiedCoolifyDatabaseReadOperation({
+        ...readIdentity,
+        pathTemplate: "/tenant-databases/{uuid}",
+      }),
+    ).toBe(false);
+    expect(
+      isVerifiedCoolifyDatabaseUpdateOperation({ ...updateIdentity, operationId: "updateTenant" }),
+    ).toBe(false);
+    expect(
+      isCoolifyDatabaseResponseSchema({
+        type: "object",
+        properties: { internal_db_url: { type: "string" }, password: { type: "object" } },
+      }),
+    ).toBe(false);
+    expect(
+      isCoolifyDatabaseUpdateRequestSchema({
+        type: "object",
+        properties: { password: { type: "object" } },
+      }),
+    ).toBe(false);
+  });
   it.effect("republishes legacy bindings with lifecycle flags and sends them unchanged", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1007,6 +1077,44 @@ describe("Coolify application environment variable schema compatibility", () => 
       expect(annotations[stored.toolName]).toEqual({
         requiresApproval: true,
         approvalDescription: "PATCH /applications/{uuid}/envs",
+        sensitiveOutputPaths: [""],
+        sensitiveResponseHeaders: true,
+      });
+    }),
+  );
+
+  it.effect("fails closed for a persisted v1 Coolify application-list binding", () =>
+    Effect.gen(function* () {
+      const compiled = yield* compileOpenApiSpec(coolifySpec("https://coolify.fixture.invalid"));
+      const stored = openApiStoredOperationsFromCompiled("coolify", compiled).find(
+        (candidate) => candidate.toolName === listApplicationsOperationName,
+      );
+      expect(stored).toBeDefined();
+      if (!stored) return;
+      expect(stored.binding.sensitivityVersion).toBe(2);
+
+      const persistedV1 = {
+        ...stored,
+        binding: {
+          ...stored.binding,
+          sensitivityVersion: 1 as const,
+          sensitiveInputPaths: undefined,
+          sensitiveOutputPaths: undefined,
+          sensitiveOutputSafeScalars: undefined,
+          sensitiveResponseHeaders: undefined,
+        },
+      };
+      const annotations = yield* resolveOpenApiBackedAnnotations({
+        ctx: {
+          storage: {
+            getOperation: () => Effect.succeed(persistedV1),
+          },
+        } as never,
+        integration: "coolify",
+        toolRows: [{ name: stored.toolName }],
+      });
+
+      expect(annotations[stored.toolName]).toEqual({
         sensitiveOutputPaths: [""],
         sensitiveResponseHeaders: true,
       });

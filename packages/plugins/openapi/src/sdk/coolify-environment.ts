@@ -54,6 +54,40 @@ const APPLICATION_LIST_OPERATION_IDS = new Set([
   "applications.listApplications",
 ]);
 
+const DATABASE_READ_OPERATION_IDS = new Set([
+  "get-database-by-uuid",
+  "getDatabaseByUuid",
+  "databases.getDatabaseByUuid",
+]);
+
+const DATABASE_UPDATE_OPERATION_IDS = new Set([
+  "update-database-by-uuid",
+  "updateDatabaseByUuid",
+  "databases.updateDatabaseByUuid",
+]);
+
+const DATABASE_PASSWORD_FIELDS = [
+  "password",
+  "root_password",
+  "postgres_password",
+  "mysql_password",
+  "mysql_root_password",
+  "mariadb_password",
+  "mariadb_root_password",
+  "mongo_initdb_root_password",
+  "redis_password",
+  "keydb_password",
+  "dragonfly_password",
+  "clickhouse_admin_password",
+] as const;
+const DATABASE_PASSWORD_FIELD_SET = new Set<string>(DATABASE_PASSWORD_FIELDS);
+
+const DATABASE_SOURCE_FIELDS = [
+  "internal_db_url",
+  "external_db_url",
+  ...DATABASE_PASSWORD_FIELDS,
+] as const;
+
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -114,6 +148,14 @@ export const isVerifiedCoolifyApplicationListOperation = (
   identity.method === "get" &&
   identity.pathTemplate === "/applications" &&
   !identity.parameters.some((parameter) => parameter.location === "path");
+
+export const isVerifiedCoolifyDatabaseReadOperation = (
+  identity: CoolifyOperationIdentity,
+): boolean => hasIdentity(identity, DATABASE_READ_OPERATION_IDS, "get", "/databases/{uuid}");
+
+export const isVerifiedCoolifyDatabaseUpdateOperation = (
+  identity: CoolifyOperationIdentity,
+): boolean => hasIdentity(identity, DATABASE_UPDATE_OPERATION_IDS, "patch", "/databases/{uuid}");
 
 const ENVIRONMENT_REQUEST_FIELD_TYPES = {
   key: "string",
@@ -255,6 +297,37 @@ export const isCoolifyApplicationListResponseSchema = (schema: unknown): boolean
   const object = asRecord(schema);
   return object?.type === "array" && isCoolifyApplicationResponseSchema(object.items);
 };
+
+const declaredStringFields = (schema: unknown, fields: readonly string[]): readonly string[] => {
+  const object = asRecord(schema);
+  const properties = asRecord(object?.properties);
+  if (object?.type !== "object" || !properties) return [];
+  return fields.filter((field) => asRecord(properties[field])?.type === "string");
+};
+
+/** Coolify omits password/secret semantics from its database schemas. Require
+ * its connection URL plus a declared database password before treating this
+ * exact operation as a credential source. */
+export const isCoolifyDatabaseResponseSchema = (schema: unknown): boolean => {
+  const fields = declaredStringFields(schema, DATABASE_SOURCE_FIELDS);
+  return (
+    fields.includes("internal_db_url") &&
+    fields.some((field) => DATABASE_PASSWORD_FIELD_SET.has(field))
+  );
+};
+
+export const coolifyDatabaseResponseSensitiveFields = (schema: unknown): readonly string[] =>
+  isCoolifyDatabaseResponseSchema(schema)
+    ? declaredStringFields(schema, DATABASE_SOURCE_FIELDS)
+    : [];
+
+export const isCoolifyDatabaseUpdateRequestSchema = (schema: unknown): boolean =>
+  declaredStringFields(schema, DATABASE_PASSWORD_FIELDS).length > 0;
+
+export const coolifyDatabaseUpdateSensitiveFields = (schema: unknown): readonly string[] =>
+  isCoolifyDatabaseUpdateRequestSchema(schema)
+    ? declaredStringFields(schema, DATABASE_PASSWORD_FIELDS)
+    : [];
 
 /** Exact identifiers retained from a verified application read. */
 export const coolifyApplicationResponseSafeFields = (
