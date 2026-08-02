@@ -35,6 +35,10 @@ See [`.env.example`](./.env.example) for optional settings (most importantly
 [Self-Hosting guide](../../docs/self-hosting/guide.mdx) for first-run, inviting
 people, backups, reverse-proxy setup, and upgrades.
 
+An operator-only, fixed-scope Coolify release-evidence endpoint is also
+available behind explicit configuration. It is off by default and independent
+of QuickJS/MCP execution; see the [signed release-evidence guide](../docs/hosted/release-evidence.mdx).
+
 ## Develop
 
 ```bash

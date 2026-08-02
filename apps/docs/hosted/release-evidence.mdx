@@ -1,0 +1,322 @@
+---
+title: Signed Coolify release evidence
+description: "Opt-in, fixed-scope release receipts for a Glink Coolify promotion."
+---
+
+<Warning>
+  This is a narrowly scoped, operator-configured capability for Glink release verification. It is
+  disabled by default. It is not an Executor tool, MCP integration, generic HTTP proxy, or
+  code-execution surface.
+</Warning>
+
+When enabled, the self-hosted server observes only the configured Root and
+Zero Coolify applications, reduces the observation to secret-free fields, and
+signs short-lived Ed25519 receipts. Glink treats the two endpoints below as an
+external-envelope seam: it requests a preflight receipt before promotion and a
+postdeploy receipt afterwards.
+
+The receipts prove the configured, app-scoped Coolify observations. They do
+not prove an immutable runtime image or a public HTTP response.
+
+## Enable it
+
+Set `EXECUTOR_RELEASE_EVIDENCE_ENABLED=true` and configure all of these
+server-held values. Keep the caller token, Coolify token, and private key in a
+secret manager; never put them in Glink configuration or a receipt.
+
+| Variable                                                   | Purpose                                                                                                                           |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `EXECUTOR_RELEASE_EVIDENCE_TENANT_ID`                      | The one permitted Glink tenant ID.                                                                                                |
+| `EXECUTOR_RELEASE_EVIDENCE_PRINCIPAL_ID`                   | The one permitted Glink principal ID.                                                                                             |
+| `EXECUTOR_RELEASE_EVIDENCE_CALLER_TOKEN`                   | The fixed bearer credential Glink sends to the two write endpoints. It must be at least 16 characters.                            |
+| `EXECUTOR_RELEASE_EVIDENCE_ED25519_KEY_ID`                 | Active signing-key identifier.                                                                                                    |
+| `EXECUTOR_RELEASE_EVIDENCE_ED25519_PRIVATE_KEY`            | Base64url PKCS#8 DER Ed25519 private key.                                                                                         |
+| `EXECUTOR_RELEASE_EVIDENCE_ED25519_VERIFICATION_KEYS_JSON` | Optional JSON array of prior `{ "keyId", "publicKey" }` entries retained during key rotation. Public keys are base64url SPKI DER. |
+| `EXECUTOR_RELEASE_EVIDENCE_COOLIFY_BASE_URL`               | HTTPS URL for the private Coolify control plane. Embedded URL credentials and HTTP are rejected.                                  |
+| `EXECUTOR_RELEASE_EVIDENCE_COOLIFY_TOKEN`                  | Server-held Coolify API token.                                                                                                    |
+| `EXECUTOR_RELEASE_EVIDENCE_POLICY_JSON`                    | Exact Root/Zero targets, pinned public Docker defaults, expected configuration, environment flags, and receipt TTL.               |
+
+The policy has this shape. `applicationId` is decimal text; `receiptTtlMs` is
+between one and thirty minutes. The Root and Zero applications must both use
+the `main` branch.
+
+```json
+{
+  "root": {
+    "uuid": "root-coolify-application-uuid",
+    "applicationId": "1001",
+    "repository": "owner/repository",
+    "branch": "main",
+    "buildPack": "dockerfile",
+    "startCommand": "",
+    "healthCheck": {
+      "enabled": true,
+      "method": "GET",
+      "path": "/api/health",
+      "port": "3000",
+      "scheme": "http",
+      "status": 200
+    },
+    "sourceLocation": "/Dockerfile",
+    "requiredStartupMarkers": [
+      { "stage": "prisma-migrate", "marker": "Prisma migration deploy succeeded." },
+      {
+        "stage": "public-build-environment-manifest",
+        "marker": "Public build environment manifest sha256 emitted."
+      },
+      { "stage": "runtime-preflight", "marker": "Runtime environment preflight passed." },
+      { "stage": "zero-public-readiness", "marker": "Zero public readiness preflight passed." },
+      { "stage": "next-ready", "marker": "Next.js server ready." }
+    ]
+  },
+  "zero": {
+    "uuid": "zero-coolify-application-uuid",
+    "applicationId": "1002",
+    "repository": "owner/repository",
+    "branch": "main",
+    "buildPack": "dockercompose",
+    "startCommand": "",
+    "healthCheck": {
+      "enabled": false,
+      "method": null,
+      "path": null,
+      "port": null,
+      "scheme": null,
+      "status": null
+    },
+    "sourceLocation": "/infra/zero/docker-compose.coolify.yml",
+    "requiredStartupMarkers": [
+      {
+        "stage": "zero-publication-apply",
+        "marker": "Zero publication glink_zero_publication is exact for 36 browser-safe tables (apply)."
+      },
+      {
+        "stage": "zero-preflight",
+        "marker": "Zero publication glink_zero_publication is exact for 36 browser-safe tables (check)."
+      },
+      {
+        "stage": "zero-ops-monitor",
+        "marker": "Zero publication glink_zero_publication is exact for 36 browser-safe tables (drift-check)."
+      }
+    ]
+  },
+  "publicBuildEnvironmentManifest": {
+    "version": 1,
+    "defaults": [
+      { "name": "NEXT_PUBLIC_APP_DESCRIPTION", "value": "Glink changelog platform" },
+      { "name": "NEXT_PUBLIC_APP_NAME", "value": "Glink" },
+      { "name": "NEXT_PUBLIC_APP_URL", "value": "" },
+      { "name": "NEXT_PUBLIC_AUTH_ENABLE_EMAIL_PASSWORD_AUTHENTICATION", "value": "true" },
+      { "name": "NEXT_PUBLIC_AUTH_ENABLE_EMAIL_VERIFICATION", "value": "true" },
+      { "name": "NEXT_PUBLIC_EMAIL_ENABLE_EMAIL_PREVIEW", "value": "true" },
+      { "name": "NEXT_PUBLIC_EMAIL_PREVIEW_OPEN_SIMULATOR", "value": "false" },
+      { "name": "NEXT_PUBLIC_EMAIL_PREVIEW_OPEN_TAB", "value": "true" },
+      { "name": "NEXT_PUBLIC_EMAIL_PROVIDER", "value": "nodemailer-app" },
+      { "name": "NEXT_PUBLIC_ENABLE_ABOUT_PAGE", "value": "true" },
+      { "name": "NEXT_PUBLIC_ENABLE_BACKGROUND_JOBS", "value": "false" },
+      { "name": "NEXT_PUBLIC_ENABLE_BLOG_PAGE", "value": "true" },
+      { "name": "NEXT_PUBLIC_ENABLE_CHAT_PAGE", "value": "true" },
+      { "name": "NEXT_PUBLIC_ENABLE_CRON", "value": "false" },
+      { "name": "NEXT_PUBLIC_ENABLE_GITHUB_INTEGRATION", "value": "false" },
+      { "name": "NEXT_PUBLIC_ENABLE_POLAR", "value": "false" },
+      { "name": "NEXT_PUBLIC_ENABLE_PRICING_PAGE", "value": "true" },
+      { "name": "NEXT_PUBLIC_POLAR_ENV", "value": "sandbox" },
+      { "name": "NEXT_PUBLIC_POSTHOG_HOST", "value": "" },
+      { "name": "NEXT_PUBLIC_POSTHOG_KEY", "value": "" },
+      { "name": "NEXT_PUBLIC_S3_BUCKET_NAME", "value": "" },
+      { "name": "NEXT_PUBLIC_S3_ENDPOINT", "value": "" },
+      { "name": "NEXT_PUBLIC_SIZZY_ENDPOINT", "value": "" },
+      { "name": "NEXT_PUBLIC_SIZZY_GRAPHQL_TOKEN", "value": "" },
+      { "name": "NEXT_PUBLIC_ZERO_SERVER", "value": "" }
+    ]
+  },
+  "environmentPolicy": {
+    "digest": "<64 lowercase hexadecimal SHA-256 characters>",
+    "flags": [
+      {
+        "key": "NEXT_PUBLIC_ZERO_SERVER",
+        "isBuildtime": true,
+        "isRuntime": true,
+        "isLiteral": true,
+        "isPreview": false,
+        "isShownOnce": false
+      }
+    ]
+  },
+  "receiptTtlMs": 900000
+}
+```
+
+The server creates `release_evidence_nonce` and `release_evidence_receipt` in
+its existing persistent SQLite database at enabled boot. The database volume
+must survive restarts: it is the one-time nonce and postdeploy-consumption
+ledger. The setup is fail-closed; malformed enabled configuration or an
+unavailable ledger prevents the capability from starting.
+
+## Fixed API
+
+All responses use `application/json`, `cache-control: no-store`, and stable
+error codes only. They never contain a Coolify response body, log line,
+environment value, URL, token, or signing private key.
+
+| Method and path                            | Authentication                         | Purpose                                                    |
+| ------------------------------------------ | -------------------------------------- | ---------------------------------------------------------- |
+| `POST /api/release-evidence/v1/preflight`  | `Authorization: Bearer <caller token>` | Authorize one nonce and sign a preflight receipt.          |
+| `POST /api/release-evidence/v1/postdeploy` | `Authorization: Bearer <caller token>` | Consume that preflight once and sign final evidence.       |
+| `GET /api/release-evidence/v1/keys`        | None                                   | Publish the current and retained public verification keys. |
+
+The request body has an exact schema; unknown fields are rejected. Preflight:
+
+```json
+{
+  "action": "coolify.glink.authorizeReleaseEnvironment.v1",
+  "protocolVersion": 1,
+  "tenantId": "glink-tenant",
+  "principalId": "glink-release",
+  "nonce": "base64url-or-safe-one-time-nonce-at-least-22-characters",
+  "proposedMainSha": "40-lowercase-hex-characters",
+  "root": { "uuid": "root-coolify-application-uuid", "applicationId": "1001" },
+  "zero": { "uuid": "zero-coolify-application-uuid", "applicationId": "1002" },
+  "environmentPolicy": { "digest": "64-lowercase-hex-characters", "flags": [] }
+}
+```
+
+Postdeploy binds to the preflight receipt and payload digest:
+
+```json
+{
+  "action": "coolify.glink.collectReleaseEvidence.v1",
+  "protocolVersion": 1,
+  "tenantId": "glink-tenant",
+  "principalId": "glink-release",
+  "nonce": "the-identical-preflight-nonce",
+  "proposedMainSha": "the-identical-40-character-main-sha",
+  "preflightReceiptId": "preflight-receipt-id",
+  "preflightPayloadDigest": "sha256-of-the-preflight-payload"
+}
+```
+
+A successful write response is `{ "receipt": <signed receipt> }`. The common
+receipt envelope is:
+
+```json
+{
+  "receiptVersion": "v1",
+  "receiptId": "unique-safe-identifier",
+  "action": "one-of-the-two-actions",
+  "protocolVersion": 1,
+  "algorithm": "Ed25519",
+  "keyId": "published-key-id",
+  "tenantId": "glink-tenant",
+  "principalId": "glink-release",
+  "nonce": "bound-one-time-nonce",
+  "issuedAt": "2026-08-02T12:00:00.000Z",
+  "expiresAt": "2026-08-02T12:15:00.000Z",
+  "payload": {},
+  "signature": "base64url-ed25519-signature"
+}
+```
+
+Preflight payloads contain `phase: "preflight"`, the proposed SHA, reduced
+Root/Zero application configuration, and the server-derived
+`{ "version": 1, "expectedDigest": "..." }` public-manifest commitment,
+plus environment-policy flags. The caller cannot supply or choose that digest.
+Postdeploy payloads contain `phase: "postdeploy"`, the preflight receipt ID and
+payload digest, proposed and observed SHA, reduced Root/Zero application plus
+selected deployment evidence, the versioned expected digest, the image-emitted
+actual digest, and the environment-policy flags. Each deployment includes its
+app/deployment IDs, configuration hash, complete app-scoped deployment-history
+digest/count, selected timestamps, and fixed startup-marker digest.
+
+## Public build manifest digest
+
+Coolify environment values never leave the server. During preflight, the
+observer reads **only the Root application's environment records** and derives
+the expected digest itself. It ignores preview rows, rejects non-runtime or
+non-allowlisted build-time inputs, and accepts a build-time value only when it
+is a literal Root record for one of the declared public Docker ARG names. Its
+only value input is that record's `real_value`; it never trusts the display
+`value` field.
+
+For every configured public name, an absent or runtime-only Root variable uses
+the pinned `defaults` value. The exact v1 byte sequence is:
+
+```js
+JSON.stringify({
+  values: sortedPublicNames.map((name) => ({ name, value: supplied[name] ?? defaults[name] })),
+  version: 1,
+});
+```
+
+The server signs lowercase hexadecimal `SHA-256` of those UTF-8 bytes as the
+preflight `expectedDigest`; values and raw environment records do not enter a
+receipt.
+
+Postdeploy never rereads current environment values to recreate that expected
+digest. Instead it extracts `actualDigest` from exactly one visible stdout Root
+log line emitted by the image:
+
+```text
+Public build environment manifest sha256: <64 lowercase hex>.
+```
+
+It accepts the deployment only when the emitted digest equals the signed
+preflight expectation. This is a source-faithful, capability-faithful binding;
+it is not immutable runtime-image provenance.
+
+## Verify receipts offline
+
+Fetch `/api/release-evidence/v1/keys`, retain keys by `keyId`, and verify the
+base64url Ed25519 signature over the canonical JSON bytes of the receipt with
+`signature` omitted. Then enforce all caller-side constraints:
+
+- receipt version, protocol version, algorithm, issue/expiry time, and a
+  one-time local receipt-ID replay store;
+- expected action, tenant, principal, nonce, full lowercase `main` SHA, and
+  Root/Zero `{ uuid, applicationId }` pairs;
+- postdeploy `observedMainSha`, deployment configuration/history/marker data,
+  and expected versus actual public-manifest digest; and
+- the link from postdeploy `preflightReceiptId` and
+  `preflightPayloadDigest` to the exact preflight receipt and canonical
+  payload digest.
+
+The protocol module exposes `verifyReleaseEvidenceReceipt` for one receipt and
+`verifyPostdeployBinding` for the two-receipt chain. A verifier must use its
+own expected IDs and SHA; it must not treat values copied from a receipt as the
+expected constraints.
+
+## Rotate signing keys
+
+Use an overlap, never an in-place key replacement:
+
+1. Generate the new Ed25519 key and assign a new key ID.
+2. Before switching signers, configure and publish both key IDs: make the new
+   private key/key ID active and place the old public key in
+   `EXECUTOR_RELEASE_EVIDENCE_ED25519_VERIFICATION_KEYS_JSON`.
+3. Confirm `/keys` returns the active key and the old key. Receipts created
+   before the switch can then finish postdeploy, and verifiers can validate
+   either receipt.
+4. Retain the old public key for at least the maximum receipt TTL plus the
+   verifier's clock-skew/replay-retention grace period. Retire it only after no
+   valid old receipt can be presented.
+
+Do not reuse a key ID for different public-key bytes. The server rejects that
+configuration.
+
+## Coolify prerequisites
+
+The configured control-plane token needs only the fixed app-scoped reads used
+by this capability: application, application deployment history, selected
+deployment detail, and application environments. The observer fails closed
+unless it can bind both apps to the configured IDs and exact policy
+configuration, read complete bounded deployment histories, select a finished
+non-restart/non-rollback non-PR webhook deployment for the promoted SHA, and
+reduce one ordered lifecycle within each deployment interval. Every selected
+marker must come from a row with exactly `hidden: false` and `type: "stdout"`;
+duplicates, missing markers, non-stdout/hidden matches, record/line ordering
+changes, and non-increasing timestamps are rejected.
+
+Root must emit, in order: Prisma migration success, the public-manifest line,
+runtime preflight, Zero public readiness, and Next.js readiness. Zero must emit
+its publication apply, preflight, and ops-monitor markers in order. Root and
+Zero also need compatible deployment metadata and configuration hashes.

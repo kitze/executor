@@ -29,6 +29,8 @@ import { makeSelfHostMcpSeams } from "./mcp";
 import { selfHostPlugins } from "./plugins";
 import { ErrorCaptureLive } from "./observability";
 import { oauthCallbackSignInRedirectLocation } from "./auth/oauth-callback-login";
+import { loadReleaseEvidenceConfig } from "./release-evidence/config";
+import { createReleaseEvidenceCapability } from "./release-evidence/host";
 
 // ===========================================================================
 // The self-hosted Executor app, as ONE `ExecutorApp.make` call.
@@ -64,6 +66,17 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     namespace: SELF_HOST_NAMESPACE,
     version: SELF_HOST_SCHEMA_VERSION,
   });
+
+  // This privileged capability is opt-in and uses its own durable nonce
+  // ledger. It is never part of the QuickJS execution plane; a failed setup
+  // refuses this boot rather than exposing an unsigned release path.
+  const releaseEvidenceConfig = loadReleaseEvidenceConfig();
+  const releaseEvidence = releaseEvidenceConfig
+    ? await createReleaseEvidenceCapability({
+        client: dbHandle.client,
+        config: releaseEvidenceConfig,
+      })
+    : null;
 
   // Boot-time data migrations: each registry entry runs once and is stamped
   // in the `data_migration` ledger; stamped entries are skipped without
@@ -116,6 +129,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     },
     extensions: {
       routes: [
+        ...(releaseEvidence ? [releaseEvidence.routes] : []),
         // CLI device-login discovery, must precede the /api/auth/* wildcard
         // below (Better Auth would otherwise 404 it). The verification page it
         // points at (/device) is a console SPA route
