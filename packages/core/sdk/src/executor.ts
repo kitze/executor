@@ -1,4 +1,4 @@
-import { Effect, Inspectable, Layer, Option, Predicate, References, Schema } from "effect";
+import { Cause, Effect, Inspectable, Layer, Option, Predicate, References, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 import { fumadb } from "@executor-js/fumadb";
 import { memoryAdapter } from "@executor-js/fumadb/adapters/memory";
@@ -4270,12 +4270,14 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         const staticOpaqueContext = (entry: StaticTools): OpaqueValueCallContext => ({
           principal: opaquePrincipal,
           integration: entry.integration.id,
+          owner: staticToolOwner(),
           connection: String(staticToolConnection(entry.integration)),
           operation: entry.tool.name,
         });
         const dynamicOpaqueContext = (parsed: ParsedToolAddress): OpaqueValueCallContext => ({
           principal: opaquePrincipal,
           integration: String(parsed.integration),
+          owner: parsed.owner,
           connection: String(parsed.connection),
           operation: String(parsed.tool),
         });
@@ -4318,10 +4320,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             Effect.provideService(References.MinimumLogLevel, "None"),
           );
 
-        // Protect declared sensitive response fields, then redact every value
-        // already sealed in this execution from all success/result envelopes.
-        // The latter catches an upstream echo of a source value in a different
-        // field or in a ToolResult error without exposing it to the sandbox.
+        // Protect declared sensitive response fields, structurally project a
+        // source to its opaque handles plus explicitly trusted metadata, then
+        // redact every value already sealed in this execution from all
+        // success/result envelopes.
         const protectInvocationResult = (
           value: unknown,
           annotations: ToolAnnotations | undefined,
@@ -4364,7 +4366,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             // transforms: retain only executor-owned success metadata and
             // discard the body plus arbitrary response headers. Calls that
             // merely *produce* opaque handles do not enter this branch, so
-            // their protected source shape remains available to the sandbox.
+            // their fail-closed projected source shape remains available to
+            // the sandbox.
             if (consumedOpaqueInput) {
               return {
                 ok: true,
@@ -4378,6 +4381,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 value.data,
                 annotations?.sensitiveOutputPaths,
                 context,
+                annotations?.sensitiveOutputSafePaths,
               ),
               // Response headers have no schema-level projection today. When
               // a response body contains a declared secret, do not make an
@@ -4388,7 +4392,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             });
           }
           if (consumedOpaqueInput) return null;
-          return opaqueValues.protectOutput(value, annotations?.sensitiveOutputPaths, context);
+          return opaqueValues.protectOutput(
+            value,
+            annotations?.sensitiveOutputPaths,
+            context,
+            annotations?.sensitiveOutputSafePaths,
+          );
         };
 
         // oxlint-disable executor/no-instanceof-error, executor/no-unknown-error-message, executor/no-manual-tag-check -- boundary: normalize arbitrary unknown plugin failures into a human-readable message for ToolInvocationError/telemetry
@@ -4408,20 +4417,32 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         const wrapInvocationError = <A, E>(
           effect: Effect.Effect<A, E>,
           annotations?: ToolAnnotations,
-        ): Effect.Effect<A, ToolInvocationError> =>
-          effect.pipe(
+        ): Effect.Effect<A, ToolInvocationError> => {
+          const hasSensitiveTransport =
+            (annotations?.sensitiveInputPaths?.length ?? 0) > 0 ||
+            (annotations?.sensitiveOutputPaths?.length ?? 0) > 0 ||
+            annotations?.sensitiveResponseHeaders === true;
+          if (hasSensitiveTransport) {
+            // Typed errors and defects can both retain an arbitrary upstream
+            // body. Normalize the whole Cause before it reaches the enclosing
+            // executor span or a host's Cause.pretty/error reporter. Preserve
+            // pure fiber interruption without carrying the untrusted Cause.
+            return effect.pipe(
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.interrupt
+                  : Effect.fail(
+                      new ToolInvocationError({
+                        address,
+                        message: "Upstream request failed.",
+                        cause: { _tag: "SensitiveToolInvocationFailure" },
+                      }),
+                    ),
+              ),
+            );
+          }
+          return effect.pipe(
             Effect.mapError((cause) => {
-              const hasSensitiveTransport =
-                (annotations?.sensitiveInputPaths?.length ?? 0) > 0 ||
-                (annotations?.sensitiveOutputPaths?.length ?? 0) > 0 ||
-                annotations?.sensitiveResponseHeaders === true;
-              if (hasSensitiveTransport) {
-                return new ToolInvocationError({
-                  address,
-                  message: "Upstream request failed.",
-                  cause: { _tag: "SensitiveToolInvocationFailure" },
-                });
-              }
               const safeCause = opaqueValues ? opaqueValues.redact(cause) : cause;
               return new ToolInvocationError({
                 address,
@@ -4432,6 +4453,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               });
             }),
           );
+        };
 
         // Static path — O(1) map lookup for plugin-contributed static tools
         // (core-tools, plugin executor namespaces). Addressed by their fqid,
@@ -4469,11 +4491,13 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             (staticEntry.tool.annotations?.sensitiveInputPaths?.length ?? 0) > 0 ||
             (staticEntry.tool.annotations?.sensitiveOutputPaths?.length ?? 0) > 0 ||
             staticEntry.tool.annotations?.sensitiveResponseHeaders === true;
-          const invocation = staticEntry.tool.handler({
-            ctx: staticEntry.ctx,
-            args: invocationArgs,
-            elicit: buildElicit(address, handler),
-          });
+          const invocation = Effect.suspend(() =>
+            staticEntry.tool.handler({
+              ctx: staticEntry.ctx,
+              args: invocationArgs,
+              elicit: buildElicit(address, handler),
+            }),
+          );
           const result = yield* wrapInvocationError(
             staticSensitiveTransportTracingDisabled
               ? suppressSensitiveTransportObservability(invocation)
@@ -4647,19 +4671,21 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             config: integrationRow ? decodeJsonColumn(integrationRow.config) : undefined,
             ...(grantedScopes ? { grantedScopes } : {}),
           };
-          const invocation = invokeTool({
-            ctx: runtime.ctx,
-            toolRow: row,
-            credential,
-            args: invocationArgs,
-            elicit: buildElicit(address, handler),
-            invokeOptions: {
-              ...options,
-              ...(sensitiveTransportTracingDisabled
-                ? { disableSensitiveRequestTracing: true }
-                : {}),
-            },
-          });
+          const invocation = Effect.suspend(() =>
+            invokeTool({
+              ctx: runtime.ctx,
+              toolRow: row,
+              credential,
+              args: invocationArgs,
+              elicit: buildElicit(address, handler),
+              invokeOptions: {
+                ...options,
+                ...(sensitiveTransportTracingDisabled
+                  ? { disableSensitiveRequestTracing: true }
+                  : {}),
+              },
+            }),
+          );
           // Effect's HTTP client records raw URLs and arbitrary headers before
           // executor-level result redaction runs. Disable nested tracing for a
           // declared sensitive transport in either direction.

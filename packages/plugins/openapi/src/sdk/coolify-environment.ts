@@ -163,6 +163,38 @@ const isCoolifyEnvironmentVariableResponseSchema = (schema: unknown): boolean =>
   );
 };
 
+const ENVIRONMENT_SAFE_RESPONSE_FIELD_TYPES = {
+  id: new Set(["integer", "number"]),
+  uuid: new Set(["string"]),
+  key: new Set(["string"]),
+  is_preview: new Set(["boolean"]),
+  is_literal: new Set(["boolean"]),
+  is_multiline: new Set(["boolean"]),
+  is_shown_once: new Set(["boolean"]),
+  is_runtime: new Set(["boolean"]),
+  is_buildtime: new Set(["boolean"]),
+} as const;
+
+const APPLICATION_SAFE_RESPONSE_FIELD_TYPES = {
+  id: new Set(["integer", "number"]),
+  uuid: new Set(["string"]),
+  name: new Set(["string"]),
+} as const;
+
+const declaredSafeScalarFields = (
+  schema: unknown,
+  fields: Readonly<Record<string, ReadonlySet<string>>>,
+): readonly string[] => {
+  const properties = asRecord(asRecord(schema)?.properties);
+  if (!properties) return [];
+  return Object.entries(fields)
+    .filter(([name, allowedTypes]) => {
+      const type = asRecord(properties[name])?.type;
+      return typeof type === "string" && allowedTypes.has(type);
+    })
+    .map(([name]) => name);
+};
+
 export const isCoolifyEnvironmentListResponseSchema = (schema: unknown): boolean => {
   const object = asRecord(schema);
   return object?.type === "array" && isCoolifyEnvironmentVariableResponseSchema(object.items);
@@ -176,6 +208,17 @@ export const isCoolifyEnvironmentWriteResponseSchema = (
     ? isCoolifyEnvironmentVariableResponseSchema(schema)
     : isCoolifyEnvironmentListResponseSchema(schema);
 
+/** Exact scalar metadata fields that a verified environment response may keep
+ * beside opaque values. Unknown response properties never become safe merely
+ * because Coolify returned them. */
+export const coolifyEnvironmentResponseSafeFields = (schema: unknown): readonly string[] => {
+  const object = asRecord(schema);
+  const itemSchema = object?.type === "array" ? object.items : schema;
+  return isCoolifyEnvironmentVariableResponseSchema(itemSchema)
+    ? declaredSafeScalarFields(itemSchema, ENVIRONMENT_SAFE_RESPONSE_FIELD_TYPES)
+    : [];
+};
+
 export const isCoolifyApplicationResponseSchema = (schema: unknown): boolean => {
   const object = asRecord(schema);
   const properties = asRecord(object?.properties);
@@ -188,3 +231,9 @@ export const isCoolifyApplicationResponseSchema = (schema: unknown): boolean => 
     "http_basic_auth_password",
   ].every((name) => asRecord(properties[name])?.type === "string");
 };
+
+/** Exact identifiers retained from a verified application read. */
+export const coolifyApplicationResponseSafeFields = (schema: unknown): readonly string[] =>
+  isCoolifyApplicationResponseSchema(schema)
+    ? declaredSafeScalarFields(schema, APPLICATION_SAFE_RESPONSE_FIELD_TYPES)
+    : [];

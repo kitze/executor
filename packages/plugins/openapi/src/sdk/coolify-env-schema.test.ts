@@ -54,10 +54,28 @@ const applicationSecretCanaries = {
   http_basic_auth_password: "coolify-basic-auth-canary",
 } as const;
 
+const applicationSafeMetadata = {
+  uuid: "app-1",
+  name: "Fixture application",
+} as const;
+
 const environmentSecretCanaries = {
   value: "coolify-environment-value-canary",
   real_value: "coolify-environment-real-value-canary",
 } as const;
+
+const transformedSiblingCanaries = (value: string) => ({
+  base64Echo: Buffer.from(value).toString("base64"),
+  base64urlEcho: Buffer.from(value).toString("base64url"),
+  arbitraryEcho: [...value].reverse().join(""),
+});
+
+const environmentTransformedSiblingCanaries = transformedSiblingCanaries(
+  environmentSecretCanaries.value,
+);
+const applicationTransformedSiblingCanaries = transformedSiblingCanaries(
+  applicationSecretCanaries.manual_webhook_secret_github,
+);
 
 const environmentVariableRequestSchema = () => ({
   type: "object",
@@ -164,9 +182,13 @@ const getApplicationOperation = () => ({
         "application/json": {
           schema: {
             type: "object",
-            properties: Object.fromEntries(
-              Object.keys(applicationSecretCanaries).map((name) => [name, { type: "string" }]),
-            ),
+            properties: {
+              uuid: { type: "string" },
+              name: { type: "string" },
+              ...Object.fromEntries(
+                Object.keys(applicationSecretCanaries).map((name) => [name, { type: "string" }]),
+              ),
+            },
           },
         },
       },
@@ -263,6 +285,14 @@ const accepted = {
 const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const encodeJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
+const expectTransformedSiblingsDropped = (
+  value: unknown,
+  canaries: Readonly<Record<string, string>>,
+): void => {
+  const rendered = JSON.stringify(value);
+  for (const canary of Object.values(canaries)) expect(rendered).not.toContain(canary);
+};
+
 const serveCoolifyFixture = () =>
   Effect.gen(function* () {
     const requests = yield* Ref.make<readonly CapturedRequest[]>([]);
@@ -280,19 +310,43 @@ const serveCoolifyFixture = () =>
         const method = request.method.toUpperCase();
         const path = new URL(request.url ?? "/", "https://coolify.fixture.invalid").pathname;
         if (method === "GET" && path.endsWith("/envs")) {
-          return HttpServerResponse.jsonUnsafe([{ key: "ENV", ...environmentSecretCanaries }]);
+          return HttpServerResponse.jsonUnsafe([
+            {
+              key: "ENV",
+              ...environmentSecretCanaries,
+              ...environmentTransformedSiblingCanaries,
+            },
+          ]);
         }
         if (method === "GET") {
-          return HttpServerResponse.jsonUnsafe(applicationSecretCanaries);
+          return HttpServerResponse.jsonUnsafe({
+            ...applicationSafeMetadata,
+            ...applicationSecretCanaries,
+            ...applicationTransformedSiblingCanaries,
+          });
         }
         if (method === "POST" && path.endsWith("/envs")) {
-          return HttpServerResponse.jsonUnsafe({ key: "ENV", ...environmentSecretCanaries });
+          return HttpServerResponse.jsonUnsafe({
+            key: "ENV",
+            ...environmentSecretCanaries,
+            ...environmentTransformedSiblingCanaries,
+          });
         }
         if (method === "PATCH" && path.endsWith("/envs/bulk")) {
-          return HttpServerResponse.jsonUnsafe([{ key: "ENV", ...environmentSecretCanaries }]);
+          return HttpServerResponse.jsonUnsafe([
+            {
+              key: "ENV",
+              ...environmentSecretCanaries,
+              ...environmentTransformedSiblingCanaries,
+            },
+          ]);
         }
         if (method === "PATCH" && path.endsWith("/envs")) {
-          return HttpServerResponse.jsonUnsafe({ key: "ENV", ...environmentSecretCanaries });
+          return HttpServerResponse.jsonUnsafe({
+            key: "ENV",
+            ...environmentSecretCanaries,
+            ...environmentTransformedSiblingCanaries,
+          });
         }
         return HttpServerResponse.jsonUnsafe({ ok: true });
       }),
@@ -347,6 +401,7 @@ describe("Coolify application environment variable schema compatibility", () => 
         );
         const freshApplicationReadAnnotations = freshApplicationRead?.annotations as {
           readonly sensitiveOutputPaths?: readonly string[];
+          readonly sensitiveOutputSafePaths?: readonly string[];
         };
         expect(freshApplicationReadAnnotations.sensitiveOutputPaths).toEqual([
           "/http_basic_auth_password",
@@ -355,6 +410,10 @@ describe("Coolify application environment variable schema compatibility", () => 
           "/manual_webhook_secret_github",
           "/manual_webhook_secret_gitlab",
         ]);
+        expect(freshApplicationReadAnnotations.sensitiveOutputSafePaths).toEqual([
+          "/name",
+          "/uuid",
+        ]);
 
         const freshEnvironmentCreate = fresh.find(
           (candidate) => candidate.name === "applications.createEnvByApplicationUuid",
@@ -362,6 +421,7 @@ describe("Coolify application environment variable schema compatibility", () => 
         const freshEnvironmentCreateAnnotations = freshEnvironmentCreate?.annotations as {
           readonly sensitiveInputPaths?: readonly string[];
           readonly sensitiveOutputPaths?: readonly string[];
+          readonly sensitiveOutputSafePaths?: readonly string[];
         };
         expect(freshEnvironmentCreateAnnotations.sensitiveInputPaths).toEqual([
           "/body/value",
@@ -371,17 +431,20 @@ describe("Coolify application environment variable schema compatibility", () => 
           "/real_value",
           "/value",
         ]);
+        expect(freshEnvironmentCreateAnnotations.sensitiveOutputSafePaths).toEqual(["/key"]);
 
         const freshEnvironmentList = fresh.find(
           (candidate) => candidate.name === listEnvironmentOperationName,
         );
         const freshEnvironmentListAnnotations = freshEnvironmentList?.annotations as {
           readonly sensitiveOutputPaths?: readonly string[];
+          readonly sensitiveOutputSafePaths?: readonly string[];
         };
         expect(freshEnvironmentListAnnotations.sensitiveOutputPaths).toEqual([
           "/*/real_value",
           "/*/value",
         ]);
+        expect(freshEnvironmentListAnnotations.sensitiveOutputSafePaths).toEqual(["/*/key"]);
 
         const freshEnvironmentUpdate = fresh.find(
           (candidate) => candidate.name === updateEnvironmentOperationName,
@@ -389,6 +452,7 @@ describe("Coolify application environment variable schema compatibility", () => 
         const freshEnvironmentUpdateAnnotations = freshEnvironmentUpdate?.annotations as {
           readonly sensitiveInputPaths?: readonly string[];
           readonly sensitiveOutputPaths?: readonly string[];
+          readonly sensitiveOutputSafePaths?: readonly string[];
         };
         expect(freshEnvironmentUpdateAnnotations.sensitiveInputPaths).toEqual([
           "/body/value",
@@ -398,6 +462,7 @@ describe("Coolify application environment variable schema compatibility", () => 
           "/real_value",
           "/value",
         ]);
+        expect(freshEnvironmentUpdateAnnotations.sensitiveOutputSafePaths).toEqual(["/key"]);
 
         const freshEnvironmentBatch = fresh.find(
           (candidate) => candidate.name === updateEnvironmentsOperationName,
@@ -405,6 +470,7 @@ describe("Coolify application environment variable schema compatibility", () => 
         const freshEnvironmentBatchAnnotations = freshEnvironmentBatch?.annotations as {
           readonly sensitiveInputPaths?: readonly string[];
           readonly sensitiveOutputPaths?: readonly string[];
+          readonly sensitiveOutputSafePaths?: readonly string[];
         };
         expect(freshEnvironmentBatchAnnotations.sensitiveInputPaths).toEqual([
           "/body/data/*/value",
@@ -414,6 +480,7 @@ describe("Coolify application environment variable schema compatibility", () => 
           "/*/real_value",
           "/*/value",
         ]);
+        expect(freshEnvironmentBatchAnnotations.sensitiveOutputSafePaths).toEqual(["/*/key"]);
 
         for (const [name, inputSchema] of Object.entries(legacySchemas)) {
           yield* Effect.promise(() =>
@@ -501,6 +568,8 @@ describe("Coolify application environment variable schema compatibility", () => 
         expect(JSON.stringify(createResult)).not.toContain(environmentSecretCanaries.real_value);
         expect(isOpaqueValueReference(createResult.data?.value)).toBe(true);
         expect(isOpaqueValueReference(createResult.data?.real_value)).toBe(true);
+        expect(createResult.data?.key).toBe("ENV");
+        expectTransformedSiblingsDropped(createResult, environmentTransformedSiblingCanaries);
 
         // A generic application read is a source, never plaintext sandbox
         // data.  The executor seals the exact upstream fields into opaque
@@ -526,9 +595,11 @@ describe("Coolify application environment variable schema compatibility", () => 
           applicationSecretCanaries.http_basic_auth_password,
         );
         expect(readResult.ok).toBe(true);
+        expect(readResult.data).toMatchObject(applicationSafeMetadata);
         for (const name of Object.keys(applicationSecretCanaries)) {
           expect(isOpaqueValueReference(readResult.data?.[name])).toBe(true);
         }
+        expectTransformedSiblingsDropped(readResult, applicationTransformedSiblingCanaries);
 
         const listResult = (yield* executor.execute(
           connection.address(listEnvironmentOperationName),
@@ -540,6 +611,8 @@ describe("Coolify application environment variable schema compatibility", () => 
         expect(JSON.stringify(listResult)).not.toContain(environmentSecretCanaries.real_value);
         expect(isOpaqueValueReference(listResult.data?.[0]?.value)).toBe(true);
         expect(isOpaqueValueReference(listResult.data?.[0]?.real_value)).toBe(true);
+        expect(listResult.data?.[0]?.key).toBe("ENV");
+        expectTransformedSiblingsDropped(listResult, environmentTransformedSiblingCanaries);
 
         const updateResult = (yield* executor.execute(
           connection.address(updateEnvironmentOperationName),
@@ -559,6 +632,8 @@ describe("Coolify application environment variable schema compatibility", () => 
         expect(JSON.stringify(updateResult)).not.toContain(environmentSecretCanaries.real_value);
         expect(isOpaqueValueReference(updateResult.data?.value)).toBe(true);
         expect(isOpaqueValueReference(updateResult.data?.real_value)).toBe(true);
+        expect(updateResult.data?.key).toBe("ENV");
+        expectTransformedSiblingsDropped(updateResult, environmentTransformedSiblingCanaries);
 
         const batchResult = (yield* executor.execute(
           connection.address(updateEnvironmentsOperationName),
@@ -582,6 +657,8 @@ describe("Coolify application environment variable schema compatibility", () => 
         expect(JSON.stringify(batchResult)).not.toContain(environmentSecretCanaries.real_value);
         expect(isOpaqueValueReference(batchResult.data?.[0]?.value)).toBe(true);
         expect(isOpaqueValueReference(batchResult.data?.[0]?.real_value)).toBe(true);
+        expect(batchResult.data?.[0]?.key).toBe("ENV");
+        expectTransformedSiblingsDropped(batchResult, environmentTransformedSiblingCanaries);
 
         const requests = yield* fixture.requests;
         const writes = requests.filter(
@@ -794,6 +871,7 @@ describe("Coolify application environment variable schema compatibility", () => 
           sensitivityVersion: undefined,
           sensitiveInputPaths: undefined,
           sensitiveOutputPaths: undefined,
+          sensitiveOutputSafePaths: undefined,
           sensitiveResponseHeaders: undefined,
         },
       };

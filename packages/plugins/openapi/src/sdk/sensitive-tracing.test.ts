@@ -366,6 +366,12 @@ const opaqueAdversarialEchoes = (value: string): readonly string[] => {
   ];
 };
 
+const opaqueSourceSiblingTransforms = (value: string): readonly string[] => [
+  Buffer.from(value).toString("base64"),
+  Buffer.from(value).toString("base64url"),
+  [...value].reverse().join(""),
+];
+
 const spanSurface = (spans: readonly RecordedSpan[]): string =>
   JSON.stringify(
     spans.map((span) => ({
@@ -575,9 +581,20 @@ describe("OpenAPI sensitive transport tracing", () => {
       Effect.gen(function* () {
         const receivedBodies = yield* Ref.make<readonly unknown[]>([]);
         const echoes = opaqueAdversarialEchoes(OPAQUE_PROVENANCE_MARKER);
+        const sourceTransforms = opaqueSourceSiblingTransforms(OPAQUE_PROVENANCE_MARKER);
         const server = yield* serveTestHttpApp((request) =>
           request.url?.endsWith("/source")
-            ? Effect.succeed(HttpServerResponse.jsonUnsafe({ value: OPAQUE_PROVENANCE_MARKER }))
+            ? Effect.succeed(
+                HttpServerResponse.jsonUnsafe({
+                  value: OPAQUE_PROVENANCE_MARKER,
+                  base64Echo: sourceTransforms[0],
+                  base64urlEcho: sourceTransforms[1],
+                  arbitraryEcho: sourceTransforms[2],
+                  error: { message: sourceTransforms[0] },
+                  logs: sourceTransforms,
+                  trace: { "http.response.body": sourceTransforms.join("|") },
+                }),
+              )
             : Effect.gen(function* () {
                 const body = yield* request.json.pipe(Effect.catch(() => Effect.succeed(null)));
                 if (body !== null) {
@@ -622,6 +639,12 @@ describe("OpenAPI sensitive transport tracing", () => {
         )) as { readonly ok?: boolean; readonly data?: { readonly value?: unknown } };
         expect(source.ok).toBe(true);
         expect(isOpaqueValueReference(source.data?.value)).toBe(true);
+        expect(Object.keys(source.data ?? {})).toEqual(["value"]);
+        const sourcePublicSurface = `${JSON.stringify(source)}\n${spanSurface(spans)}`;
+        expect(sourcePublicSurface).not.toContain(OPAQUE_PROVENANCE_MARKER);
+        for (const transform of sourceTransforms) {
+          expect(sourcePublicSurface).not.toContain(transform);
+        }
 
         const result = yield* Effect.withTracer(
           executor.execute(
@@ -644,6 +667,7 @@ describe("OpenAPI sensitive transport tracing", () => {
         const publicSurface = `${JSON.stringify(result)}\n${spanSurface(spans)}`;
         expect(publicSurface).not.toContain(OPAQUE_PROVENANCE_MARKER);
         for (const echo of echoes) expect(publicSurface).not.toContain(echo);
+        for (const transform of sourceTransforms) expect(publicSurface).not.toContain(transform);
       }),
     ),
   );

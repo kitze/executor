@@ -2,6 +2,8 @@ import { Effect, Option, Predicate } from "effect";
 
 import { planToolPaths, type OperationPathInput, type PlannedToolPath } from "./definitions";
 import {
+  coolifyApplicationResponseSafeFields,
+  coolifyEnvironmentResponseSafeFields,
   coolifyEnvironmentWriteKind,
   isCoolifyApplicationResponseSchema,
   isCoolifyEnvironmentListResponseSchema,
@@ -492,6 +494,7 @@ const addCoolifySensitivity = (
   },
   sensitiveInputPaths: Set<string>,
   sensitiveOutputPaths: Set<string>,
+  sensitiveOutputSafePaths: Set<string>,
 ): void => {
   const writeKind = coolifyEnvironmentWriteKind(input.identity);
   if (writeKind && isVerifiedCoolifyEnvironmentWriteRequest(writeKind, input.requestSchemas)) {
@@ -522,6 +525,11 @@ const addCoolifySensitivity = (
         sensitiveOutputPaths.add("/*/value");
         sensitiveOutputPaths.add("/*/real_value");
       }
+      for (const schema of input.responseSchemas) {
+        for (const field of coolifyEnvironmentResponseSafeFields(schema)) {
+          sensitiveOutputSafePaths.add(writeKind === "single" ? `/${field}` : `/*/${field}`);
+        }
+      }
     }
   }
 
@@ -531,6 +539,11 @@ const addCoolifySensitivity = (
   ) {
     sensitiveOutputPaths.add("/*/value");
     sensitiveOutputPaths.add("/*/real_value");
+    for (const schema of input.responseSchemas) {
+      for (const field of coolifyEnvironmentResponseSafeFields(schema)) {
+        sensitiveOutputSafePaths.add(`/*/${field}`);
+      }
+    }
   }
 
   if (
@@ -545,6 +558,11 @@ const addCoolifySensitivity = (
       "http_basic_auth_password",
     ]) {
       sensitiveOutputPaths.add(`/${field}`);
+    }
+    for (const schema of input.responseSchemas) {
+      for (const field of coolifyApplicationResponseSafeFields(schema)) {
+        sensitiveOutputSafePaths.add(`/${field}`);
+      }
     }
   }
 };
@@ -561,6 +579,7 @@ const operationSensitivity = (input: {
 }): {
   readonly sensitiveInputPaths?: readonly string[];
   readonly sensitiveOutputPaths?: readonly string[];
+  readonly sensitiveOutputSafePaths?: readonly string[];
   readonly sensitiveResponseHeaders?: boolean;
 } => {
   const sensitiveInputPaths = new Set<string>();
@@ -591,6 +610,7 @@ const operationSensitivity = (input: {
   for (const path of rawServerVariablePaths(input.rawServers)) sensitiveInputPaths.add(path);
 
   const sensitiveOutputPaths = new Set<string>();
+  const sensitiveOutputSafePaths = new Set<string>();
   const responseSensitivity = collectResponseSensitivity(input.rawOperation, input.resolver);
   for (const path of responseSensitivity.paths) sensitiveOutputPaths.add(path);
 
@@ -607,6 +627,7 @@ const operationSensitivity = (input: {
     },
     sensitiveInputPaths,
     sensitiveOutputPaths,
+    sensitiveOutputSafePaths,
   );
 
   return {
@@ -615,6 +636,9 @@ const operationSensitivity = (input: {
       : {}),
     ...(sensitiveOutputPaths.size > 0
       ? { sensitiveOutputPaths: [...sensitiveOutputPaths].sort() }
+      : {}),
+    ...(sensitiveOutputSafePaths.size > 0
+      ? { sensitiveOutputSafePaths: [...sensitiveOutputSafePaths].sort() }
       : {}),
     ...(responseSensitivity.hasSensitiveHeaders ? { sensitiveResponseHeaders: true } : {}),
   };
