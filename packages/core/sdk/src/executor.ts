@@ -168,13 +168,11 @@ import {
   type OAuthEndpointUrlPolicy,
 } from "./oauth-helpers";
 import { connectionIdentifier } from "./connection-name-identifier";
-import { annotateToolResultOutcome } from "./tool-result";
+import { annotateToolResultOutcome, isToolResult } from "./tool-result";
 import { isUnauthorizedToolFailure } from "./auth-tool-failure";
 
 const PLUGIN_STORAGE_DELETE_KEY_BATCH_SIZE = 90;
 const PLUGIN_STORAGE_CREATE_ROW_BATCH_SIZE = 90;
-const MAX_APPROVAL_ARGUMENT_PREVIEW_CHARS = 4_000;
-
 // ---------------------------------------------------------------------------
 // Elicitation handler — resolved once at `createExecutor({ onElicitation })`
 // and overridable per `execute`. A tool that requests user input mid-execution
@@ -1480,17 +1478,6 @@ const makePluginStorageFacade = (input: {
       removeImpl(storageInput.owner, storageInput.collection, storageInput.key),
     removeMany: (storageInput) => removeManyImpl(storageInput.owner, storageInput.entries),
   };
-};
-
-// ---------------------------------------------------------------------------
-// Approval argument preview
-// ---------------------------------------------------------------------------
-
-const approvalArgumentPreview = (args: unknown): string => {
-  const text = JSON.stringify(args ?? {}, null, 2) ?? "null";
-  return text.length > MAX_APPROVAL_ARGUMENT_PREVIEW_CHARS
-    ? `${text.slice(0, MAX_APPROVAL_ARGUMENT_PREVIEW_CHARS)}...`
-    : text;
 };
 
 // ---------------------------------------------------------------------------
@@ -4231,16 +4218,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         ? resolveElicitationHandler(options.onElicitation)
         : defaultElicitationHandler;
 
-    const buildElicit = (
-      address: ToolAddress,
-      args: unknown,
-      handler: ElicitationHandler,
-    ): Elicit => {
+    const buildElicit = (address: ToolAddress, handler: ElicitationHandler): Elicit => {
       return (request: ElicitationRequest) =>
         Effect.gen(function* () {
           const response: ElicitationResponse = yield* handler({
             address,
-            args,
             request,
           });
           if (response.action !== "accept") {
@@ -4259,7 +4241,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const approvalRequired = (
       annotations: ToolAnnotations | undefined,
       policy: EffectivePolicy,
+      consumesOpaqueValue: boolean,
     ): boolean => {
+      // An opaque value is a capability the sandbox may carry but not read.
+      // Its resolution is never weakened by an `approve` policy: consuming it
+      // needs a live human acceptance in this execution.
+      if (consumesOpaqueValue) return true;
       if (policy.action === "approve") return false;
       return policy.action === "require_approval" || annotations?.requiresApproval === true;
     };
@@ -4267,12 +4254,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const enforceApproval = (
       annotations: ToolAnnotations | undefined,
       address: ToolAddress,
-      args: unknown,
       policy: EffectivePolicy,
       handler: ElicitationHandler,
+      consumesOpaqueValue: boolean,
     ) =>
       Effect.gen(function* () {
-        if (!approvalRequired(annotations, policy)) return;
+        if (!approvalRequired(annotations, policy, consumesOpaqueValue)) return;
         const policyForcesApproval = policy.action === "require_approval";
         const message = annotations?.approvalDescription
           ? annotations.approvalDescription
@@ -4280,10 +4267,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             ? `Approve ${address}? (matched policy: ${policy.pattern})`
             : `Approve ${address}?`;
         const request = FormElicitation.make({
-          message: `${message}\n\nArguments:\n${approvalArgumentPreview(args)}`,
+          message,
           requestedSchema: { type: "object", properties: {} },
         });
-        const response = yield* handler({ address, args, request });
+        const response = yield* handler({ address, request });
         if (response.action !== "accept") {
           return yield* new ElicitationDeclinedError({
             address,
@@ -4341,7 +4328,40 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       options?: InvokeOptions,
     ): Effect.Effect<unknown, ExecuteError> => {
       const handler = pickHandler(options);
+      const opaqueValues = options?.opaqueValueHandoff;
       return Effect.gen(function* () {
+        const prepareOpaqueInput = (annotations: ToolAnnotations | undefined) =>
+          opaqueValues
+            ? opaqueValues.prepareInputForValidation(args, annotations?.sensitiveInputPaths)
+            : { value: args, containsOpaqueValue: false };
+
+        const resolveOpaqueInput = (
+          annotations: ToolAnnotations | undefined,
+          prepared: { readonly containsOpaqueValue: boolean },
+        ): unknown =>
+          prepared.containsOpaqueValue && opaqueValues
+            ? opaqueValues.resolveInputAfterApproval(args, annotations?.sensitiveInputPaths)
+            : args;
+
+        // Protect declared sensitive response fields, then redact every value
+        // already sealed in this execution from all success/result envelopes.
+        // The latter catches an upstream echo of a source value in a different
+        // field or in a ToolResult error without exposing it to the sandbox.
+        const protectInvocationResult = (
+          value: unknown,
+          annotations: ToolAnnotations | undefined,
+        ): unknown => {
+          if (!opaqueValues) return value;
+          if (isToolResult(value)) {
+            if (!value.ok) return opaqueValues.redact(value);
+            return opaqueValues.redact({
+              ...value,
+              data: opaqueValues.protectOutput(value.data, annotations?.sensitiveOutputPaths),
+            });
+          }
+          return opaqueValues.protectOutput(value, annotations?.sensitiveOutputPaths);
+        };
+
         // oxlint-disable executor/no-instanceof-error, executor/no-unknown-error-message, executor/no-manual-tag-check -- boundary: normalize arbitrary unknown plugin failures into a human-readable message for ToolInvocationError/telemetry
         const formatInvocationCauseMessage = (cause: unknown): string => {
           if (cause instanceof Error && cause.message.length > 0) return cause.message;
@@ -4360,14 +4380,16 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           effect: Effect.Effect<A, E>,
         ): Effect.Effect<A, ToolInvocationError> =>
           effect.pipe(
-            Effect.mapError(
-              (cause) =>
-                new ToolInvocationError({
-                  address,
-                  message: formatInvocationCauseMessage(cause),
-                  cause,
-                }),
-            ),
+            Effect.mapError((cause) => {
+              const safeCause = opaqueValues ? opaqueValues.redact(cause) : cause;
+              return new ToolInvocationError({
+                address,
+                message: opaqueValues
+                  ? opaqueValues.redactText(formatInvocationCauseMessage(safeCause))
+                  : formatInvocationCauseMessage(safeCause),
+                cause: safeCause,
+              });
+            }),
           );
 
         // Static path — O(1) map lookup for plugin-contributed static tools
@@ -4387,14 +4409,23 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               pattern: policy.pattern ?? "*",
             });
           }
-          yield* enforceApproval(staticEntry.tool.annotations, address, args, policy, handler);
-          return yield* wrapInvocationError(
+          const prepared = prepareOpaqueInput(staticEntry.tool.annotations);
+          yield* enforceApproval(
+            staticEntry.tool.annotations,
+            address,
+            policy,
+            handler,
+            prepared.containsOpaqueValue,
+          );
+          const invocationArgs = resolveOpaqueInput(staticEntry.tool.annotations, prepared);
+          const result = yield* wrapInvocationError(
             staticEntry.tool.handler({
               ctx: staticEntry.ctx,
-              args,
-              elicit: buildElicit(address, args, handler),
+              args: invocationArgs,
+              elicit: buildElicit(address, handler),
             }),
           );
+          return protectInvocationResult(result, staticEntry.tool.annotations);
         }
 
         const parsed = parseToolAddress(String(address));
@@ -4469,9 +4500,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           });
         }
 
-        // Resolve annotations + enforce approval.
+        // Resolve annotations before policy short-circuiting. Persisted rows can
+        // predate sensitive-path metadata, and an opaque input must not become
+        // resolvable merely because a policy otherwise auto-approves this tool.
         let resolvedAnnotations = annotations;
-        if (policy.action !== "approve" && runtime.plugin.resolveAnnotations) {
+        if (runtime.plugin.resolveAnnotations) {
           const map = yield* runtime.plugin
             .resolveAnnotations({
               ctx: runtime.ctx,
@@ -4482,17 +4515,33 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             .pipe(wrapInvocationError);
           resolvedAnnotations = map[String(parsed.tool)] ?? annotations;
         }
+        const prepared = prepareOpaqueInput(resolvedAnnotations);
+        const requiresApproval = approvalRequired(
+          resolvedAnnotations,
+          policy,
+          prepared.containsOpaqueValue,
+        );
         // When this call is about to pause for approval, validate args
         // first: a call that can only fail (missing required path param /
         // body) must be rejected here, not after the user grants an approval
         // that then goes to waste. Non-pausing calls skip this — invokeTool
         // raises the identical failure moments later without the extra pass.
-        if (approvalRequired(resolvedAnnotations, policy) && runtime.plugin.validateToolArgs) {
+        if (requiresApproval && runtime.plugin.validateToolArgs) {
           yield* runtime.plugin
-            .validateToolArgs({ ctx: runtime.ctx, toolRow: row, args })
+            .validateToolArgs({
+              ctx: runtime.ctx,
+              toolRow: row,
+              args: prepared.containsOpaqueValue ? prepared.value : args,
+            })
             .pipe(wrapInvocationError);
         }
-        yield* enforceApproval(resolvedAnnotations, address, args, policy, handler);
+        yield* enforceApproval(
+          resolvedAnnotations,
+          address,
+          policy,
+          handler,
+          prepared.containsOpaqueValue,
+        );
 
         // Resolve every named credential input (`variable → value`); `value` is
         // the primary `token` for single-input + OAuth callers.
@@ -4500,6 +4549,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         const integrationRow = yield* findIntegrationRow(parsed.integration);
         const grantedScopes = grantedScopesFromRow(connectionRow);
         const invokeTool = runtime.plugin.invokeTool;
+        // This is the first point the actual opaque value can reach any plugin
+        // code. Credential resolution and preflight validation already ran;
+        // the human gate above must have accepted an opaque-consuming call.
+        const invocationArgs = resolveOpaqueInput(resolvedAnnotations, prepared);
         const invokeWith = (
           resolved: Record<string, string | null>,
         ): Effect.Effect<unknown, ToolInvocationError> => {
@@ -4518,8 +4571,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               ctx: runtime.ctx,
               toolRow: row,
               credential,
-              args,
-              elicit: buildElicit(address, args, handler),
+              args: invocationArgs,
+              elicit: buildElicit(address, handler),
               invokeOptions: options,
             }),
           );
@@ -4541,16 +4594,18 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // If the retry also fails its result stands, so a genuinely dead grant
         // still surfaces the upstream's own auth failure and its reconnect
         // guidance rather than a masked one.
-        if (!isUnauthorizedToolFailure(first)) return first;
+        if (!isUnauthorizedToolFailure(first)) {
+          return protectInvocationResult(first, resolvedAnnotations);
+        }
         const refreshed = yield* forceRefreshConnectionValues(connectionRow).pipe(
           // A failed re-mint is not this call's failure to report: the upstream
           // already produced an auth failure with recovery guidance, which is
           // strictly more actionable than a refresh-plumbing error. Keep it.
           Effect.catchTag("CredentialResolutionError", () => Effect.succeed(null)),
         );
-        if (!refreshed) return first;
+        if (!refreshed) return protectInvocationResult(first, resolvedAnnotations);
         yield* Effect.annotateCurrentSpan({ "executor.oauth.refresh.retried": true });
-        return yield* invokeWith(refreshed);
+        return protectInvocationResult(yield* invokeWith(refreshed), resolvedAnnotations);
       }).pipe(
         // Expected tool failures (`ToolResult.fail`) resolve through the
         // success channel, so the tracer alone would record them as healthy

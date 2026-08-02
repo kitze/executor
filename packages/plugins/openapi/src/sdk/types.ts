@@ -180,6 +180,11 @@ export const ExtractedOperation = Schema.Struct({
   inputSchema: Schema.OptionFromOptional(Schema.Unknown),
   outputSchema: Schema.OptionFromOptional(Schema.Unknown),
   deprecated: Schema.Boolean,
+  /** JSON Pointer paths derived from explicit `x-executor-sensitive: true`
+   * schema markers. Input paths are relative to the Executor tool args;
+   * output paths are relative to `ToolResult.data`. */
+  sensitiveInputPaths: Schema.optional(Schema.Array(Schema.String)),
+  sensitiveOutputPaths: Schema.optional(Schema.Array(Schema.String)),
   /** OAuth scope requirements from `security`, alternatives preserved: each
    *  inner array is one acceptable Security Requirement Object's scope set
    *  (sorted, deduped); the outer array is an OR across alternatives. An
@@ -211,6 +216,10 @@ export const OperationBinding = Schema.Struct({
   parameters: Schema.Array(OperationParameter),
   requestBody: Schema.OptionFromOptional(OperationRequestBody),
   responseBody: Schema.OptionFromOptional(OperationResponseBody),
+  /** Persisted so dynamic invoke can restore sensitivity annotations without
+   * reparsing the source OpenAPI document. Optional for legacy bindings. */
+  sensitiveInputPaths: Schema.optional(Schema.Array(Schema.String)),
+  sensitiveOutputPaths: Schema.optional(Schema.Array(Schema.String)),
   /** Declared OAuth scope alternatives (see
    *  ExtractedOperation.requiredScopeAlternatives), persisted with the
    *  binding so the invoke path can annotate a scope-insufficient rejection

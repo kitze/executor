@@ -225,7 +225,10 @@ export const ExecutionsHandlers = HttpApiBuilder.group(ExecutorApi, "executions"
           // whichever instance serves the resume. Artifact calls only: a general
           // codemode pause can sit anywhere inside arbitrary code and is not
           // reconstructible from one address.
-          if (payload.artifactId !== undefined) {
+          // Opaque values are scoped to the live execution fiber. Never write
+          // a resumable record for one: after a restart its capabilities must
+          // be unavailable rather than silently reconstructed or resolved.
+          if (payload.artifactId !== undefined && !outcome.execution.hasOpaqueValues) {
             yield* recordPendingApproval({
               executionId: outcome.execution.id,
               artifactId: payload.artifactId,

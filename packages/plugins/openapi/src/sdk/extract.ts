@@ -7,6 +7,7 @@ import {
   parseEntry,
   parseHead,
   parseSmallComponents,
+  indexSchemas,
   type ByteRange,
   type KeepPathItem,
   type SpecStructure,
@@ -161,6 +162,155 @@ const extractRequestBody = (
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+// Explicit opt-in only. `writeOnly`, `format: password`, and property names
+// are documentation hints, not a safe authority to hide values from a model.
+const SENSITIVE_SCHEMA_EXTENSION = "x-executor-sensitive";
+
+const pointerEscape = (segment: string): string =>
+  segment.replaceAll("~", "~0").replaceAll("/", "~1");
+
+const pointerAt = (segments: readonly string[]): string =>
+  segments.length === 0 ? "" : `/${segments.map(pointerEscape).join("/")}`;
+
+/** Collect every exact schema marker as an RFC 6901 pointer. A component ref
+ * is resolved through the current document and guarded against recursive
+ * schemas. Array and map members use the shared `/*` wildcard convention. */
+const collectSensitiveSchemaPaths = (
+  schema: unknown,
+  resolver: DocResolver,
+  path: readonly string[] = [],
+  out = new Set<string>(),
+  seenRefs = new Set<string>(),
+): Set<string> => {
+  if (!isRecord(schema)) return out;
+  if (schema[SENSITIVE_SCHEMA_EXTENSION] === true) out.add(pointerAt(path));
+
+  const ref = schema.$ref;
+  if (typeof ref === "string" && !seenRefs.has(ref)) {
+    seenRefs.add(ref);
+    const resolved = resolver.resolve<Record<string, unknown>>(schema as never);
+    if (resolved && resolved !== schema) {
+      collectSensitiveSchemaPaths(resolved, resolver, path, out, seenRefs);
+    }
+    // This is a recursion guard, not a de-duplication set. The same component
+    // can occur at several object paths and every occurrence needs its own
+    // pointer in the operation metadata.
+    seenRefs.delete(ref);
+  }
+
+  const properties = schema.properties;
+  if (isRecord(properties)) {
+    for (const [name, nested] of Object.entries(properties)) {
+      collectSensitiveSchemaPaths(nested, resolver, [...path, name], out, seenRefs);
+    }
+  }
+  if (schema.items !== undefined) {
+    collectSensitiveSchemaPaths(schema.items, resolver, [...path, "*"], out, seenRefs);
+  }
+  if (isRecord(schema.additionalProperties)) {
+    collectSensitiveSchemaPaths(
+      schema.additionalProperties,
+      resolver,
+      [...path, "*"],
+      out,
+      seenRefs,
+    );
+  }
+  for (const key of ["allOf", "anyOf", "oneOf"] as const) {
+    const variants = schema[key];
+    if (!Array.isArray(variants)) continue;
+    for (const variant of variants) {
+      collectSensitiveSchemaPaths(variant, resolver, path, out, seenRefs);
+    }
+  }
+  return out;
+};
+
+const withPointerPrefix = (prefix: string, path: string): string => `${prefix}${path}`;
+
+const operationSensitivity = (input: {
+  readonly parameters: readonly OperationParameter[];
+  readonly requestBody: OperationRequestBody | undefined;
+  readonly responseBody: OperationResponseBody | undefined;
+  readonly resolver: DocResolver;
+}): {
+  readonly sensitiveInputPaths?: readonly string[];
+  readonly sensitiveOutputPaths?: readonly string[];
+} => {
+  const sensitiveInputPaths = new Set<string>();
+  for (const parameter of input.parameters) {
+    const schema = Option.getOrUndefined(parameter.schema);
+    for (const path of collectSensitiveSchemaPaths(schema, input.resolver)) {
+      sensitiveInputPaths.add(withPointerPrefix(`/${pointerEscape(parameter.name)}`, path));
+    }
+  }
+  if (input.requestBody) {
+    const schemas = [
+      Option.getOrUndefined(input.requestBody.schema),
+      ...(Option.getOrUndefined(input.requestBody.contents) ?? []).map((content) =>
+        Option.getOrUndefined(content.schema),
+      ),
+    ];
+    for (const schema of schemas) {
+      for (const path of collectSensitiveSchemaPaths(schema, input.resolver)) {
+        sensitiveInputPaths.add(withPointerPrefix("/body", path));
+      }
+    }
+  }
+
+  const sensitiveOutputPaths = new Set<string>();
+  if (input.responseBody) {
+    const schema = Option.getOrUndefined(input.responseBody.schema);
+    const prefix = isNdjsonMediaType(input.responseBody.contentType) ? "/*" : "";
+    for (const path of collectSensitiveSchemaPaths(schema, input.resolver)) {
+      sensitiveOutputPaths.add(withPointerPrefix(prefix, path));
+    }
+  }
+
+  return {
+    ...(sensitiveInputPaths.size > 0
+      ? { sensitiveInputPaths: [...sensitiveInputPaths].sort() }
+      : {}),
+    ...(sensitiveOutputPaths.size > 0
+      ? { sensitiveOutputPaths: [...sensitiveOutputPaths].sort() }
+      : {}),
+  };
+};
+
+/**
+ * The streaming compiler intentionally never materializes all component
+ * schemas. Sensitivity extraction still has to follow a referenced schema, so
+ * expose a lazy `components.schemas` record that parses one named range on its
+ * first lookup. `DocResolver` only indexes named pointer segments, so no
+ * operation can accidentally enumerate or retain the full schema set.
+ */
+const lazySchemasFromStructure = (structure: SpecStructure): Record<string, unknown> => {
+  const ranges = indexSchemas(structure);
+  const parsed = new Map<string, unknown>();
+  return new Proxy<Record<string, unknown>>(
+    {},
+    {
+      get: (_target, property) => {
+        if (typeof property !== "string") return undefined;
+        const existing = parsed.get(property);
+        if (existing !== undefined) return existing;
+        const range = ranges.get(property);
+        if (!range) return undefined;
+        const entry = parseEntry(structure.text, range, 4);
+        const schema = entry?.[1];
+        if (schema === undefined) return undefined;
+        parsed.set(property, schema);
+        return schema;
+      },
+      has: (_target, property) => typeof property === "string" && ranges.has(property),
+      getOwnPropertyDescriptor: (_target, property) =>
+        typeof property === "string" && ranges.has(property)
+          ? { configurable: true, enumerable: true }
+          : undefined,
+    },
+  );
+};
 
 const stringType = (schema: Record<string, unknown>): boolean =>
   schema.type === "string" || (Array.isArray(schema.type) && schema.type.includes("string"));
@@ -568,6 +718,12 @@ export const extract = Effect.fn("OpenApi.extract")(function* (doc: ParsedDocume
       const requestBody = extractRequestBody(operation, r);
       const responseBody = extractResponseBody(operation, r);
       const servers = operationServers(pathItem, operation, docServers);
+      const sensitivity = operationSensitivity({
+        parameters,
+        requestBody,
+        responseBody,
+        resolver: r,
+      });
       const inputSchema = buildInputSchema(parameters, requestBody, servers);
       const outputSchema = responseBody ? outputSchemaFromResponseBody(responseBody) : undefined;
       const tags = (operation.tags ?? []).filter((t) => t.trim().length > 0);
@@ -593,6 +749,7 @@ export const extract = Effect.fn("OpenApi.extract")(function* (doc: ParsedDocume
           inputSchema: Option.fromNullishOr(inputSchema),
           outputSchema: Option.fromNullishOr(outputSchema),
           deprecated: operation.deprecated === true,
+          ...sensitivity,
           ...(requiredScopeAlternatives ? { requiredScopeAlternatives } : {}),
         }),
       );
@@ -709,6 +866,12 @@ export const streamOperationBindings = <E, R>(
       const requestBody = extractRequestBody(ref.operation, r);
       const responseBody = extractResponseBody(ref.operation, r);
       const servers = operationServers(ref.pathItem, ref.operation, docServers);
+      const sensitivity = operationSensitivity({
+        parameters,
+        requestBody,
+        responseBody,
+        resolver: r,
+      });
       const requiredScopeAlternatives = securityScopeAlternatives(
         ref.operation,
         documentSecurityOf(doc),
@@ -726,6 +889,7 @@ export const streamOperationBindings = <E, R>(
           parameters,
           requestBody: Option.fromNullishOr(requestBody),
           responseBody: Option.fromNullishOr(responseBody),
+          ...sensitivity,
           ...(requiredScopeAlternatives ? { requiredScopeAlternatives } : {}),
         }),
       });
@@ -822,7 +986,10 @@ export const streamOperationBindingsFromStructure = <E, R>(
     const resolverDoc = {
       ...parseHead(structure),
       paths: {},
-      components: parseSmallComponents(structure),
+      components: {
+        ...parseSmallComponents(structure),
+        schemas: lazySchemasFromStructure(structure),
+      },
     } as unknown as ParsedDocument;
     const r = new DocResolver(resolverDoc);
     const docServers = extractServers(resolverDoc);
@@ -844,6 +1011,12 @@ export const streamOperationBindingsFromStructure = <E, R>(
         const requestBody = extractRequestBody(operation, r);
         const responseBody = extractResponseBody(operation, r);
         const servers = operationServers(pathItem, operation, docServers);
+        const sensitivity = operationSensitivity({
+          parameters,
+          requestBody,
+          responseBody,
+          resolver: r,
+        });
         const requiredScopeAlternatives = securityScopeAlternatives(
           operation,
           documentSecurityOf(resolverDoc),
@@ -861,6 +1034,7 @@ export const streamOperationBindingsFromStructure = <E, R>(
             parameters,
             requestBody: Option.fromNullishOr(requestBody),
             responseBody: Option.fromNullishOr(responseBody),
+            ...sensitivity,
             ...(requiredScopeAlternatives ? { requiredScopeAlternatives } : {}),
           }),
         });

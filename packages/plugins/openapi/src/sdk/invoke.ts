@@ -1,6 +1,6 @@
 import { Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
-import type { ToolFileValue } from "@executor-js/sdk/core";
+import type { ToolAnnotations, ToolFileValue } from "@executor-js/sdk/core";
 
 import { OpenApiInvocationError } from "./errors";
 import { isNdjsonMediaType, NDJSON_MEDIA_TYPES, resolveServerUrl } from "./openapi-utils";
@@ -1361,10 +1361,23 @@ export const REQUIRE_APPROVAL = new Set(["post", "put", "patch", "delete"]);
 export const annotationsForOperation = (
   method: string,
   pathTemplate: string,
-): { requiresApproval?: boolean; approvalDescription?: string } => {
+  sensitivity?: {
+    readonly sensitiveInputPaths?: readonly string[];
+    readonly sensitiveOutputPaths?: readonly string[];
+  },
+): ToolAnnotations => {
   const m = method.toLowerCase();
-  if (!REQUIRE_APPROVAL.has(m)) return {};
+  const sensitive = {
+    ...(sensitivity?.sensitiveInputPaths?.length
+      ? { sensitiveInputPaths: sensitivity.sensitiveInputPaths }
+      : {}),
+    ...(sensitivity?.sensitiveOutputPaths?.length
+      ? { sensitiveOutputPaths: sensitivity.sensitiveOutputPaths }
+      : {}),
+  };
+  if (!REQUIRE_APPROVAL.has(m)) return sensitive;
   return {
+    ...sensitive,
     requiresApproval: true,
     approvalDescription: `${method.toUpperCase()} ${pathTemplate}`,
   };

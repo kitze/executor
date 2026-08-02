@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect";
 
 import { ElicitationId, ToolAddress } from "./ids";
+import type { OpaqueValueHandoff } from "./opaque-value-handoff";
 
 /* A tool that needs user input mid-call suspends and the host's `onElicitation`
  * handler (executor-level, overridable per `execute`) answers. Tools that never
@@ -35,10 +36,13 @@ export const ElicitationResponse = Schema.Struct({
 });
 export type ElicitationResponse = typeof ElicitationResponse.Type;
 
-/** Handler input — the tool address being invoked, its args, and the request. */
+/**
+ * Handler input deliberately contains metadata only. Invocation arguments stay
+ * in the active tool fiber; public approval, browser, and native-MCP paths
+ * must never receive caller values by default.
+ */
 export interface ElicitationContext {
   readonly address: ToolAddress;
-  readonly args: unknown;
   readonly request: ElicitationRequest;
 }
 
@@ -53,6 +57,8 @@ export type OnElicitation = ElicitationHandler | "accept-all";
 export interface InvokeOptions {
   /** Override the executor-level handler for this single call. */
   readonly onElicitation?: OnElicitation;
+  /** @internal Per-sandbox-execution sensitive-value capability store. */
+  readonly opaqueValueHandoff?: OpaqueValueHandoff;
 }
 
 /** A tool was declined or cancelled during elicitation. */
