@@ -93,6 +93,7 @@ export { collectTables } from "@executor-js/sdk";
 export {
   IdentityProvider,
   AuthContext,
+  RequestLiveApprovalProvenance,
   Unauthorized,
   NoOrganization,
   Unavailable,

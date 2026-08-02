@@ -5,6 +5,7 @@ import {
   coolifyEnvironmentWriteKind,
   isCoolifyApplicationResponseSchema,
   isCoolifyEnvironmentListResponseSchema,
+  isCoolifyEnvironmentWriteResponseSchema,
   isVerifiedCoolifyApplicationReadOperation,
   isVerifiedCoolifyEnvironmentListOperation,
   isVerifiedCoolifyEnvironmentWriteRequest,
@@ -497,15 +498,30 @@ const addCoolifySensitivity = (
     if (writeKind === "single") {
       sensitiveInputPaths.add("/body/value");
       sensitiveInputPaths.add("/input/value");
-      if (input.identity.method === "patch") {
-        sensitiveOutputPaths.add("/value");
-        sensitiveOutputPaths.add("/real_value");
-      }
     } else {
       sensitiveInputPaths.add("/body/data/*/value");
       sensitiveInputPaths.add("/input/data/*/value");
-      sensitiveOutputPaths.add("/*/value");
-      sensitiveOutputPaths.add("/*/real_value");
+    }
+
+    // Coolify's create, update, and bulk-update operations can all return the
+    // newly written environment value. Keep the compatibility rule as narrow
+    // as the sink rule above: operation identity + exact request fingerprint
+    // are not enough on their own; at least one declared response must also
+    // match Coolify's environment response shape before output paths are
+    // sealed. This covers POST create as well as PATCH update without turning a
+    // similarly named tenant endpoint's arbitrary response into a capability.
+    if (
+      input.responseSchemas.some((schema) =>
+        isCoolifyEnvironmentWriteResponseSchema(writeKind, schema),
+      )
+    ) {
+      if (writeKind === "single") {
+        sensitiveOutputPaths.add("/value");
+        sensitiveOutputPaths.add("/real_value");
+      } else {
+        sensitiveOutputPaths.add("/*/value");
+        sensitiveOutputPaths.add("/*/real_value");
+      }
     }
   }
 

@@ -10,6 +10,7 @@ const MARKER = "opaque-value-regression-marker";
 const STRUCTURAL_KEY_MARKER = "opaque-structural-key-marker";
 const JSON_MARKER = 'opaque-json-"escaped"-marker';
 const URI_MARKER = "opaque-uri/a?b=marker";
+const FORM_MARKER = "opaque form+slash/?=marker~";
 const sourceContext = {
   principal: "tenant-a\u0000alice",
   integration: "coolify",
@@ -127,6 +128,27 @@ describe("opaque sensitive value handoff", () => {
       expect(rendered).not.toContain(marker);
     }
     expect(rendered).not.toContain("enabled=true");
+  });
+
+  it("redacts application/x-www-form-urlencoded echoes across response, error, log, and trace shapes", () => {
+    const handoff = makeOpaqueValueHandoff();
+    handoff.protectOutput({ value: FORM_MARKER }, ["/value"]);
+    const encoded = new URLSearchParams([["value", FORM_MARKER]]).toString().slice("value=".length);
+    expect(encoded, "the regression fixture exercises HTML form space-to-plus encoding").toContain(
+      "+",
+    );
+
+    const safe = handoff.redact({
+      response: { echoed: `value=${encoded}` },
+      error: { message: `upstream rejected value=${encoded}` },
+      logs: [`request body value=${encoded}`],
+      trace: { attributes: { "http.request.body": `value=${encoded}` } },
+    });
+    const rendered = JSON.stringify(safe);
+
+    expect(rendered).not.toContain(FORM_MARKER);
+    expect(rendered).not.toContain(encoded);
+    expect(handoff.redactText(`value=${encoded}`)).not.toContain(encoded);
   });
 
   it("disposes raw capabilities and redaction material when its TTL elapses", async () => {

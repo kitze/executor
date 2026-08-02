@@ -56,6 +56,7 @@ import {
   AuthContext,
   isPlatformPrincipal,
   ReadOnlyCredential,
+  RequestLiveApprovalProvenance,
   type IdentityFailure,
   type ResolvedPrincipal,
 } from "./identity";
@@ -256,6 +257,10 @@ export const makeExecutionStackMiddleware = <
             : stack.pipe(Effect.withSpan("executor.stack.http.resolve"));
           return yield* httpEffect.pipe(
             Effect.provideService(AuthContext, auth),
+            Effect.provideService(
+              RequestLiveApprovalProvenance,
+              resolved.liveApprovalProvenance ?? "none",
+            ),
             Effect.provideService(ExecutorService, executor),
             Effect.provideService(ExecutionEngineService, engine),
             provideExecutorExtensions(executor),

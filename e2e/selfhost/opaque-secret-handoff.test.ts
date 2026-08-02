@@ -20,6 +20,7 @@ import type { Identity } from "../src/target";
 const api = composePluginApi([openApiHttpPlugin()] as const);
 const CONNECTION = ConnectionName.make("main");
 const ENV_KEY = "OPAQUE_HANDOFF_VALUE";
+const COOLIFY_ENV_KEY = "COOLIFY_RESPONSE_SEALING";
 
 const unique = (prefix: string): string => `${prefix}_${randomBytes(5).toString("hex")}`;
 
@@ -125,6 +126,48 @@ const opaqueEnvSpec = (baseUrl: string): string =>
           },
         },
       },
+      "/applications/{uuid}/envs": {
+        post: {
+          operationId: "createEnvByApplicationUuid",
+          tags: ["Applications"],
+          parameters: [{ name: "uuid", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    key: { type: "string" },
+                    value: { type: "string" },
+                    is_preview: { type: "boolean" },
+                    is_literal: { type: "boolean" },
+                    is_multiline: { type: "boolean" },
+                    is_shown_once: { type: "boolean" },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "created Coolify environment variable",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      key: { type: "string" },
+                      value: { type: "string" },
+                      real_value: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
     },
   });
 
@@ -157,14 +200,39 @@ console.log("sink response", created);
 return { source, created };
 `;
 
+const coolifyCreateCode = (input: {
+  readonly address: string;
+  readonly applicationUuid: string;
+  readonly requestValue: string;
+}): string => `
+const callable = (address) => {
+  let node = tools;
+  for (const segment of address.split(".").slice(1)) node = node[segment];
+  return node;
+};
+const created = await callable(${JSON.stringify(input.address)})({
+  uuid: ${JSON.stringify(input.applicationUuid)},
+  body: {
+    key: ${JSON.stringify(COOLIFY_ENV_KEY)},
+    value: ${JSON.stringify(input.requestValue)},
+    is_preview: false,
+    is_literal: true,
+    is_multiline: false,
+    is_shown_once: false,
+  },
+});
+console.log("Coolify create response", created);
+return created;
+`;
+
 const textAndRawContainNo = (
   value: { readonly text: string; readonly raw: unknown },
   marker: string,
 ) => {
-  expect(value.text, "MCP text never reveals the source value").not.toContain(marker);
+  expect(value.text, "MCP text never reveals the sensitive marker").not.toContain(marker);
   expect(
     JSON.stringify(value.raw),
-    "MCP structured content never reveals the source value",
+    "MCP structured content never reveals the sensitive marker",
   ).not.toContain(marker);
 };
 
@@ -281,9 +349,17 @@ scenario(
             .filter((tool) => String(tool.integration) === slug)
             .map((tool) => String(tool.address))
             .find((address) => address.endsWith("createProjectEnv"));
+          const coolifyCreateAddress = tools
+            .filter((tool) => String(tool.integration) === slug)
+            .map((tool) => String(tool.address))
+            .find((address) => address.endsWith("createEnvByApplicationUuid"));
           expect(sourceAddress, "the sensitive source operation is available").toBeDefined();
           expect(sinkAddress, "the sensitive sink operation is available").toBeDefined();
-          if (!sourceAddress || !sinkAddress) return;
+          expect(
+            coolifyCreateAddress,
+            "the Coolify-compatible create operation is available",
+          ).toBeDefined();
+          if (!sourceAddress || !sinkAddress || !coolifyCreateAddress) return;
 
           const session = mcp.session(identity, { elicitationMode: "browser" });
           yield* session.listTools();
@@ -351,6 +427,82 @@ scenario(
           expect(acceptedPosts, "one target write follows the approval").toHaveLength(1);
           expect(acceptedPosts[0]?.request.body).toMatchObject({ value: marker });
 
+          // The Coolify compatibility rule is the only source of output
+          // sensitivity here: the response schema deliberately has no
+          // x-executor-sensitive annotations, and this marker never appeared in
+          // the request or the earlier source response. If POST response paths
+          // are not inferred, this exact canary reaches MCP text/raw output.
+          yield* Effect.promise(() => emulator.ledger.clear());
+          const coolifyApplication = unique("coolify_application");
+          const coolifyRequestValue = unique("coolify_request_value");
+          const coolifyResponseMarker = unique("coolify_response_only");
+          const coolifyPath = `/applications/${coolifyApplication}/envs`;
+          const responseFault = yield* Effect.promise(() =>
+            emulator.faults.arm({
+              match: { method: "POST", pathPattern: coolifyPath },
+              response: {
+                status: 200,
+                body: {
+                  key: COOLIFY_ENV_KEY,
+                  value: coolifyResponseMarker,
+                  real_value: coolifyResponseMarker,
+                },
+              },
+            }),
+          );
+
+          const coolifyPaused = yield* session.call("execute", {
+            code: coolifyCreateCode({
+              address: coolifyCreateAddress,
+              applicationUuid: coolifyApplication,
+              requestValue: coolifyRequestValue,
+            }),
+          });
+          textAndRawContainNo(coolifyPaused, coolifyResponseMarker);
+          const coolifyApproval = parseBrowserApproval(coolifyPaused);
+
+          const [coolifyResume] = yield* Effect.all(
+            [
+              session.awaitResume(coolifyApproval.executionId),
+              browser.session(identity, async ({ page, step }) => {
+                await step("Open the Coolify create approval", async () => {
+                  const url = new URL(coolifyApproval.approvalUrl);
+                  await page.goto(`${url.pathname}${url.search}`, { waitUntil: "networkidle" });
+                  await page.getByText("User approval required").waitFor();
+                });
+                await step("Approve the Coolify create", async () => {
+                  await page.getByRole("button", { name: "Approve" }).click();
+                  await page.getByText("Approve sent").waitFor();
+                });
+              }),
+            ],
+            { concurrency: "unbounded" },
+          );
+          expect(coolifyResume.ok, "the approved Coolify create completes").toBe(true);
+          textAndRawContainNo(coolifyResume, coolifyResponseMarker);
+
+          const coolifyPosts = (yield* Effect.promise(() => emulator.ledger.list())).filter(
+            (entry) => entry.method === "POST" && entry.path === coolifyPath,
+          );
+          expect(coolifyPosts, "one Coolify create follows browser approval").toHaveLength(1);
+          expect(coolifyPosts[0]).toMatchObject({
+            faulted: true,
+            faultId: responseFault.id,
+            request: {
+              body: {
+                key: COOLIFY_ENV_KEY,
+                value: coolifyRequestValue,
+              },
+            },
+            response: {
+              status: 200,
+              body: {
+                value: coolifyResponseMarker,
+                real_value: coolifyResponseMarker,
+              },
+            },
+          });
+
           yield* Effect.promise(() => emulator.ledger.clear());
           const declined = yield* session.call("execute", {
             code: handoffCode({
@@ -398,6 +550,7 @@ scenario(
             })
             .pipe(Effect.ignore);
           yield* client.openapi.removeSpec({ params: { slug } }).pipe(Effect.ignore);
+          yield* Effect.promise(() => emulator.faults.clear()).pipe(Effect.ignore);
         }),
       );
     }),

@@ -40,6 +40,7 @@ import {
   AuthContext,
   isPlatformPrincipal,
   ReadOnlyCredential,
+  RequestLiveApprovalProvenance,
   type Principal,
   type ResolvedPrincipal,
 } from "./identity";
@@ -137,6 +138,10 @@ export const makeFixedExecutionMiddleware = <
           const auth = AuthContext.of(authContextFromPrincipal(resolved));
           return yield* httpEffect.pipe(
             Effect.provideService(AuthContext, auth),
+            Effect.provideService(
+              RequestLiveApprovalProvenance,
+              resolved.liveApprovalProvenance ?? "none",
+            ),
             Effect.provideService(ExecutorService, executor),
             Effect.provideService(ExecutionEngineService, engine),
             provideExecutorExtensions(extensions as PluginExtensions<TPlugins>),

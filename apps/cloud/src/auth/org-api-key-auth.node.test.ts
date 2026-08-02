@@ -121,6 +121,7 @@ describe("org-level API keys", () => {
 
       expect(isPlatformAuth(auth)).toBe(false);
       expect(auth).toMatchObject({ accountId: "user_123", organizationId: "org_123" });
+      expect(auth).not.toHaveProperty("liveApprovalProvenance");
     }),
   );
 

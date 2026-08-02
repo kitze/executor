@@ -76,6 +76,20 @@ const ApprovalExpiredError = Schema.TaggedStruct("ApprovalExpiredError", {
   });
 
 /**
+ * A non-session credential attempted to accept a pause that can release an
+ * opaque capability. API keys may inspect and decline such a pause, but only a
+ * browser/session-backed human decision can mint the live in-memory grant.
+ */
+const LiveApprovalForbiddenError = Schema.TaggedStruct("LiveApprovalForbiddenError", {
+  executionId: Schema.String,
+})
+  .annotate({ httpApiStatus: 403 })
+  .annotate({
+    description:
+      "Accepting this action requires an authenticated browser or user session. API keys cannot release opaque values.",
+  });
+
+/**
  * An artifact-originated execution that could not be turned into a call: the
  * code was not the shell proxy's emission, the artifact is not this caller's,
  * or a role in it has no connection bound.
@@ -125,6 +139,11 @@ export const ExecutionsApi = HttpApiGroup.make("executions")
       params: ExecutionParams,
       payload: ResumeRequest,
       success: ResumeResponse,
-      error: [InternalError, ExecutionNotFoundError, ApprovalExpiredError],
+      error: [
+        InternalError,
+        ExecutionNotFoundError,
+        ApprovalExpiredError,
+        LiveApprovalForbiddenError,
+      ],
     }),
   );

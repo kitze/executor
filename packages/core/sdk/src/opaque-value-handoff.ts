@@ -427,6 +427,13 @@ const redactionFormsFor = (value: string): readonly string[] => {
   } catch {
     // no encoded form for malformed UTF-16
   }
+  // HTML form encoding is not identical to encodeURIComponent: most notably,
+  // spaces become `+` (and characters such as `~` use a different escape
+  // set). Upstream services routinely echo request-body fields, URLs, and
+  // errors in this representation, so retain the exact scalar encoding as a
+  // redaction needle as well. The fixed key is discarded and never contains
+  // caller material.
+  forms.add(new URLSearchParams([["value", value]]).toString().slice("value=".length));
   return [...forms].filter((form) => form.length > 0);
 };
 

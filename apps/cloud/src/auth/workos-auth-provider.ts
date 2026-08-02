@@ -154,6 +154,7 @@ const resolveJwtPrincipal = (token: string, jwt: JwtBearerConfig) =>
       name: null,
       avatarUrl: null,
       roles: [],
+      liveApprovalProvenance: "session",
     } satisfies Principal;
   });
 
@@ -326,6 +327,7 @@ export const resolveSessionPrincipal = (request: Request) =>
       name: sealedSessionDisplayName(session),
       avatarUrl: session.avatarUrl ?? null,
       roles: [],
+      liveApprovalProvenance: "session",
     } satisfies Principal;
   });
 
