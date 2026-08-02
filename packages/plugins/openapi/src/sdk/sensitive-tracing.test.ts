@@ -84,6 +84,7 @@ const RESPONSE_HEADER_MARKER = "trace-response-header-sensitive-canary";
 const AUTH_QUERY_MARKER = "trace-auth-query-canary";
 const AUTH_HEADER_MARKER = "trace-auth-header-canary";
 const ALTERNATE_RESPONSE_MARKER = "trace-alternate-response-canary";
+const OPAQUE_PROVENANCE_MARKER = 'trace opaque "line1\r\nline2" * / marker';
 const ALL_MARKERS = [
   PATH_MARKER,
   QUERY_MARKER,
@@ -294,6 +295,77 @@ const alternateSensitiveResponseSpec = (baseUrl: string) =>
     },
   });
 
+const opaqueProvenanceSpec = (baseUrl: string) =>
+  JSON.stringify({
+    openapi: "3.1.0",
+    info: { title: "Opaque provenance fixture", version: "1.0.0" },
+    servers: [{ url: baseUrl }],
+    paths: {
+      "/source": {
+        get: {
+          operationId: "readOpaqueSource",
+          tags: ["Tracing"],
+          responses: {
+            "200": {
+              description: "OK",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: { value: { type: "string", format: "secret" } },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/sink": {
+        post: {
+          operationId: "writeOpaqueSink",
+          tags: ["Tracing"],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { value: { type: "string", format: "password" } },
+                  required: ["value"],
+                },
+              },
+            },
+          },
+          responses: {
+            "202": {
+              description: "Accepted",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    additionalProperties: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+
+const opaqueAdversarialEchoes = (value: string): readonly string[] => {
+  const json = JSON.stringify(value);
+  const uri = encodeURIComponent(value);
+  return [
+    encodeURIComponent(json),
+    new URLSearchParams([["value", json]]).toString(),
+    encodeURIComponent(value.replaceAll("\r\n", "\n")),
+    uri.replaceAll("*", "%2A"),
+    encodeURIComponent(uri),
+  ];
+};
+
 const spanSurface = (spans: readonly RecordedSpan[]): string =>
   JSON.stringify(
     spans.map((span) => ({
@@ -494,6 +566,84 @@ describe("OpenAPI sensitive transport tracing", () => {
         expect(isOpaqueValueReference(result.data?.alternate)).toBe(true);
         expect(JSON.stringify(result)).not.toContain(ALTERNATE_RESPONSE_MARKER);
         expect(spanSurface(spans)).not.toContain(ALTERNATE_RESPONSE_MARKER);
+      }),
+    ),
+  );
+
+  it.effect("taints an opaque-consuming OpenAPI response instead of matching transforms", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const receivedBodies = yield* Ref.make<readonly unknown[]>([]);
+        const echoes = opaqueAdversarialEchoes(OPAQUE_PROVENANCE_MARKER);
+        const server = yield* serveTestHttpApp((request) =>
+          request.url?.endsWith("/source")
+            ? Effect.succeed(HttpServerResponse.jsonUnsafe({ value: OPAQUE_PROVENANCE_MARKER }))
+            : Effect.gen(function* () {
+                const body = yield* request.json.pipe(Effect.catch(() => Effect.succeed(null)));
+                if (body !== null) {
+                  yield* Ref.update(receivedBodies, (all) => [...all, body]);
+                }
+                return HttpServerResponse.jsonUnsafe(
+                  {
+                    success: echoes,
+                    error: echoes.map((echo) => ({ message: echo })),
+                    logs: echoes,
+                    trace: echoes.map((echo) => ({ "http.response.body": echo })),
+                    directText: echoes.join("\n"),
+                  },
+                  { status: 202, headers: { "x-opaque-echo": echoes.join(",") } },
+                );
+              }),
+        );
+        const executor = yield* createExecutor(
+          makeTestConfig({
+            plugins: [
+              openApiPlugin({ httpClientLayer: server.httpClientLayer }),
+              memoryCredentialsPlugin(),
+            ] as const,
+          }),
+        );
+        const connection = yield* addOpenApiTestConnection(
+          executor,
+          { ...server, specJson: opaqueProvenanceSpec(server.baseUrl) },
+          { slug: "trace_opaque_provenance" },
+        );
+        const handoff = makeOpaqueValueHandoff();
+        const { tracer, spans } = makeRecordingTracer();
+        const source = (yield* Effect.withTracer(
+          executor.execute(
+            connection.address("tracing.readOpaqueSource"),
+            {},
+            {
+              opaqueValueHandoff: handoff,
+            },
+          ),
+          tracer,
+        )) as { readonly ok?: boolean; readonly data?: { readonly value?: unknown } };
+        expect(source.ok).toBe(true);
+        expect(isOpaqueValueReference(source.data?.value)).toBe(true);
+
+        const result = yield* Effect.withTracer(
+          executor.execute(
+            connection.address("tracing.writeOpaqueSink"),
+            { body: { value: source.data?.value } },
+            {
+              onElicitation: () => Effect.succeed({ action: "accept" as const }),
+              opaqueValueHandoff: handoff,
+            },
+          ),
+          tracer,
+        );
+
+        expect(yield* Ref.get(receivedBodies)).toEqual([{ value: OPAQUE_PROVENANCE_MARKER }]);
+        expect(result).toEqual({
+          ok: true,
+          data: null,
+          http: { status: 202, headers: {} },
+        });
+        const publicSurface = `${JSON.stringify(result)}\n${spanSurface(spans)}`;
+        expect(publicSurface).not.toContain(OPAQUE_PROVENANCE_MARKER);
+        for (const echo of echoes) expect(publicSurface).not.toContain(echo);
       }),
     ),
   );

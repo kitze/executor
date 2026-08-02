@@ -616,6 +616,80 @@ describe("Coolify application environment variable schema compatibility", () => 
     ),
   );
 
+  it.effect("sends opaque values through schema-gated POST and PATCH sinks", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* serveCoolifyFixture();
+        const executor = yield* createExecutor(
+          makeTestConfig({
+            plugins: [
+              openApiPlugin({ httpClientLayer: fixture.httpClientLayer }),
+              memoryCredentialsPlugin(),
+            ] as const,
+          }),
+        );
+        const connection = yield* addOpenApiTestConnection(executor, fixture, {
+          slug: "coolify",
+        });
+        const handoff = makeOpaqueValueHandoff();
+
+        const postSource = (yield* executor.execute(
+          connection.address(listEnvironmentOperationName),
+          { uuid: "app-1" },
+          { opaqueValueHandoff: handoff },
+        )) as { readonly data?: readonly { readonly value?: unknown }[] };
+        expect(isOpaqueValueReference(postSource.data?.[0]?.value)).toBe(true);
+        const postResult = yield* executor.execute(
+          connection.address("applications.createEnvByApplicationUuid"),
+          {
+            uuid: "app-1",
+            body: { key: "OPAQUE_POST", value: postSource.data?.[0]?.value },
+          },
+          { ...accepted, opaqueValueHandoff: handoff },
+        );
+
+        const patchSource = (yield* executor.execute(
+          connection.address(listEnvironmentOperationName),
+          { uuid: "app-1" },
+          { opaqueValueHandoff: handoff },
+        )) as { readonly data?: readonly { readonly value?: unknown }[] };
+        expect(isOpaqueValueReference(patchSource.data?.[0]?.value)).toBe(true);
+        const patchResult = yield* executor.execute(
+          connection.address(updateEnvironmentOperationName),
+          {
+            uuid: "app-1",
+            body: { key: "OPAQUE_PATCH", value: patchSource.data?.[0]?.value },
+          },
+          { ...accepted, opaqueValueHandoff: handoff },
+        );
+
+        const safeResult = {
+          ok: true,
+          data: null,
+          http: { status: 200, headers: {} },
+        };
+        expect(postResult).toEqual(safeResult);
+        expect(patchResult).toEqual(safeResult);
+
+        const writes = (yield* fixture.requests).filter(
+          (request) => request.method === "POST" || request.method === "PATCH",
+        );
+        expect(
+          writes.map((request) => ({ method: request.method, body: decodeJson(request.body) })),
+        ).toEqual([
+          {
+            method: "POST",
+            body: { key: "OPAQUE_POST", value: environmentSecretCanaries.value },
+          },
+          {
+            method: "PATCH",
+            body: { key: "OPAQUE_PATCH", value: environmentSecretCanaries.value },
+          },
+        ]);
+      }),
+    ),
+  );
+
   it.effect("leaves a tenant-local integration named coolify untouched", () =>
     Effect.scoped(
       Effect.gen(function* () {
