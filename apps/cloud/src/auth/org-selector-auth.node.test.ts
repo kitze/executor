@@ -119,6 +119,7 @@ describe("resolveSessionPrincipal · URL org selector", () => {
         "x-executor-organization": URL_SLUG,
       });
       expect(principal.organizationId, "the slug header wins over the session org").toBe(URL_ORG);
+      expect(principal.liveApprovalProvenance).toBe("session");
     }),
   );
 

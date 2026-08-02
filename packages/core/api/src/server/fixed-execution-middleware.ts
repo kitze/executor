@@ -35,7 +35,12 @@ import type { ExecutionEngine } from "@executor-js/execution";
 
 import { ExecutionEngineService, ExecutorService } from "../services";
 import { providePluginExtensions, type PluginExtensionServices } from "../plugin-routes";
-import { authContextFromPrincipal, AuthContext, type Principal } from "./identity";
+import {
+  authContextFromPrincipal,
+  AuthContext,
+  RequestLiveApprovalProvenance,
+  type Principal,
+} from "./identity";
 import type { FailureRenderingStrategy } from "./execution-stack-middleware";
 
 /**
@@ -114,6 +119,10 @@ export const makeFixedExecutionMiddleware = <
           const auth = AuthContext.of(authContextFromPrincipal(resolved));
           return yield* httpEffect.pipe(
             Effect.provideService(AuthContext, auth),
+            Effect.provideService(
+              RequestLiveApprovalProvenance,
+              resolved.liveApprovalProvenance ?? "none",
+            ),
             Effect.provideService(ExecutorService, executor),
             Effect.provideService(ExecutionEngineService, engine),
             provideExecutorExtensions(extensions as PluginExtensions<TPlugins>),

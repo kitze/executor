@@ -86,6 +86,7 @@ export const singleAdminIdentityLayer = (
           name: "Admin",
           avatarUrl: null,
           roles: ["admin"],
+          liveApprovalProvenance: "session",
         }),
     }),
   );
@@ -109,6 +110,7 @@ export const headerIdentityLayer: Layer.Layer<IdentityProvider> = Layer.succeed(
         name: userId,
         avatarUrl: null,
         roles: ["admin"],
+        liveApprovalProvenance: "session",
       });
     },
   }),

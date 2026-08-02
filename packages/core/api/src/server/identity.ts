@@ -43,7 +43,19 @@ export interface Principal {
   readonly name: string | null;
   readonly avatarUrl: string | null;
   readonly roles: readonly string[];
+  /** Authority established by the identity provider, never by request JSON.
+   * Session-backed/browser credentials may approve a live opaque handoff;
+   * bearer API keys deliberately omit this capability. */
+  readonly liveApprovalProvenance?: "session";
 }
+
+/** Request-local provenance consumed only by the generic executions resume
+ * handler. The fail-closed default protects direct handler composition and any
+ * identity provider that has not explicitly classified its credential. */
+export const RequestLiveApprovalProvenance = Context.Reference<"session" | "none">(
+  "@executor-js/api/RequestLiveApprovalProvenance",
+  { defaultValue: () => "none" },
+);
 
 /**
  * The single `AuthContext` every executor-API handler reads. The roles-bearing

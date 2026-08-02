@@ -46,6 +46,15 @@ export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, Bette
       return IdentityProvider.of({
         authenticate: (request) =>
           Effect.gen(function* () {
+            // A direct x-api-key request can resolve through Better Auth's
+            // enableSessionForAPIKeys path on this first lookup. Treat the mere
+            // presence of that credential as API-key provenance even if a
+            // cookie is also attached; ambiguous mixed credentials fail closed
+            // for live approval while remaining authenticated for ordinary API
+            // work.
+            let liveApprovalProvenance: "session" | undefined = request.headers.has("x-api-key")
+              ? undefined
+              : "session";
             let resolved = yield* Effect.promise(() =>
               auth.api.getSession({ headers: request.headers }),
             );
@@ -56,6 +65,7 @@ export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, Bette
                   try: () => auth.api.getSession({ headers: { "x-api-key": token } }),
                   catch: () => "api-key session lookup failed",
                 }).pipe(Effect.orElseSucceed(() => null));
+                if (resolved) liveApprovalProvenance = undefined;
               }
             }
             // No session resolved from any credential shape -> unauthenticated.
@@ -78,6 +88,7 @@ export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, Bette
                 .split(",")
                 .map((role) => role.trim())
                 .filter((role) => role.length > 0),
+              ...(liveApprovalProvenance ? { liveApprovalProvenance } : {}),
             };
           }),
       });

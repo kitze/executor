@@ -118,6 +118,7 @@ describe("protected JWT (device-login) auth", () => {
         name: null,
         avatarUrl: null,
         roles: [],
+        liveApprovalProvenance: "session",
       });
     }),
   );

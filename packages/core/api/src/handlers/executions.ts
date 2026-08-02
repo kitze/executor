@@ -3,11 +3,16 @@ import { Effect } from "effect";
 import { Schema } from "effect";
 
 import { ExecutorApi } from "../api";
-import { formatExecuteResult, formatPausedExecution } from "@executor-js/execution";
+import {
+  formatExecuteResult,
+  formatPausedExecution,
+  type ResumeResponse,
+} from "@executor-js/execution";
 import { resolveArtifactAction } from "@executor-js/host-mcp/artifact-action";
 import { TOOL_CALL_CONTRACT_MESSAGE } from "@executor-js/host-mcp/tool-call-code";
 import { ExecutionEngineService, ExecutorService } from "../services";
 import { capture, captureEngineError } from "@executor-js/api";
+import { RequestLiveApprovalProvenance } from "../server/identity";
 
 class ExecutionNotFoundError extends Schema.TaggedErrorClass<ExecutionNotFoundError>()(
   "ExecutionNotFoundError",
@@ -56,6 +61,20 @@ class ApprovalExpiredError extends Schema.TaggedErrorClass<ApprovalExpiredError>
 ) {
   override get message(): string {
     return "This approval expired. Trigger the action again.";
+  }
+}
+
+/** A bearer API key cannot stand in for the human/session authority required
+ * to release an opaque value into a sensitive sink. */
+class LiveApprovalForbiddenError extends Schema.TaggedErrorClass<LiveApprovalForbiddenError>()(
+  "LiveApprovalForbiddenError",
+  {
+    executionId: Schema.String,
+  },
+  { httpApiStatus: 403 },
+) {
+  override get message(): string {
+    return "Accepting this action requires an authenticated browser or user session.";
   }
 }
 
@@ -159,14 +178,32 @@ export const ExecutionsHandlers = HttpApiBuilder.group(ExecutorApi, "executions"
       capture(
         Effect.gen(function* () {
           const engine = yield* ExecutionEngineService;
-          const granted = yield* engine.grantLiveApproval(path.executionId, {
-            action: payload.action,
-            content: payload.content as Record<string, unknown> | undefined,
-          });
-          if (!granted) {
+          const paused = yield* engine.getPausedExecution(path.executionId);
+          if (!paused) {
             return yield* new ApprovalExpiredError({ executionId: path.executionId });
           }
-          const result = yield* captureEngineError(engine.resume(path.executionId, granted));
+
+          const response = {
+            action: payload.action,
+            content: payload.content as Record<string, unknown> | undefined,
+          };
+          let responseToResume: ResumeResponse = response;
+
+          if (payload.action === "accept" && paused.requiresLiveApproval === true) {
+            const provenance = yield* RequestLiveApprovalProvenance;
+            if (provenance !== "session") {
+              return yield* new LiveApprovalForbiddenError({ executionId: path.executionId });
+            }
+            const granted = yield* engine.grantLiveApproval(path.executionId, response);
+            if (!granted) {
+              return yield* new ApprovalExpiredError({ executionId: path.executionId });
+            }
+            responseToResume = granted;
+          }
+
+          const result = yield* captureEngineError(
+            engine.resume(path.executionId, responseToResume),
+          );
 
           // No live pause means the process/human approval window changed. It
           // is intentionally non-replayable: start a fresh execution so every

@@ -174,14 +174,21 @@ const getApplicationOperation = () => ({
   },
 });
 
-const coolifySpec = (baseUrl: string) =>
+const coolifySpec = (
+  baseUrl: string,
+  createResponseSchema: Record<string, unknown> = environmentVariableResponseSchema(),
+) =>
   JSON.stringify({
     openapi: "3.0.0",
     info: { title: "Coolify API", version: "1.0.0" },
     servers: [{ url: baseUrl }],
     paths: {
       "/applications/{uuid}/envs": {
-        post: operation("createEnvByApplicationUuid", environmentVariableRequestSchema()),
+        post: operation(
+          "createEnvByApplicationUuid",
+          environmentVariableRequestSchema(),
+          createResponseSchema,
+        ),
         patch: operation(
           "updateEnvByApplicationUuid",
           environmentVariableRequestSchema(),
@@ -278,6 +285,9 @@ const serveCoolifyFixture = () =>
         if (method === "GET") {
           return HttpServerResponse.jsonUnsafe(applicationSecretCanaries);
         }
+        if (method === "POST" && path.endsWith("/envs")) {
+          return HttpServerResponse.jsonUnsafe({ key: "ENV", ...environmentSecretCanaries });
+        }
         if (method === "PATCH" && path.endsWith("/envs/bulk")) {
           return HttpServerResponse.jsonUnsafe([{ key: "ENV", ...environmentSecretCanaries }]);
         }
@@ -344,6 +354,22 @@ describe("Coolify application environment variable schema compatibility", () => 
           "/manual_webhook_secret_gitea",
           "/manual_webhook_secret_github",
           "/manual_webhook_secret_gitlab",
+        ]);
+
+        const freshEnvironmentCreate = fresh.find(
+          (candidate) => candidate.name === "applications.createEnvByApplicationUuid",
+        );
+        const freshEnvironmentCreateAnnotations = freshEnvironmentCreate?.annotations as {
+          readonly sensitiveInputPaths?: readonly string[];
+          readonly sensitiveOutputPaths?: readonly string[];
+        };
+        expect(freshEnvironmentCreateAnnotations.sensitiveInputPaths).toEqual([
+          "/body/value",
+          "/input/value",
+        ]);
+        expect(freshEnvironmentCreateAnnotations.sensitiveOutputPaths).toEqual([
+          "/real_value",
+          "/value",
         ]);
 
         const freshEnvironmentList = fresh.find(
@@ -457,7 +483,7 @@ describe("Coolify application environment variable schema compatibility", () => 
         expect(nonTargetPersistedSchema).not.toContain('"is_runtime"');
         expect(nonTargetPersistedSchema).not.toContain('"is_buildtime"');
 
-        yield* executor.execute(
+        const createResult = (yield* executor.execute(
           connection.address("applications.createEnvByApplicationUuid"),
           {
             uuid: "app-1",
@@ -468,8 +494,13 @@ describe("Coolify application environment variable schema compatibility", () => 
               is_buildtime: false,
             },
           },
-          accepted,
-        );
+          { ...accepted, opaqueValueHandoff: makeOpaqueValueHandoff() },
+        )) as { readonly ok?: boolean; readonly data?: Record<string, unknown> };
+        expect(createResult.ok).toBe(true);
+        expect(JSON.stringify(createResult)).not.toContain(environmentSecretCanaries.value);
+        expect(JSON.stringify(createResult)).not.toContain(environmentSecretCanaries.real_value);
+        expect(isOpaqueValueReference(createResult.data?.value)).toBe(true);
+        expect(isOpaqueValueReference(createResult.data?.real_value)).toBe(true);
 
         // A generic application read is a source, never plaintext sandbox
         // data.  The executor seals the exact upstream fields into opaque
@@ -646,6 +677,25 @@ describe("Coolify application environment variable schema compatibility", () => 
         });
       }),
     ),
+  );
+
+  it.effect(
+    "does not infer sensitive create outputs without the Coolify response fingerprint",
+    () =>
+      Effect.gen(function* () {
+        const compiled = yield* compileOpenApiSpec(
+          coolifySpec("https://coolify.fixture.invalid", {
+            type: "object",
+            properties: { id: { type: "string" }, message: { type: "string" } },
+          }),
+        );
+        const create = compiled.definitions.find(
+          (candidate) => candidate.operation.operationId === "createEnvByApplicationUuid",
+        );
+        expect(create).toBeDefined();
+        expect(create?.operation.sensitiveInputPaths).toEqual(["/body/value", "/input/value"]);
+        expect(create?.operation.sensitiveOutputPaths).toBeUndefined();
+      }),
   );
 
   it.effect("fails closed for a legacy Coolify environment binding without inventing sinks", () =>
