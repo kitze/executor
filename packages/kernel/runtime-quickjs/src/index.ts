@@ -182,8 +182,10 @@ const buildExecutionSource = (code: string): string => {
     '"use strict";',
     "const __invokeTool = __executor_invokeTool;",
     "const __log = __executor_log;",
+    "const crypto = Object.freeze({ randomUUID: __executor_randomUUID });",
     "try { delete globalThis.__executor_invokeTool; } catch {}",
     "try { delete globalThis.__executor_log; } catch {}",
+    "try { delete globalThis.__executor_randomUUID; } catch {}",
     "const __formatLogArg = (value) => {",
     "  if (typeof value === 'string') return value;",
     "  try {",
@@ -299,6 +301,11 @@ const createLogBridge = (context: QuickJSContext, logs: string[]): QuickJSHandle
     logs.push(`[${level}] ${line}`);
     return context.undefined;
   });
+
+const createRandomUuidBridge = (context: QuickJSContext): QuickJSHandle =>
+  context.newFunction("__executor_randomUUID", () =>
+    context.newString(globalThis.crypto.randomUUID()),
+  );
 
 type RunPromise = <A, E>(effect: Effect.Effect<A, E>) => Promise<A>;
 
@@ -458,6 +465,10 @@ const evaluateInQuickJs = async (
       const logBridge = createLogBridge(context, logs);
       context.setProp(context.global, "__executor_log", logBridge);
       logBridge.dispose();
+
+      const randomUuidBridge = createRandomUuidBridge(context);
+      context.setProp(context.global, "__executor_randomUUID", randomUuidBridge);
+      randomUuidBridge.dispose();
 
       const toolBridge = createToolBridge(
         context,

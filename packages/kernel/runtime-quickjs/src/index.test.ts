@@ -35,6 +35,38 @@ describe("quickjs executor", () => {
     }),
   );
 
+  it.effect("exposes only crypto.randomUUID and removes the raw host bridge", () =>
+    Effect.gen(function* () {
+      const result = yield* executor.execute(
+        `
+        const values = Array.from({ length: 32 }, () => crypto.randomUUID());
+        return {
+          values,
+          uniqueCount: new Set(values).size,
+          cryptoKeys: Object.keys(crypto),
+          bridgeType: typeof globalThis.__executor_randomUUID,
+        };
+        `,
+        makeTestInvoker({}),
+      );
+
+      expect(result.error).toBeUndefined();
+      expect(result.result).toMatchObject({
+        uniqueCount: 32,
+        cryptoKeys: ["randomUUID"],
+        bridgeType: "undefined",
+      });
+
+      const values = (result.result as { readonly values: ReadonlyArray<string> }).values;
+      expect(values).toHaveLength(32);
+      for (const value of values) {
+        expect(value).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        );
+      }
+    }),
+  );
+
   it.effect("accumulates helper output separately from returned data", () =>
     Effect.gen(function* () {
       const result = yield* executor.execute(
