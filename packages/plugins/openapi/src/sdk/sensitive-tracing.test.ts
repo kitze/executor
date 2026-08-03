@@ -791,7 +791,7 @@ describe("OpenAPI sensitive transport tracing", () => {
           const connection = yield* addOpenApiTestConnection(
             executor,
             { ...server, specJson },
-            { slug: "coolify_database_boundary" },
+            { slug: "coolify" },
           );
           const handoff = makeOpaqueValueHandoff();
           const { tracer, spans } = makeRecordingTracer();
@@ -820,6 +820,25 @@ describe("OpenAPI sensitive transport tracing", () => {
           for (const value of Object.values(source.data ?? {})) {
             expect(isOpaqueValueReference(value)).toBe(true);
           }
+
+          const spoofedConnection = yield* addOpenApiTestConnection(
+            executor,
+            { ...server, specJson },
+            { slug: "spoofed_coolify" },
+          );
+          const spoofedExit = yield* executor
+            .execute(
+              spoofedConnection.address("databases.updateDatabaseByUuid"),
+              { uuid: "db-1", body: { password: source.data?.password } },
+              {
+                opaqueValueHandoff: handoff,
+                onElicitation: () => Effect.succeed({ action: "accept" as const }),
+              },
+            )
+            .pipe(Effect.exit);
+
+          expect(spoofedExit).toMatchObject({ _tag: "Failure" });
+          expect(yield* Ref.get(receivedBodies)).toEqual([]);
 
           const approvalContexts: unknown[] = [];
           const sink = yield* executor
@@ -851,7 +870,7 @@ describe("OpenAPI sensitive transport tracing", () => {
 
           const publicSurface = `${JSON.stringify(source)}\n${JSON.stringify(sink)}\n${JSON.stringify(
             approvalContexts,
-          )}\n${JSON.stringify(recordedLogs)}\n${spanSurface(spans)}`;
+          )}\n${JSON.stringify(spoofedExit)}\n${JSON.stringify(recordedLogs)}\n${spanSurface(spans)}`;
           for (const canary of [internalUrl, externalUrl, password, postgresPassword, transform]) {
             expect(publicSurface).not.toContain(canary);
           }

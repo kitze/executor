@@ -471,6 +471,16 @@ const inspectOpaqueInputs = (
           "This opaque sensitive value is not available to this execution.",
         );
       }
+      if (entry.source.integration !== context.integration) {
+        // A tenant-authored integration may imitate another integration's
+        // operation/schema fingerprint. Keep the capability bound to the
+        // integration that minted it so the imitation cannot route a real
+        // source value into its own declared sink.
+        // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: cross-integration capability use is rejected before validation or resolution reads the source value
+        throw new OpaqueValueHandoffError(
+          "This opaque sensitive value is not available to this integration.",
+        );
+      }
       if (entry.expiresAt <= now()) {
         entries.delete(current.id);
         // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: expiry rejects before the source value is read
