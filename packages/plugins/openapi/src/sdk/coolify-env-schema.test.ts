@@ -28,6 +28,7 @@ import {
   coolifyDatabaseUpdateSensitiveFields,
   isCoolifyDatabaseResponseSchema,
   isCoolifyDatabaseUpdateRequestSchema,
+  isCoolifyMisdeclaredDatabaseResponseSchema,
   isVerifiedCoolifyDatabaseReadOperation,
   isVerifiedCoolifyDatabaseUpdateOperation,
 } from "./coolify-environment";
@@ -439,6 +440,8 @@ describe("Coolify application environment variable schema compatibility", () => 
     expect(isVerifiedCoolifyDatabaseReadOperation(readIdentity)).toBe(true);
     expect(isVerifiedCoolifyDatabaseUpdateOperation(updateIdentity)).toBe(true);
     expect(isCoolifyDatabaseResponseSchema(responseSchema)).toBe(true);
+    expect(isCoolifyMisdeclaredDatabaseResponseSchema({ type: "string" })).toBe(true);
+    expect(isCoolifyMisdeclaredDatabaseResponseSchema({ type: "object" })).toBe(false);
     expect(coolifyDatabaseResponseSensitiveFields(responseSchema)).toEqual([
       "internal_db_url",
       "external_db_url",

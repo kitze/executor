@@ -3,6 +3,7 @@ import type { SensitiveOutputSafeScalar } from "@executor-js/sdk/core";
 
 import { planToolPaths, type OperationPathInput, type PlannedToolPath } from "./definitions";
 import {
+  COOLIFY_MISDECLARED_DATABASE_SOURCE_FIELDS,
   coolifyDatabaseResponseSensitiveFields,
   coolifyDatabaseUpdateSensitiveFields,
   coolifyApplicationResponseSafeFields,
@@ -11,6 +12,7 @@ import {
   isCoolifyApplicationListResponseSchema,
   isCoolifyApplicationResponseSchema,
   isCoolifyDatabaseResponseSchema,
+  isCoolifyMisdeclaredDatabaseResponseSchema,
   isCoolifyDatabaseUpdateRequestSchema,
   isCoolifyEnvironmentListResponseSchema,
   isCoolifyEnvironmentWriteResponseSchema,
@@ -605,12 +607,20 @@ const addCoolifySensitivity = (
     }
   }
 
-  if (
-    isVerifiedCoolifyDatabaseReadOperation(input.identity) &&
-    input.responseSchemas.some(isCoolifyDatabaseResponseSchema)
-  ) {
-    for (const schema of input.responseSchemas) {
-      for (const field of coolifyDatabaseResponseSensitiveFields(schema)) {
+  if (isVerifiedCoolifyDatabaseReadOperation(input.identity)) {
+    if (input.responseSchemas.some(isCoolifyDatabaseResponseSchema)) {
+      for (const schema of input.responseSchemas) {
+        for (const field of coolifyDatabaseResponseSensitiveFields(schema)) {
+          sensitiveOutputPaths.add(`/${field}`);
+        }
+      }
+    } else if (input.responseSchemas.some(isCoolifyMisdeclaredDatabaseResponseSchema)) {
+      // The declared scalar cannot describe the runtime object's structure.
+      // Replace any schema-derived projection with this exact allowlist so no
+      // sibling, identifier, or transform can cross the opaque boundary.
+      sensitiveOutputPaths.clear();
+      sensitiveOutputSafeScalars.clear();
+      for (const field of COOLIFY_MISDECLARED_DATABASE_SOURCE_FIELDS) {
         sensitiveOutputPaths.add(`/${field}`);
       }
     }
