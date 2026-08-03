@@ -88,6 +88,17 @@ const DATABASE_SOURCE_FIELDS = [
   ...DATABASE_PASSWORD_FIELDS,
 ] as const;
 
+// Coolify's live getDatabaseByUuid response is currently declared as a string
+// even though the JSON body is a database object. Keep this compatibility
+// projection smaller than the correctly declared object-schema path: these are
+// the only credential leaves needed by recovery flows.
+export const COOLIFY_MISDECLARED_DATABASE_SOURCE_FIELDS = [
+  "internal_db_url",
+  "external_db_url",
+  "password",
+  "postgres_password",
+] as const;
+
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -315,6 +326,9 @@ export const isCoolifyDatabaseResponseSchema = (schema: unknown): boolean => {
     fields.some((field) => DATABASE_PASSWORD_FIELD_SET.has(field))
   );
 };
+
+export const isCoolifyMisdeclaredDatabaseResponseSchema = (schema: unknown): boolean =>
+  asRecord(schema)?.type === "string";
 
 export const coolifyDatabaseResponseSensitiveFields = (schema: unknown): readonly string[] =>
   isCoolifyDatabaseResponseSchema(schema)

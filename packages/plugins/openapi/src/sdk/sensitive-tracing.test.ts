@@ -673,7 +673,7 @@ describe("OpenAPI sensitive transport tracing", () => {
   );
 
   it.effect(
-    "keeps verified Coolify database credentials inside opaque source and sink boundaries",
+    "projects a persisted Coolify string-schema database read into exact opaque leaves",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -689,6 +689,8 @@ describe("OpenAPI sensitive transport tracing", () => {
             request.method === "GET"
               ? Effect.succeed(
                   HttpServerResponse.jsonUnsafe({
+                    uuid: "db-uuid-sibling-canary",
+                    name: "db-name-sibling-canary",
                     internal_db_url: internalUrl,
                     external_db_url: externalUrl,
                     password,
@@ -730,16 +732,11 @@ describe("OpenAPI sensitive transport tracing", () => {
                       description: "OK",
                       content: {
                         "application/json": {
-                          schema: {
-                            type: "object",
-                            properties: {
-                              internal_db_url: { type: "string" },
-                              external_db_url: { type: "string" },
-                              password: { type: "string" },
-                              postgres_password: { type: "string" },
-                              transformed: { type: "string" },
-                            },
-                          },
+                          // This mirrors the currently published live Coolify
+                          // schema even though the runtime JSON body is an
+                          // object. The persisted v2 binding must retain the
+                          // exact compatibility projection.
+                          schema: { type: "string" },
                         },
                       },
                     },
