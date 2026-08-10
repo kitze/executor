@@ -412,6 +412,7 @@ export {
   connectionAddress,
   toolAddress,
 } from "./executor";
+export { coolifySafeProjectToolResult } from "./coolify-safe-projection";
 
 // CLI / runtime config.
 export {

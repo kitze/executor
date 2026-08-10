@@ -269,6 +269,36 @@ const errorPlugin = makeTestPlugin({
   ],
 });
 
+const COOLIFY_VALIDATION_MARKER = "coolify-tool-invoker-secret";
+
+const coolifyConfigurationPlugin = makeTestPlugin({
+  pluginId: "coolify-configuration-test",
+  integration: "coolify",
+  tools: [
+    {
+      name: "applications.updateApplicationByUuid",
+      description: "Update an application",
+      inputJsonSchema: EmptyInputJson,
+      validator: EmptyValidator,
+      handler: () =>
+        Effect.succeed(
+          ToolResult.fail({
+            code: "upstream_http_error",
+            message: `validator echoed ${COOLIFY_VALIDATION_MARKER}`,
+            status: 422,
+            details: {
+              errors: {
+                is_raw_compose_deployment_enabled:
+                  "is_raw_compose_deployment_enabled must be boolean",
+              },
+              secret: COOLIFY_VALIDATION_MARKER,
+            },
+          }),
+        ),
+    },
+  ],
+});
+
 class UnmarkedTestError extends Data.TaggedError("UnmarkedTestError")<{
   readonly message: string;
 }> {}
@@ -1113,6 +1143,41 @@ describe("tool discovery", () => {
           message: 'Field with name "DisplayName" does not exist',
         },
       });
+    }),
+  );
+
+  it.effect("projects a Coolify application-update 422 before sandbox delivery", () =>
+    Effect.gen(function* () {
+      const executor = yield* makeExecutorWith([coolifyConfigurationPlugin] as const);
+      yield* provision(executor as never, [
+        { pluginId: "coolify-configuration-test", integration: "coolify" },
+      ]);
+      const invoker = makeExecutorToolInvoker(executor, {
+        invokeOptions: { onElicitation: acceptAll },
+      });
+
+      const result = yield* invoker.invoke({
+        path: "coolify.org.main.applications.updateApplicationByUuid",
+        args: {},
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: {
+          code: "UPSTREAM_VALIDATION_FAILED",
+          message: "Coolify rejected the application configuration request.",
+          status: 422,
+          details: {
+            validationIssues: [
+              {
+                field: "is_raw_compose_deployment_enabled",
+                reason: "must_be_boolean",
+              },
+            ],
+          },
+        },
+      });
+      expect(JSON.stringify(result)).not.toContain(COOLIFY_VALIDATION_MARKER);
     }),
   );
 

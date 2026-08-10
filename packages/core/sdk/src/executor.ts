@@ -170,6 +170,7 @@ import {
 import { connectionIdentifier } from "./connection-name-identifier";
 import { annotateToolResultOutcome, isToolResult } from "./tool-result";
 import { isUnauthorizedToolFailure } from "./auth-tool-failure";
+import { coolifySafeProjectToolResult } from "./coolify-safe-projection";
 
 const PLUGIN_STORAGE_DELETE_KEY_BATCH_SIZE = 90;
 const PLUGIN_STORAGE_CREATE_ROW_BATCH_SIZE = 90;
@@ -4418,6 +4419,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           consumedOpaqueInput: boolean,
         ): unknown => {
           if (!opaqueValues) return value;
+          const projectedCoolifyResult = coolifySafeProjectToolResult(String(address), value);
+          if (projectedCoolifyResult !== undefined) {
+            return opaqueValues.redact(projectedCoolifyResult);
+          }
           const hasSensitiveInput = (annotations?.sensitiveInputPaths?.length ?? 0) > 0;
           if (isToolResult(value)) {
             const hasSensitiveOutput =

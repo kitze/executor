@@ -11,6 +11,7 @@ import type {
 import {
   annotateToolResultOutcome,
   authToolFailure,
+  coolifySafeProjectToolResult,
   isUserActionableError,
   isToolResult,
   ToolResult,
@@ -372,11 +373,13 @@ export const makeExecutorToolInvoker = (
     // Expected failures resolve through the success channel, so without the
     // outcome annotation the dispatch span reads as healthy even when the
     // caller hit an upstream error or auth wall.
-    yield* annotateToolResultOutcome(result);
-    if (isToolResult(result)) {
-      return result;
+    const projectedCoolifyResult = coolifySafeProjectToolResult(path, result);
+    const publicResult = projectedCoolifyResult ?? result;
+    yield* annotateToolResultOutcome(publicResult);
+    if (isToolResult(publicResult)) {
+      return publicResult;
     }
-    return { ok: true, data: result };
+    return { ok: true, data: publicResult };
   }),
 });
 

@@ -12,11 +12,13 @@ import {
   ToolAddress,
   ToolName,
 } from "./ids";
-import { definePlugin } from "./plugin";
+import { definePlugin, tool } from "./plugin";
 import type { CredentialProvider } from "./provider";
 import { IntegrationDetectionResult } from "./types";
 import { makeTestExecutor, memoryCredentialsPlugin } from "./testing";
 import { serveOAuthTestServer } from "./testing/oauth-test-server";
+import { makeOpaqueValueHandoff } from "./opaque-value-handoff";
+import { ToolResult } from "./tool-result";
 
 // removed: v1 secret browser-handoff, source.configure, case-insensitive tool-id
 // resolution, secrets/sources/scope-stack. The integration coverage below is
@@ -139,6 +141,72 @@ const diagnosticsPlugin = definePlugin(() => ({
         config: {},
       }),
   }),
+}))();
+
+const COOLIFY_SECRET_MARKER = "coolify-sdk-projection-secret";
+
+const coolifyProjectionPlugin = definePlugin(() => ({
+  id: "coolify-projection-test" as const,
+  storage: () => ({}),
+  staticIntegrations: () => [
+    {
+      id: "coolify",
+      kind: "control" as const,
+      name: "Coolify projection test",
+      tools: [
+        tool({
+          name: "applications.getApplicationByUuid",
+          description: "Get an application",
+          annotations: { sensitiveOutputPaths: [""] },
+          execute: () =>
+            Effect.succeed(
+              ToolResult.ok({
+                uuid: "app_123",
+                git_repository: `https://fixture:${COOLIFY_SECRET_MARKER}@example.invalid/kitze/glink2.git`,
+                settings: {
+                  is_preserve_repository_enabled: true,
+                  is_raw_compose_deployment_enabled: true,
+                  inject_build_args_to_dockerfile: true,
+                  password: COOLIFY_SECRET_MARKER,
+                },
+                password: COOLIFY_SECRET_MARKER,
+              }),
+            ),
+        }),
+        tool({
+          name: "applications.updateApplicationByUuid",
+          description: "Update an application",
+          annotations: { sensitiveOutputPaths: [""] },
+          execute: () =>
+            Effect.succeed(
+              ToolResult.fail({
+                code: "upstream_http_error",
+                message: COOLIFY_SECRET_MARKER,
+                status: 422,
+                details: {
+                  is_raw_compose_deployment_enabled: "must be boolean",
+                  secret: COOLIFY_SECRET_MARKER,
+                },
+              }),
+            ),
+        }),
+        tool({
+          name: "applications.restartApplicationByUuid",
+          description: "Restart an application",
+          annotations: { sensitiveOutputPaths: [""] },
+          execute: () =>
+            Effect.succeed(
+              ToolResult.fail({
+                code: "upstream_http_error",
+                message: COOLIFY_SECRET_MARKER,
+                status: 422,
+                details: { is_raw_compose_deployment_enabled: COOLIFY_SECRET_MARKER },
+              }),
+            ),
+        }),
+      ],
+    },
+  ],
 }))();
 
 const detector = (id: string, confidence: IntegrationDetectionResult["confidence"]) =>
@@ -628,6 +696,72 @@ describe("createExecutor", () => {
 
       const out = yield* executor.execute(addr("run"), {});
       expect(out).toEqual({ ran: "run" });
+    }),
+  );
+
+  it.effect("projects only allowlisted Coolify evidence before opaque transport masking", () =>
+    Effect.gen(function* () {
+      const executor = yield* makeTestExecutor({
+        plugins: [coolifyProjectionPlugin] as const,
+      });
+      const options = { opaqueValueHandoff: makeOpaqueValueHandoff() };
+
+      const application = yield* executor.execute(
+        ToolAddress.make("coolify.applications.getApplicationByUuid"),
+        {},
+        options,
+      );
+      expect(application).toEqual({
+        ok: true,
+        data: {
+          uuid: "app_123",
+          git_repository: "[redacted]",
+          settings: {
+            is_preserve_repository_enabled: true,
+            is_raw_compose_deployment_enabled: true,
+            inject_build_args_to_dockerfile: true,
+          },
+        },
+      });
+
+      const validation = yield* executor.execute(
+        ToolAddress.make("coolify.applications.updateApplicationByUuid"),
+        {},
+        options,
+      );
+      expect(validation).toEqual({
+        ok: false,
+        error: {
+          code: "UPSTREAM_VALIDATION_FAILED",
+          message: "Coolify rejected the application configuration request.",
+          status: 422,
+          details: {
+            validationIssues: [
+              {
+                field: "is_raw_compose_deployment_enabled",
+                reason: "must_be_boolean",
+              },
+            ],
+          },
+        },
+      });
+
+      const unrelated = yield* executor.execute(
+        ToolAddress.make("coolify.applications.restartApplicationByUuid"),
+        {},
+        options,
+      );
+      expect(unrelated).toEqual({
+        ok: false,
+        error: {
+          code: "UPSTREAM_REQUEST_FAILED",
+          message: "Upstream request failed.",
+          status: 422,
+        },
+      });
+      for (const result of [application, validation, unrelated]) {
+        expect(JSON.stringify(result)).not.toContain(COOLIFY_SECRET_MARKER);
+      }
     }),
   );
 
