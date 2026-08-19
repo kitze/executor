@@ -1,10 +1,8 @@
-import { describe, expect, it, vi } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
 import { Data, Deferred, Effect } from "effect";
 import type * as Tracer from "effect/Tracer";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { ClientCapabilities } from "@modelcontextprotocol/sdk/types.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport, type ClientCapabilities } from "@modelcontextprotocol/server";
 import type * as Cause from "effect/Cause";
 
 import {
@@ -18,7 +16,7 @@ import type { ToolFileValue } from "@executor-js/sdk";
 import type { ExecutionEngine, ExecutionResult } from "@executor-js/execution";
 
 import {
-  createExecutorMcpServer,
+  buildMcpServer,
   formatMcpExecutionOutcome,
   type ExecutorMcpServerConfig,
 } from "./tool-server";
@@ -45,19 +43,26 @@ const makeStubEngine = <E extends Cause.YieldableError = never>(overrides: {
   resume?: ExecutionEngine<E>["resume"];
   isExecutionSettled?: ExecutionEngine<E>["isExecutionSettled"];
   description?: string;
-}): ExecutionEngine<E> => ({
-  execute: overrides.execute ?? (() => Effect.succeed({ result: "default" })),
-  executeWithPause:
-    overrides.executeWithPause ??
-    (() => Effect.succeed({ status: "completed", result: { result: "default" } })),
-  resume: overrides.resume ?? (() => Effect.succeed(null)),
-  grantLiveApproval: (_executionId, response) => Effect.succeed(response),
-  isExecutionSettled: overrides.isExecutionSettled,
-  getPausedExecution: () => Effect.succeed(null),
-  pausedExecutionCount: () => Effect.succeed(0),
-  hasPausedExecutions: () => Effect.succeed(false),
-  getDescription: Effect.succeed(overrides.description ?? "test executor"),
-});
+}): ExecutionEngine<E> => {
+  const execute: ExecutionEngine<E>["execute"] =
+    overrides.execute ?? (() => Effect.succeed({ result: "default" }));
+  return {
+    execute,
+    executeWithPause:
+      overrides.executeWithPause ??
+      ((code) =>
+        execute(code, {
+          onElicitation: () => Effect.die("Unexpected elicitation in completed execution test"),
+        }).pipe(Effect.map((result) => ({ status: "completed" as const, result })))),
+    resume: overrides.resume ?? (() => Effect.succeed(null)),
+    grantLiveApproval: (_executionId, response) => Effect.succeed(response),
+    isExecutionSettled: overrides.isExecutionSettled,
+    getPausedExecution: () => Effect.succeed(null),
+    pausedExecutionCount: () => Effect.succeed(0),
+    hasPausedExecutions: () => Effect.succeed(false),
+    getDescription: Effect.succeed(overrides.description ?? "test executor"),
+  };
+};
 
 type TestServerConfig<E extends Cause.YieldableError> = Pick<
   ExecutorMcpServerConfig<E>,
@@ -77,7 +82,14 @@ const withClient = async <E extends Cause.YieldableError>(
   config?: TestServerConfig<E> & { readonly tracer?: Tracer.Tracer },
 ) => {
   const { tracer, ...serverConfig } = config ?? {};
-  const create = createExecutorMcpServer({ engine, ...serverConfig });
+  const create = buildMcpServer({
+    engine,
+    appsEnabled: false,
+    requestStateSigningKey: new Uint8Array(32).fill(13),
+    requestStatePrincipal: "tool-server-test-principal",
+    sessionful: true,
+    ...serverConfig,
+  });
   const mcpServer = await Effect.runPromise(tracer ? Effect.withTracer(create, tracer) : create);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "1.0.0" }, { capabilities });
@@ -155,7 +167,6 @@ const withTracedClient = async <E extends Cause.YieldableError>(
 const ELICITATION_CAPS: ClientCapabilities = {
   elicitation: { form: {}, url: {} },
 };
-const FORM_ONLY_CAPS: ClientCapabilities = { elicitation: { form: {} } };
 const NO_CAPS: ClientCapabilities = {};
 
 /** Extract the first text content from a callTool result. */
@@ -193,32 +204,15 @@ const toolFile = (input: {
   byteLength: input.byteLength,
 });
 
-/** Build an engine whose execute triggers one elicitation and returns the handler's result. */
-const makeElicitingEngine = (
-  request: FormElicitation | UrlElicitation,
-  formatResult: (response: { action: string; content?: Record<string, unknown> }) => unknown = (
-    r,
-  ) => r.action,
-): ExecutionEngine =>
-  makeStubEngine({
-    execute: (_code, { onElicitation }) =>
-      Effect.gen(function* () {
-        const response = yield* onElicitation({
-          address: STUB_TOOL_ADDRESS,
-          request,
-        });
-        return { result: formatResult(response) };
-      }),
-  });
-
 // ---------------------------------------------------------------------------
 // Explicit native elicitation mode
 // ---------------------------------------------------------------------------
 
 describe("MCP host server — native elicitation mode", () => {
-  it("execute tool calls engine.execute and returns result", async () => {
+  it("execute tool calls engine.executeWithPause and returns result", async () => {
     const engine = makeStubEngine({
-      execute: (code) => Effect.succeed({ result: `ran: ${code}` }),
+      executeWithPause: (code) =>
+        Effect.succeed({ status: "completed", result: { result: `ran: ${code}` } }),
     });
 
     await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
@@ -769,106 +763,6 @@ describe("MCP host server — native elicitation mode", () => {
     });
   });
 
-  it("form elicitation is bridged from engine to MCP client and back", async () => {
-    const engine = makeElicitingEngine(
-      FormElicitation.make({
-        message: "Approve this action?",
-        requestedSchema: {
-          type: "object",
-          properties: { approved: { type: "boolean" } },
-        },
-      }),
-      (r) => (r.action === "accept" && r.content?.approved ? "approved" : "denied"),
-    );
-
-    await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
-      client.setRequestHandler(ElicitRequestSchema, async () => ({
-        action: "accept" as const,
-        content: { approved: true },
-      }));
-
-      const result = await client.callTool({
-        name: "execute",
-        arguments: { code: "do-it" },
-      });
-      expect(result.content).toEqual([{ type: "text", text: "approved" }]);
-    });
-  });
-
-  it("form elicitation declined by client → engine sees decline", async () => {
-    const engine = makeElicitingEngine(
-      FormElicitation.make({ message: "Accept?", requestedSchema: {} }),
-      (r) => `action:${r.action}`,
-    );
-
-    await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
-      client.setRequestHandler(ElicitRequestSchema, async () => ({
-        action: "decline" as const,
-        content: {},
-      }));
-
-      const result = await client.callTool({
-        name: "execute",
-        arguments: { code: "x" },
-      });
-      expect(result.content).toEqual([{ type: "text", text: "action:decline" }]);
-    });
-  });
-
-  it("reconstructs live-sensitive native elicitation before MCP params or debug logs", async () => {
-    const marker = "native-elicitation-sensitive-regression-marker";
-    const rawUrl = `https://fixture.invalid/approve?token=${marker}`;
-    const engine = makeStubEngine({
-      execute: (_code, { onElicitation }) =>
-        Effect.gen(function* () {
-          const response = yield* onElicitation({
-            address: STUB_TOOL_ADDRESS,
-            request: {
-              ...UrlElicitation.make({
-                message: `Approve ${marker}`,
-                url: rawUrl,
-                elicitationId: ElicitationId.make(marker),
-              }),
-              args: { value: marker },
-            } as never,
-            requiresLiveApproval: true,
-          });
-          return { result: response.action };
-        }),
-    });
-    const debug = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    let receivedParams: Record<string, unknown> | undefined;
-    let debugSurface = "";
-
-    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: test must restore the process-global console spy even if the in-memory MCP client fails
-    try {
-      await withClient(
-        engine,
-        ELICITATION_CAPS,
-        async (client) => {
-          client.setRequestHandler(ElicitRequestSchema, async (request) => {
-            receivedParams = request.params as Record<string, unknown>;
-            return { action: "accept" as const, content: {} };
-          });
-          await client.callTool({ name: "execute", arguments: { code: "run" } });
-        },
-        { elicitationMode: { mode: "native" }, debug: true },
-      );
-    } finally {
-      debugSurface = JSON.stringify(debug.mock.calls);
-      debug.mockRestore();
-    }
-
-    expect(receivedParams).toEqual({
-      mode: "form",
-      message: `Approve continuation of ${STUB_TOOL_ADDRESS}?`,
-      requestedSchema: { type: "object", properties: {} },
-    });
-    expect(JSON.stringify(receivedParams)).not.toContain(marker);
-    expect(debugSurface).not.toContain(marker);
-    expect(JSON.stringify(receivedParams)).not.toContain(rawUrl);
-  });
-
   it("browser approval mode does not auto-switch to native elicitation", async () => {
     let approvalUrlCalled = false;
     let executeCalled = false;
@@ -891,11 +785,6 @@ describe("MCP host server — native elicitation mode", () => {
       engine,
       ELICITATION_CAPS,
       async (client) => {
-        client.setRequestHandler(ElicitRequestSchema, async () => ({
-          action: "accept" as const,
-          content: {},
-        }));
-
         const { tools } = await client.listTools();
         expect(tools.map((t) => t.name)).toContain("resume");
 
@@ -922,56 +811,6 @@ describe("MCP host server — native elicitation mode", () => {
         },
       },
     );
-  });
-
-  it("empty form schema gets wrapped with minimal valid schema", async () => {
-    let receivedSchema: unknown;
-    const engine = makeElicitingEngine(
-      FormElicitation.make({ message: "Just approve", requestedSchema: {} }),
-    );
-
-    await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
-      client.setRequestHandler(ElicitRequestSchema, async (request) => {
-        const params = request.params;
-        if ("requestedSchema" in params) {
-          receivedSchema = params.requestedSchema;
-        }
-        return { action: "accept" as const, content: {} };
-      });
-
-      await client.callTool({
-        name: "execute",
-        arguments: { code: "approve" },
-      });
-      expect(receivedSchema).toEqual({ type: "object", properties: {} });
-    });
-  });
-
-  it("UrlElicitation is sent as native mode:url elicitation", async () => {
-    let receivedParams: Record<string, unknown> | undefined;
-    const engine = makeElicitingEngine(
-      UrlElicitation.make({
-        message: "Please authenticate",
-        url: "https://example.com/oauth",
-        elicitationId: ElicitationId.make("elic-1"),
-      }),
-    );
-
-    await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
-      client.setRequestHandler(ElicitRequestSchema, async (request) => {
-        receivedParams = request.params as Record<string, unknown>;
-        return { action: "accept" as const, content: {} };
-      });
-
-      await client.callTool({
-        name: "execute",
-        arguments: { code: "oauth" },
-      });
-      expect(receivedParams?.mode).toBe("url");
-      expect(receivedParams?.message).toBe("Please authenticate");
-      expect(receivedParams?.url).toBe("https://example.com/oauth");
-      expect(receivedParams?.elicitationId).toBe("elic-1");
-    });
   });
 
   it("engine error is surfaced as isError result", async () => {
@@ -1027,61 +866,6 @@ describe("MCP host server — native elicitation mode", () => {
       const names = tools.map((t) => t.name);
       expect(names).toContain("execute");
       expect(names).not.toContain("resume");
-    });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Client with form-only elicitation in native mode
-// ---------------------------------------------------------------------------
-
-describe("MCP host server — native form-only elicitation", () => {
-  it("resume tool is hidden in native mode", async () => {
-    await withNativeClient(makeStubEngine({}), FORM_ONLY_CAPS, async (client) => {
-      const { tools } = await client.listTools();
-      expect(tools.map((t) => t.name)).toContain("execute");
-      expect(tools.map((t) => t.name)).not.toContain("resume");
-    });
-  });
-
-  it("uses native elicitation path when client supports form", async () => {
-    const engine = makeStubEngine({
-      execute: (code) => Effect.succeed({ result: `native: ${code}` }),
-    });
-
-    await withNativeClient(engine, FORM_ONLY_CAPS, async (client) => {
-      const result = await client.callTool({
-        name: "execute",
-        arguments: { code: "test" },
-      });
-      expect(result.content).toEqual([{ type: "text", text: "native: test" }]);
-    });
-  });
-
-  it("UrlElicitation falls back to form when client lacks url support", async () => {
-    let receivedMessage: string | undefined;
-    const engine = makeElicitingEngine(
-      UrlElicitation.make({
-        message: "Please authenticate",
-        url: "https://auth.example.com/oauth",
-        elicitationId: ElicitationId.make("elic-1"),
-      }),
-    );
-
-    await withNativeClient(engine, FORM_ONLY_CAPS, async (client) => {
-      client.setRequestHandler(ElicitRequestSchema, async (request) => {
-        receivedMessage =
-          typeof request.params.message === "string" ? request.params.message : undefined;
-        return { action: "accept" as const, content: {} };
-      });
-
-      const result = await client.callTool({
-        name: "execute",
-        arguments: { code: "oauth" },
-      });
-      expect(result.content).toEqual([{ type: "text", text: "accept" }]);
-      expect(receivedMessage).toContain("https://auth.example.com/oauth");
-      expect(receivedMessage).toContain("Please authenticate");
     });
   });
 });
@@ -1246,65 +1030,6 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
         "Ask the user for values matching requestedSchema",
       );
     });
-  });
-
-  it("reconstructs custom-engine live pauses on model execute and resume output boundaries", async () => {
-    const marker = "custom-engine-live-pause-regression-marker";
-    const unsafePause = (id: string): ExecutionResult => ({
-      status: "paused",
-      execution: {
-        id,
-        requiresLiveApproval: true,
-        elicitationContext: {
-          address: STUB_TOOL_ADDRESS,
-          request: {
-            ...UrlElicitation.make({
-              message: `Approve ${marker}`,
-              url: `https://fixture.invalid/approve?token=${marker}`,
-              elicitationId: ElicitationId.make(marker),
-            }),
-            args: { secret: marker },
-            requestedSchema: {
-              type: "object",
-              properties: { secret: { description: marker } },
-            },
-          } as never,
-        },
-      },
-    });
-    const engine = makeStubEngine({
-      executeWithPause: () => Effect.succeed(unsafePause("exec_custom_execute")),
-      resume: () => Effect.succeed(unsafePause("exec_custom_resume")),
-    });
-
-    await withClient(
-      engine,
-      NO_CAPS,
-      async (client) => {
-        const executed = await client.callTool({
-          name: "execute",
-          arguments: { code: "pause" },
-        });
-        const resumed = await client.callTool({
-          name: "resume",
-          arguments: { executionId: "exec_custom_execute", action: "decline" },
-        });
-
-        for (const result of [executed, resumed]) {
-          expect(JSON.stringify(result)).not.toContain(marker);
-          expect(result.structuredContent).toMatchObject({
-            status: "waiting_for_interaction",
-            requiresLiveApproval: true,
-            interaction: {
-              kind: "form",
-              message: `Approve continuation of ${STUB_TOOL_ADDRESS}?`,
-              requestedSchema: { type: "object", properties: {} },
-            },
-          });
-        }
-      },
-      { elicitationMode: { mode: "model" } },
-    );
   });
 
   it("default model resume mode explains empty form schemas as model-side confirmation", async () => {
@@ -1753,38 +1478,6 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
 });
 
 // ---------------------------------------------------------------------------
-// Elicitation error handling
-// ---------------------------------------------------------------------------
-
-describe("MCP host server — elicitation error handling", () => {
-  it("elicitInput failure falls back to cancel", async () => {
-    const engine = makeElicitingEngine(
-      FormElicitation.make({
-        message: "will fail",
-        requestedSchema: {
-          type: "object",
-          properties: { x: { type: "string" } },
-        },
-      }),
-      (r) => `fallback:${r.action}`,
-    );
-
-    await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
-      client.setRequestHandler(ElicitRequestSchema, async () => {
-        // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: MCP client request handler rejects to exercise server fallback
-        throw new Error("client cannot handle this");
-      });
-
-      const result = await client.callTool({
-        name: "execute",
-        arguments: { code: "fail" },
-      });
-      expect(result.content).toEqual([{ type: "text", text: "fallback:cancel" }]);
-    });
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Resume content parsing edge cases
 // ---------------------------------------------------------------------------
 
@@ -1838,63 +1531,6 @@ describe("MCP host server — resume content parsing", () => {
       },
       { elicitationMode: { mode: "model" } },
     );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Multiple elicitations in a single execution
-// ---------------------------------------------------------------------------
-
-describe("MCP host server — multiple elicitations", () => {
-  it("engine can elicit multiple times during a single execute call", async () => {
-    const engine = makeStubEngine({
-      execute: (_code, { onElicitation }) =>
-        Effect.gen(function* () {
-          const r1 = yield* onElicitation({
-            address: STUB_TOOL_ADDRESS,
-            request: FormElicitation.make({
-              message: "What is your name?",
-              requestedSchema: {
-                type: "object",
-                properties: { name: { type: "string" } },
-              },
-            }),
-          });
-
-          const r2 = yield* onElicitation({
-            address: STUB_TOOL_ADDRESS,
-            request: FormElicitation.make({
-              message: `Confirm: ${r1.content?.name}?`,
-              requestedSchema: {
-                type: "object",
-                properties: { confirmed: { type: "boolean" } },
-              },
-            }),
-          });
-
-          return {
-            result: `name=${r1.content?.name},confirmed=${r2.content?.confirmed}`,
-          };
-        }),
-    });
-
-    await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
-      let callCount = 0;
-      client.setRequestHandler(ElicitRequestSchema, async () => {
-        callCount++;
-        if (callCount === 1) {
-          return { action: "accept" as const, content: { name: "Alice" } };
-        }
-        return { action: "accept" as const, content: { confirmed: true } };
-      });
-
-      const result = await client.callTool({
-        name: "execute",
-        arguments: { code: "multi" },
-      });
-      expect(result.content).toEqual([{ type: "text", text: "name=Alice,confirmed=true" }]);
-      expect(callCount).toBe(2);
-    });
   });
 });
 

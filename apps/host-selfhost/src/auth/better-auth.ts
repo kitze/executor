@@ -98,6 +98,11 @@ const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?:
     // origin keeps host-header injection out of OAuth redirects and links.
     baseURL: config.webBaseUrl,
     trustedOrigins: [config.webBaseUrl],
+    // A parent-domain application also uses Better Auth's default cookie name.
+    // Pin this host to its own prefix so an unrelated `kitze.io` cookie cannot
+    // shadow Executor's session and turn a successful login into `/account/me`
+    // 401s.
+    advanced: { cookiePrefix: "executor" },
     emailAndPassword: { enabled: true },
     // `apiKey` issues long-lived personal keys (the API-keys page). With
     // `enableSessionForAPIKeys`, presenting a key resolves to its owner's

@@ -99,6 +99,26 @@ const tokenResponse =
   () =>
     json(200, body);
 
+const WITHINGS_TOKEN_URL = "https://wbsapi.withings.net/v2/oauth2";
+
+const captureTokenFetch = (responseBody: unknown) => {
+  const calls: TokenCall[] = [];
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    calls.push({
+      method: request.method,
+      url: request.url,
+      headers: Object.fromEntries(request.headers.entries()),
+      body: new URLSearchParams(await request.clone().text()),
+    });
+    return new Response(JSON.stringify(responseBody), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof globalThis.fetch;
+  return { calls, fetch } as const;
+};
+
 // ---------------------------------------------------------------------------
 // PKCE
 // ---------------------------------------------------------------------------
@@ -171,6 +191,19 @@ describe("buildAuthorizationUrl", () => {
   it("supports a custom scope separator (e.g. comma for legacy providers)", () => {
     const url = new URL(buildAuthorizationUrl({ ...baseInput, scopeSeparator: "," }));
     expect(url.searchParams.get("scope")).toBe("read,write");
+  });
+
+  it("uses Withings comma scopes and omits unsupported PKCE fields", () => {
+    const url = new URL(
+      buildAuthorizationUrl({
+        ...baseInput,
+        authorizationUrl: "https://account.withings.com/oauth2_user/authorize2",
+        scopes: ["user.info", "user.metrics", "user.activity"],
+      }),
+    );
+    expect(url.searchParams.get("scope")).toBe("user.info,user.metrics,user.activity");
+    expect(url.searchParams.has("code_challenge_method")).toBe(false);
+    expect(url.searchParams.has("code_challenge")).toBe(false);
   });
 
   it("omits scope when no scopes are requested", () => {
@@ -932,6 +965,95 @@ describe("refreshAccessToken", () => {
           expect((error as OAuth2Error).error).toBeUndefined();
         }),
     ),
+  );
+});
+
+describe("Withings OAuth compatibility", () => {
+  it.effect("sends the authorization-code action, omits PKCE, and unwraps token envelopes", () =>
+    Effect.gen(function* () {
+      const fixture = captureTokenFetch({
+        status: 0,
+        body: {
+          access_token: "withings-access",
+          refresh_token: "withings-refresh",
+          token_type: "Bearer",
+          expires_in: 10_800,
+          scope: "user.info,user.metrics,user.activity",
+        },
+      });
+
+      const result = yield* exchangeAuthorizationCode({
+        tokenUrl: WITHINGS_TOKEN_URL,
+        clientId: "withings-client",
+        clientSecret: "withings-secret",
+        redirectUrl: "https://executor.example/api/oauth/callback",
+        codeVerifier: "must-not-be-sent",
+        code: "withings-code",
+        fetch: fixture.fetch,
+      });
+
+      expect(result).toMatchObject({
+        access_token: "withings-access",
+        refresh_token: "withings-refresh",
+        scope: "user.info,user.metrics,user.activity",
+      });
+      const body = fixture.calls[0]!.body;
+      expect(body.get("grant_type")).toBe("authorization_code");
+      expect(body.get("action")).toBe("requesttoken");
+      expect(body.has("code_verifier")).toBe(false);
+    }),
+  );
+
+  it.effect("sends the refresh action, omits scope, and unwraps refreshed tokens", () =>
+    Effect.gen(function* () {
+      const fixture = captureTokenFetch({
+        status: 0,
+        body: {
+          access_token: "withings-access-2",
+          refresh_token: "withings-refresh-2",
+          token_type: "Bearer",
+          expires_in: 10_800,
+        },
+      });
+
+      const result = yield* refreshAccessToken({
+        tokenUrl: WITHINGS_TOKEN_URL,
+        clientId: "withings-client",
+        clientSecret: "withings-secret",
+        refreshToken: "withings-refresh",
+        scopes: ["user.info", "user.metrics"],
+        fetch: fixture.fetch,
+      });
+
+      expect(result.access_token).toBe("withings-access-2");
+      const body = fixture.calls[0]!.body;
+      expect(body.get("grant_type")).toBe("refresh_token");
+      expect(body.get("action")).toBe("requesttoken");
+      expect(body.has("scope")).toBe(false);
+    }),
+  );
+
+  it.effect("maps Withings HTTP-200 error envelopes to OAuth invalid_grant", () =>
+    Effect.gen(function* () {
+      const fixture = captureTokenFetch({
+        status: 401,
+        error: "Invalid authorization code",
+      });
+
+      const error = yield* Effect.flip(
+        exchangeAuthorizationCode({
+          tokenUrl: WITHINGS_TOKEN_URL,
+          clientId: "withings-client",
+          clientSecret: "withings-secret",
+          redirectUrl: "https://executor.example/api/oauth/callback",
+          codeVerifier: "must-not-be-sent",
+          code: "expired-code",
+          fetch: fixture.fetch,
+        }),
+      );
+      expect(error).toBeInstanceOf(OAuth2Error);
+      expect((error as OAuth2Error).error).toBe("invalid_grant");
+    }),
   );
 });
 

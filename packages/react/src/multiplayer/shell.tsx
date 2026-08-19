@@ -1,12 +1,17 @@
 import { Link, Outlet, useLocation, useParams } from "@tanstack/react-router";
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { useAtomValue } from "@effect/atom-react";
+import { useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
-import { BookOpen, Command, ExternalLink } from "lucide-react";
+import { BookOpen, Command, ExternalLink, RefreshCw } from "lucide-react";
 import type { Integration } from "@executor-js/sdk/shared";
-import { integrationsOptimisticAtom } from "../api/atoms";
+import {
+  connectionsAllAtom,
+  connectionsOptimisticAtom,
+  integrationsOptimisticAtom,
+} from "../api/atoms";
 import { trackEvent } from "../api/analytics";
 import { Button } from "../components/button";
+import { IntegrationHealthSummary } from "../components/integration-health-summary";
 import { Skeleton } from "../components/skeleton";
 import { SidebarUpdateCard } from "../components/update-card";
 import {
@@ -23,6 +28,7 @@ import {
 } from "../components/integration-favicon";
 import { CommandPalette } from "../components/command-palette";
 import { Wordmark } from "../components/wordmark";
+import { runConnectionHealthCheck } from "../lib/use-connection-health";
 import { useClientPlugins, useIntegrationPlugins } from "@executor-js/sdk/client";
 import { useAuth } from "./auth-context";
 
@@ -181,6 +187,44 @@ function CommandsButton(props: { onOpen: () => void }) {
 
 // ── IntegrationList ───────────────────────────────────────────────────────────
 
+function RefreshAllIntegrationsButton() {
+  const connectionsResult = useAtomValue(connectionsAllAtom);
+  const registry = useContext(RegistryContext);
+  const [checking, setChecking] = useState(false);
+  const connections = AsyncResult.isSuccess(connectionsResult) ? connectionsResult.value : [];
+
+  const refreshAll = async () => {
+    if (checking) return;
+    setChecking(true);
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: Promise-based React click handler must always clear its local busy state after best-effort parallel browser probes
+    try {
+      await Promise.allSettled(
+        connections.map((connection) => runConnectionHealthCheck(connection, { force: true })),
+      );
+      registry.refresh(connectionsOptimisticAtom("org"));
+      registry.refresh(connectionsOptimisticAtom("user"));
+      registry.refresh(connectionsAllAtom);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    // oxlint-disable-next-line react/forbid-elements -- compact sidebar action; Button styling is intentionally too large here
+    <button
+      type="button"
+      data-testid="refresh-all-integrations"
+      onClick={() => void refreshAll()}
+      disabled={checking || !AsyncResult.isSuccess(connectionsResult)}
+      title={`Check all ${connections.length} saved connections`}
+      className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-muted-foreground transition-colors hover:bg-sidebar-active hover:text-foreground disabled:cursor-wait disabled:opacity-50"
+    >
+      <RefreshCw className={`size-2.5 ${checking ? "animate-spin" : ""}`} />
+      {checking ? "Checking…" : "Refresh"}
+    </button>
+  );
+}
+
 // `pathname` is scope-relative (org-slug prefix already stripped).
 function IntegrationList(props: { pathname: string; onNavigate?: () => void }) {
   const integrations = useAtomValue(integrationsOptimisticAtom);
@@ -239,6 +283,11 @@ function IntegrationList(props: { pathname: string; onNavigate?: () => void }) {
                   }
                 />
                 <span className="flex-1 truncate">{name}</span>
+                <IntegrationHealthSummary
+                  integration={integration.slug}
+                  compact
+                  revalidate={false}
+                />
               </Link>
             );
           })}
@@ -382,8 +431,9 @@ function SidebarContent(
           />
         ))}
 
-        <div className="mt-5 mb-1 px-2.5 text-xs font-medium uppercase tracking-widest text-muted-foreground">
+        <div className="mt-5 mb-1 flex items-center justify-between px-2.5 text-xs font-medium uppercase tracking-widest text-muted-foreground">
           <span>Integrations</span>
+          <RefreshAllIntegrationsButton />
         </div>
 
         <IntegrationList pathname={props.pathname} onNavigate={props.onNavigate} />

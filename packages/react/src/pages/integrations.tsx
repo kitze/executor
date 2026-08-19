@@ -1,4 +1,4 @@
-import { Suspense, useCallback, useMemo, useState, type ReactNode } from "react";
+import { Suspense, useCallback, useMemo, useState } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useAtomRefresh, useAtomSet, useAtomValue } from "@effect/atom-react";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
@@ -33,14 +33,11 @@ import {
   CardStackEntryDescription,
   CardStackEntryMedia,
   CardStackEntryTitle,
-  CardStackHeader,
 } from "../components/card-stack";
 import {
-  IntegrationFavicon,
   integrationInferredUrl,
   integrationPresetIconUrl,
 } from "../components/integration-favicon";
-import { groupIntegrations, type IntegrationFamilyGroup } from "../lib/integration-grouping";
 import { IntegrationHealthSummary } from "../components/integration-health-summary";
 import { IntegrationIconWithAccount } from "../components/integration-icon-with-account";
 import { Skeleton } from "../components/skeleton";
@@ -77,7 +74,7 @@ export function IntegrationsPage() {
   const [connectOpen, setConnectOpen] = useState(false);
 
   return (
-    <PageContainer>
+    <PageContainer className="max-w-7xl">
       <PageHeader
         title="Integrations"
         description="Tool providers available in this workspace."
@@ -427,113 +424,59 @@ function PresetGrid(props: {
 }
 
 // ---------------------------------------------------------------------------
-// Integration grid — flat list of catalog integrations, click-through to detail
+// Integration grid — responsive cards, click-through to detail
 // ---------------------------------------------------------------------------
 
 function IntegrationGrid(props: { integrations: readonly Integration[] }) {
   const integrationPlugins = useIntegrationPlugins();
   const pluginByKind = useMemo(() => {
     const out = new Map<string, IntegrationPlugin>();
-    for (const p of integrationPlugins) out.set(p.key, p);
+    for (const plugin of integrationPlugins) out.set(plugin.key, plugin);
     return out;
   }, [integrationPlugins]);
 
-  const items = useMemo(() => groupIntegrations(props.integrations), [props.integrations]);
-
-  const renderEntry = (integration: Integration) => {
-    const pluginKey = KIND_TO_PLUGIN_KEY[integration.kind] ?? integration.kind;
-    const plugin = pluginByKind.get(pluginKey);
-    const SummaryComponent = plugin?.summary;
-    const slug = String(integration.slug);
-    const name = integration.name || slug;
-    return (
-      <CardStackEntry key={slug} asChild searchText={`${name} ${slug} ${integration.kind}`}>
-        <Link
-          to="/{-$orgSlug}/integrations/$namespace"
-          params={{ namespace: slug }}
-          data-testid={`integration-entry-${slug}`}
-        >
-          <IntegrationIconWithAccount
-            icon={integrationPresetIconUrl(
-              { id: slug, kind: integration.kind, name, url: integration.displayUrl },
-              integrationPlugins,
-            )}
-            integrationId={slug}
-            url={integration.displayUrl ?? integrationInferredUrl({ id: slug, name }) ?? undefined}
-          />
-          <CardStackEntryContent>
-            <CardStackEntryTitle>{name}</CardStackEntryTitle>
-            <CardStackEntryDescription>{slug}</CardStackEntryDescription>
-          </CardStackEntryContent>
-          <CardStackEntryActions>
-            {SummaryComponent && (
-              <Suspense fallback={null}>
-                <SummaryComponent integrationId={slug} />
-              </Suspense>
-            )}
-            <IntegrationHealthSummary integration={integration.slug} />
-          </CardStackEntryActions>
-        </Link>
-      </CardStackEntry>
-    );
-  };
-
-  const rendered: ReactNode[] = [];
-  let flatRun: Integration[] = [];
-  const flushFlat = () => {
-    if (flatRun.length === 0) return;
-    const run = flatRun;
-    flatRun = [];
-    rendered.push(
-      <CardStack key={`flat-${String(run[0]!.slug)}`} searchable>
-        <CardStackContent>{run.map(renderEntry)}</CardStackContent>
-      </CardStack>,
-    );
-  };
-
-  for (const item of items) {
-    if (item.type === "single") {
-      flatRun.push(item.integration);
-      continue;
-    }
-    flushFlat();
-    rendered.push(
-      <IntegrationFamilyGroupCard
-        key={`group-${item.family}`}
-        group={item}
-        plugin={pluginByKind.get("openapi")}
-        renderEntry={renderEntry}
-      />,
-    );
-  }
-  flushFlat();
-
-  return <div className="space-y-3">{rendered}</div>;
-}
-
-function IntegrationFamilyGroupCard(props: {
-  group: IntegrationFamilyGroup;
-  plugin: IntegrationPlugin | undefined;
-  renderEntry: (integration: Integration) => ReactNode;
-}) {
-  const { group, plugin, renderEntry } = props;
-  const headerIcon =
-    plugin?.presets?.find((preset) => preset.family === group.family && preset.icon)?.icon ?? null;
   return (
-    <CardStack collapsible defaultOpen data-testid={`integration-group-${group.family}`}>
-      <CardStackHeader>
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="flex size-5 shrink-0 items-center justify-center">
-            <IntegrationFavicon icon={headerIcon} size={16} />
-          </span>
-          <span className="truncate">{group.label}</span>
-          <span className="shrink-0 font-mono text-xs font-normal text-muted-foreground">
-            {group.members.length}
-          </span>
-        </span>
-      </CardStackHeader>
-      <CardStackContent>{group.members.map(renderEntry)}</CardStackContent>
-    </CardStack>
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+      {props.integrations.map((integration) => {
+        const pluginKey = KIND_TO_PLUGIN_KEY[integration.kind] ?? integration.kind;
+        const SummaryComponent = pluginByKind.get(pluginKey)?.summary;
+        const slug = String(integration.slug);
+        const name = integration.name || slug;
+
+        return (
+          <Link
+            key={slug}
+            to="/{-$orgSlug}/integrations/$namespace"
+            params={{ namespace: slug }}
+            data-testid={`integration-entry-${slug}`}
+            className="group flex min-w-0 items-center gap-3 rounded-lg border border-border/50 bg-card p-4 text-sm outline-none transition-[background-color,border-color,box-shadow] hover:border-border hover:bg-accent/40 hover:shadow-sm focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
+          >
+            <IntegrationIconWithAccount
+              icon={integrationPresetIconUrl(
+                { id: slug, kind: integration.kind, name, url: integration.displayUrl },
+                integrationPlugins,
+              )}
+              integrationId={slug}
+              url={
+                integration.displayUrl ?? integrationInferredUrl({ id: slug, name }) ?? undefined
+              }
+            />
+            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+              <div className="truncate text-sm font-medium leading-snug">{name}</div>
+              <div className="truncate font-mono text-[11px] text-muted-foreground">{slug}</div>
+            </div>
+            <div className="flex shrink-0 items-center gap-2 text-muted-foreground">
+              {SummaryComponent && (
+                <Suspense fallback={null}>
+                  <SummaryComponent integrationId={slug} />
+                </Suspense>
+              )}
+              <IntegrationHealthSummary integration={integration.slug} />
+            </div>
+          </Link>
+        );
+      })}
+    </div>
   );
 }
 
@@ -543,19 +486,20 @@ function IntegrationFamilyGroupCard(props: {
 
 function IntegrationsGridSkeleton() {
   return (
-    <CardStack>
-      <CardStackContent>
-        {Array.from({ length: 4 }).map((_, i) => (
-          <div key={i} className="flex items-center gap-3 px-4 py-3">
-            <Skeleton className="size-8 shrink-0 rounded-md" />
-            <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-              <Skeleton className="h-4" style={{ width: `${40 + ((i * 11) % 30)}%` }} />
-              <Skeleton className="h-3" style={{ width: `${25 + ((i * 7) % 20)}%` }} />
-            </div>
-            <Skeleton className="h-5 w-16 rounded-full" />
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+      {Array.from({ length: 8 }).map((_, i) => (
+        <div
+          key={i}
+          className="flex min-w-0 items-center gap-3 rounded-lg border border-border/50 bg-card p-4"
+        >
+          <Skeleton className="size-8 shrink-0 rounded-md" />
+          <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+            <Skeleton className="h-4" style={{ width: `${40 + ((i * 11) % 30)}%` }} />
+            <Skeleton className="h-3" style={{ width: `${25 + ((i * 7) % 20)}%` }} />
           </div>
-        ))}
-      </CardStackContent>
-    </CardStack>
+          <Skeleton className="size-2 shrink-0 rounded-full" />
+        </div>
+      ))}
+    </div>
   );
 }

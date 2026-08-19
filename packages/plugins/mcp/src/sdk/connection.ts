@@ -1,16 +1,18 @@
-import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
+import {
+  Client,
+  SSEClientTransport,
+  StreamableHTTPClientTransport,
+  type FetchLike,
+  type OAuthClientProvider,
+} from "@modelcontextprotocol/client";
+import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/client/validators/cf-worker";
 import { Effect, Layer, Predicate, Stream } from "effect";
 import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 
 // NOTE: `StdioClientTransport` is NOT imported eagerly. The upstream module
-// (`@modelcontextprotocol/sdk/client/stdio.js`) touches `node:child_process`
-// at evaluation time, which crashes workerd (incl. vitest-pool-workers) at
-// SIGSEGV on module instantiation. Cloud callers set
+// (`@modelcontextprotocol/client/stdio`) still imports Node process/stream and
+// `cross-spawn` eagerly at evaluation time, which crashes workerd (including
+// vitest-pool-workers) with SIGSEGV on module instantiation. Cloud callers set
 // `dangerouslyAllowStdioMCP: false` and never reach the stdio branch below;
 // prod bundles that DO use stdio load it via a dynamic import inside the
 // stdio branch of `createMcpConnector`.
@@ -172,6 +174,15 @@ const fetchFromHttpClientLayer = (
       }
       return response;
     });
+    // Mark the request promise observed (a no-op handler on the ORIGINAL
+    // promise; callers still see the rejection). The MCP SDK fires some
+    // requests without a rejection handler — a cancellation notification
+    // after a request timeout, an SSE dial raced against an abort — and when
+    // the upstream is already gone that rejection is unhandled, which kills
+    // the whole Bun server process, not just this call. Browsers never crash
+    // on an unobserved fetch rejection; this adapter must match.
+    // oxlint-disable-next-line executor/no-promise-catch -- boundary: Fetch-compatible adapter must observe rejections the SDK abandons
+    promise.catch(() => undefined);
     if (!init?.signal) return promise;
     // oxlint-disable-next-line executor/no-promise-reject -- boundary: Fetch-compatible adapter mirrors abort rejection semantics
     if (init.signal.aborted) return Promise.reject(abortError(init.signal));
@@ -192,12 +203,13 @@ const fetchFromHttpClientLayer = (
 // MCP plugin runs inside a Cloudflare Worker (executor.sh). The
 // cfworker validator does not use code generation and works in every
 // runtime we ship to.
-const createClient = (): Client =>
+const createClient = (versionNegotiation?: { readonly mode: "auto" }): Client =>
   new Client(
     { name: "executor-mcp", version: "0.1.0" },
     {
       capabilities: { elicitation: { form: {}, url: {} } },
       jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
+      ...(versionNegotiation === undefined ? {} : { versionNegotiation }),
     },
   );
 
@@ -238,9 +250,10 @@ const connectionFailure = (
 const connectClient = (input: {
   transport: string;
   createTransport: () => Parameters<Client["connect"]>[0];
+  versionNegotiation?: { readonly mode: "auto" };
 }): Effect.Effect<McpConnection, McpConnectionError | McpOAuthReauthorizationRequired> =>
   Effect.gen(function* () {
-    const client = createClient();
+    const client = createClient(input.versionNegotiation);
     const transportInstance = input.createTransport();
 
     yield* Effect.tryPromise({
@@ -305,8 +318,12 @@ export const createMcpConnector = (input: ConnectorInput): McpConnector => {
 
   const endpoint = buildEndpointUrl(input.endpoint, input.queryParams ?? {});
 
+  // Auto-negotiate the 2026-07-28 era only on Streamable HTTP. SSE is a
+  // legacy-only transport, and stdio servers are spawned per call where the
+  // SDK recommends retaining its legacy-default handshake.
   const connectStreamableHttp = connectClient({
     transport: "streamable-http",
+    versionNegotiation: { mode: "auto" },
     createTransport: () =>
       new StreamableHTTPClientTransport(endpoint, {
         requestInit,

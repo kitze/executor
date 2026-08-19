@@ -110,6 +110,7 @@ describe("protected JWT (device-login) auth", () => {
       const identity = yield* run(request(token), config);
 
       expect(identity).toEqual({
+        kind: "member",
         accountId: "user_123",
         organizationId: "org_123",
         organizationName: "Org org_123",

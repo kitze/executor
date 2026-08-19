@@ -7,6 +7,8 @@ import {
   ElicitationResponse,
   FormElicitation,
   IntegrationSlug,
+  isOpaqueValueReference,
+  makeOpaqueValueHandoff,
   OAuthClientSlug,
   OAuthRegisterDynamicError,
   ProviderItemId,
@@ -124,6 +126,7 @@ type TestToolSpec = {
   /** Plain JSON Schema stored on the produced ToolDef. */
   readonly inputJsonSchema?: unknown;
   readonly outputJsonSchema?: unknown;
+  readonly annotations?: ToolDef["annotations"];
   /** Standard-schema validator applied to args in `invokeTool`. */
   readonly validator?: Validator;
   readonly handler: (input: ToolHandlerInput) => Effect.Effect<unknown, unknown>;
@@ -178,6 +181,7 @@ const makeTestPlugin = (config: {
             description: spec.description,
             inputSchema: spec.inputJsonSchema,
             outputSchema: spec.outputJsonSchema,
+            annotations: spec.annotations,
           }),
         ),
       }),
@@ -275,6 +279,21 @@ const coolifyConfigurationPlugin = makeTestPlugin({
   pluginId: "coolify-configuration-test",
   integration: "coolify",
   tools: [
+    {
+      name: "applications.listEnvsByApplicationUuid",
+      description: "List application environment variables",
+      inputJsonSchema: EmptyInputJson,
+      validator: EmptyValidator,
+      annotations: { sensitiveOutputPaths: ["/value"] },
+      handler: () =>
+        Effect.succeed(
+          ToolResult.ok({
+            key: "SECRET",
+            value: COOLIFY_VALIDATION_MARKER,
+            transformed: Buffer.from(COOLIFY_VALIDATION_MARKER).toString("base64"),
+          }),
+        ),
+    },
     {
       name: "applications.updateApplicationByUuid",
       description: "Update an application",
@@ -1172,6 +1191,34 @@ describe("tool discovery", () => {
         },
       });
       expect(JSON.stringify(result)).not.toContain(COOLIFY_VALIDATION_MARKER);
+    }),
+  );
+
+  it.effect("preserves a Coolify leaf-level opaque source through sandbox delivery", () =>
+    Effect.gen(function* () {
+      const executor = yield* makeExecutorWith([coolifyConfigurationPlugin] as const);
+      yield* provision(executor as never, [
+        { pluginId: "coolify-configuration-test", integration: "coolify" },
+      ]);
+      const invoker = makeExecutorToolInvoker(executor, {
+        invokeOptions: {
+          onElicitation: acceptAll,
+          opaqueValueHandoff: makeOpaqueValueHandoff(),
+        },
+      });
+
+      const result = (yield* invoker.invoke({
+        path: "coolify.org.main.applications.listEnvsByApplicationUuid",
+        args: {},
+      })) as { readonly ok?: boolean; readonly data?: Record<string, unknown> };
+
+      expect(result.ok).toBe(true);
+      expect(Object.keys(result.data ?? {})).toEqual(["value"]);
+      expect(isOpaqueValueReference(result.data?.value)).toBe(true);
+      expect(JSON.stringify(result)).not.toContain(COOLIFY_VALIDATION_MARKER);
+      expect(JSON.stringify(result)).not.toContain(
+        Buffer.from(COOLIFY_VALIDATION_MARKER).toString("base64"),
+      );
     }),
   );
 

@@ -65,6 +65,44 @@ const oauthPlugin = definePlugin(() => ({
 
 const plugins = [memoryCredentialsPlugin(), oauthPlugin] as const;
 
+const MCP_HEALTH_INTEG = IntegrationSlug.make("mcp-health");
+
+/** An MCP-shaped plugin whose health result is intentionally non-credential
+ * green. It proves OAuth-backed MCP connections reach the plugin's real
+ * liveness probe instead of stopping after token resolution. */
+const mcpOauthHealthPlugin = definePlugin(() => ({
+  id: "mcp" as const,
+  storage: () => ({}),
+  resolveTools: () =>
+    Effect.succeed({
+      tools: [{ name: ToolName.make("whoami"), description: "whoami" }],
+    }),
+  describeAuthMethods: () => [
+    {
+      id: "oauth",
+      label: "OAuth2",
+      kind: "oauth" as const,
+      template: String(TEMPLATE),
+      oauth: { scopes: ["read"] },
+    },
+  ],
+  invokeTool: ({ credential }) => Effect.succeed({ token: credential.value }),
+  checkHealth: () =>
+    Effect.succeed({
+      status: "degraded" as const,
+      checkedAt: Date.now(),
+      detail: "MCP liveness probe ran.",
+    }),
+  extension: (ctx) => ({
+    seed: () =>
+      ctx.core.integrations.register({
+        slug: MCP_HEALTH_INTEG,
+        description: "MCP health fixture",
+        config: { scopes: ["read"] },
+      }),
+  }),
+}))();
+
 interface TokenEndpointCall {
   readonly host: string;
   readonly grantType: string | null;
@@ -436,6 +474,69 @@ describe("oauth.start / oauth.complete", () => {
         expect(connections.map((connection) => String(connection.name)).sort()).toEqual([
           "main",
           "main2",
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("newConnection suffixes a name that only normalizes on the server", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // Regression: a human label like "Work Gmail" reaches `start` as the
+        // client-derived "workGmail". The mint stores the `connectionIdentifier`
+        // form; before the fix the free-name guard compared the un-re-normalized
+        // name case-sensitively, missed the existing row, and the second connect
+        // OVERWROTE the first account instead of minting a suffixed name.
+        const server = yield* serveOAuthTestServer({
+          scopes: ["openid", "email", "profile", "read"],
+          idTokenClaims: { email: "alice@example.com", sub: "user-1" },
+        });
+        const { executor } = yield* makeTestWorkspaceHarness({ plugins });
+        yield* executor.acme.seed(["openid", "email", "profile", "read"]);
+
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+
+        const runFlow = Effect.gen(function* () {
+          const started = yield* executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            // A raw label the client would type, not an already-normalized name.
+            name: ConnectionName.make("Work Gmail"),
+            integration: INTEG,
+            template: TEMPLATE,
+            newConnection: true,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return null;
+          const callback = yield* server.completeAuthorizationCodeFlow({
+            authorizationUrl: started.authorizationUrl,
+          });
+          return yield* executor.oauth.complete({
+            state: started.state,
+            code: callback.code,
+          });
+        });
+
+        const first = yield* runFlow;
+        const second = yield* runFlow;
+        // The stored name is the normalized form, and the second connect resolves
+        // to a distinct suffixed name rather than re-minting the first row.
+        expect(String(first?.name)).toBe("workGmail");
+        expect(String(second?.name)).toBe("workGmail2");
+
+        const connections = yield* executor.connections.list({ integration: INTEG });
+        expect(connections.map((connection) => String(connection.name)).sort()).toEqual([
+          "workGmail",
+          "workGmail2",
         ]);
       }),
     ),
@@ -958,6 +1059,16 @@ describe("oauth token refresh in resolveConnectionValue", () => {
           (r) => r.path === "/token" && r.method === "POST" && r.body.includes("refresh_token"),
         );
         expect(refreshRequest).toBeDefined();
+
+        yield* server.clearRequests;
+        const repeated = yield* executor.connections.checkHealth({
+          owner: "org",
+          integration: INTEG,
+          name: ConnectionName.make("main"),
+        });
+        expect(repeated.status).toBe("expired");
+        expect(repeated.detail).toContain("Grant not found");
+        expect(yield* server.requests).toHaveLength(0);
       }),
     ),
   );
@@ -1183,6 +1294,54 @@ describe("oauth token refresh in resolveConnectionValue", () => {
         expect(row?.provider_state).toEqual({ missingOAuthScopes: ["write"] });
         const listed = yield* executor.connections.list({ integration: INTEG });
         expect(listed[0]?.missingOAuthScopes).toEqual(["write"]);
+      }),
+    ),
+  );
+
+  it.effect("OAuth-backed MCP health reaches the plugin liveness probe", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor } = yield* makeTestWorkspaceHarness({
+          plugins: [memoryCredentialsPlugin(), mcpOauthHealthPlugin] as const,
+        });
+        yield* executor.mcp.seed();
+
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          resource: server.mcpResourceUrl,
+        });
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main"),
+          integration: MCP_HEALTH_INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        yield* executor.oauth.complete({ state: started.state, code: callback.code });
+
+        const result = yield* executor.connections.checkHealth({
+          owner: "org",
+          integration: MCP_HEALTH_INTEG,
+          name: ConnectionName.make("main"),
+        });
+        expect(result).toMatchObject({
+          status: "degraded",
+          detail: "MCP liveness probe ran.",
+        });
       }),
     ),
   );
@@ -1439,6 +1598,15 @@ describe("missingGrantedOAuthScopes canonicalization", () => {
       ].join(" "),
     );
     expect(missing).toEqual([]);
+  });
+
+  it("accepts comma-delimited granted scopes from legacy OAuth providers", () => {
+    expect(
+      missingGrantedOAuthScopes(
+        ["user.info", "user.metrics", "user.activity"],
+        "user.info,user.metrics,user.activity",
+      ),
+    ).toEqual([]);
   });
 });
 

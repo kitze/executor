@@ -129,6 +129,9 @@ export interface AnalyticsEvents {
   api_key_created: { success: boolean };
   api_key_revoked: { success: boolean };
   api_key_copied: { kind: "value" | "bearer_header" };
+  org_api_key_created: { success: boolean };
+  org_api_key_revoked: { success: boolean };
+  org_api_key_copied: { kind: "value" | "bearer_header" };
 
   // ── Organization ─────────────────────────────────────────────────────────
   org_renamed: { success: boolean };

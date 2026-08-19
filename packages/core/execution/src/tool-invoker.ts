@@ -373,7 +373,14 @@ export const makeExecutorToolInvoker = (
     // Expected failures resolve through the success channel, so without the
     // outcome annotation the dispatch span reads as healthy even when the
     // caller hit an upstream error or auth wall.
-    const projectedCoolifyResult = coolifySafeProjectToolResult(path, result);
+    // With an opaque handoff, executor.execute has already chosen between the
+    // narrow Coolify projection and generic leaf-level source protection. Do
+    // not project a second time here: doing so would discard the opaque
+    // handles that a later schema-gated sink is meant to consume. Invocations
+    // without a handoff still receive this sandbox-boundary defense in depth.
+    const projectedCoolifyResult = options.invokeOptions.opaqueValueHandoff
+      ? undefined
+      : coolifySafeProjectToolResult(path, result);
     const publicResult = projectedCoolifyResult ?? result;
     yield* annotateToolResultOutcome(publicResult);
     if (isToolResult(publicResult)) {

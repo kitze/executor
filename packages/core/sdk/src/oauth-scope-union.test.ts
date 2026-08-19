@@ -561,6 +561,42 @@ describe("oauth.start integration-driven scopes", () => {
   );
 
   it.effect(
+    "keeps resource scopes and adds offline_access advertised by its named authorization server",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const authServer = yield* serveMetadataServer({
+            authServerScopes: ["openid", "offline_access", "should:not:appear"],
+          });
+          const resourceServer = yield* serveMetadataServer({
+            prm: {
+              authorizationServers: [authServer.baseUrl],
+              scopesSupported: ["glink:read", "glink:write"],
+            },
+          });
+          const executor = yield* setupMcpScopeClient(resourceServer);
+
+          const started = yield* executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("main"),
+            integration: INTEG,
+            template: TEMPLATE,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return;
+
+          expect(scopesFromAuthorizeUrl(started.authorizationUrl)).toEqual([
+            "glink:read",
+            "glink:write",
+            "offline_access",
+          ]);
+        }),
+      ),
+  );
+
+  it.effect(
     "(k) caps the named authorization-server probe list at 3 (a 4th named AS is never reached)",
     () =>
       Effect.scoped(

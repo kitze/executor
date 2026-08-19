@@ -250,11 +250,25 @@ const collectSensitiveSchemaPaths = (
       continue;
     }
     const resolved: unknown = resolver.resolveReference<unknown>(ref);
-    if (activeRefs.has(ref) || !isRecord(resolved) || resolved === schema) {
-      // A cycle has no finite leaf projection. It is safe to seal an unknown
-      // output. Never turn that fallback into an input sink: only a concrete
-      // marker at a finite schema path authorizes opaque-value resolution.
+    if (!isRecord(resolved) || resolved === schema) {
+      // An unresolved, malformed, or direct self-reference has no trustworthy
+      // projection. Fail closed for output; never let that fallback authorize
+      // an opaque input sink.
       if (direction === "output") out.add(pointerAt(path));
+      continue;
+    }
+    if (activeRefs.has(ref)) {
+      // A public recursive model (for example Gmail's MessagePart) is not a
+      // secret merely because it has no finite leaf projection. Re-walk the
+      // resolved component under input semantics, which finds only concrete
+      // sensitive markers and never adds cycle fallbacks. Seal the recursive
+      // output edge only when the cycle truly contains sensitive semantics.
+      if (
+        direction === "output" &&
+        collectSensitiveSchemaPaths(resolved, resolver, "input").size > 0
+      ) {
+        out.add(pointerAt(path));
+      }
       continue;
     }
     activeRefs.add(ref);

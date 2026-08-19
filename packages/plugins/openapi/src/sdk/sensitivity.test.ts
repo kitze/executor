@@ -467,10 +467,9 @@ describe("OpenAPI explicit sensitivity metadata", () => {
         "/body/recursive/token",
         "/body/tuple/0",
       ];
-      // A recursive output cannot be projected to a finite token leaf at
-      // every depth, so seal the recursive edge. The same fallback must not
-      // become an input sink: it would authorize an opaque value in an
-      // otherwise public object position.
+      // The cycle contains a concrete token marker, so the recursive output
+      // edge is sealed. The same fallback must not become an input sink: it
+      // would authorize an opaque value in an otherwise public object position.
       const expectedOutputBodyPaths = ["/body/recursive/next", ...expectedInputBodyPaths];
       const expectedInput = [
         ...expectedInputBodyPaths,
@@ -512,7 +511,7 @@ describe("OpenAPI explicit sensitivity metadata", () => {
     }),
   );
 
-  it.effect("seals unresolved and recursive outputs without authorizing public input sinks", () =>
+  it.effect("seals unresolved outputs without sealing public recursive models", () =>
     Effect.gen(function* () {
       const compiled = yield* compileOpenApiSpec(failClosedDirectionSpec);
       const operation = compiled.definitions.find(
@@ -522,7 +521,7 @@ describe("OpenAPI explicit sensitivity metadata", () => {
       if (!operation) return;
 
       expect(operation.operation.sensitiveInputPaths).toBeUndefined();
-      expect(operation.operation.sensitiveOutputPaths).toEqual(["/recursive/next", "/unresolved"]);
+      expect(operation.operation.sensitiveOutputPaths).toEqual(["/unresolved"]);
     }),
   );
 
@@ -551,7 +550,6 @@ describe("OpenAPI explicit sensitivity metadata", () => {
         "/dependencies/dependencySecret",
         "/dynamic",
         "/pattern/*",
-        "/recursivePublic/next",
         "/tupleLegacy/1",
         "/unevaluated/*",
       ];

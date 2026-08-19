@@ -38,8 +38,11 @@ import { providePluginExtensions, type PluginExtensionServices } from "../plugin
 import {
   authContextFromPrincipal,
   AuthContext,
+  isPlatformPrincipal,
+  ReadOnlyCredential,
   RequestLiveApprovalProvenance,
   type Principal,
+  type ResolvedPrincipal,
 } from "./identity";
 import type { FailureRenderingStrategy } from "./execution-stack-middleware";
 
@@ -71,11 +74,13 @@ export interface MakeFixedExecutionMiddlewareOptions<
   /**
    * Resolve the inbound web `Request` to a neutral `Principal`. The credential
    * shape stays inside this function; local's single-user provider always
-   * resolves the one local Principal.
+   * resolves the one local Principal. (The seam's type admits a platform
+   * credential, but a fixed-executor host has no platform view — one resolving
+   * here is refused below.)
    */
-  readonly authenticate: (request: Request) => Effect.Effect<Principal, E, RLong>;
+  readonly authenticate: (request: Request) => Effect.Effect<ResolvedPrincipal, E, RLong>;
   /** Render `authenticate` failures (text for local, matching self-host). */
-  readonly strategy: FailureRenderingStrategy<E, RStrategy>;
+  readonly strategy: FailureRenderingStrategy<E | ReadOnlyCredential, RStrategy>;
 }
 
 /**
@@ -113,7 +118,21 @@ export const makeFixedExecutionMiddleware = <
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
           const webRequest = yield* HttpServerRequest.toWeb(request);
-          const resolved = yield* options.strategy.renderFailure(options.authenticate(webRequest));
+          const resolved = yield* options.strategy.renderFailure(
+            options.authenticate(webRequest).pipe(
+              // The fixed executor binds ONE subject at boot; there is no
+              // platform view to serve an org credential, so it is refused
+              // rather than silently acting as the boot subject.
+              Effect.filterOrFail(
+                (principal): principal is Principal => !isPlatformPrincipal(principal),
+                () =>
+                  new ReadOnlyCredential({
+                    code: "read_only_credential",
+                    message: "Organization API keys are not accepted on this host",
+                  }),
+              ),
+            ),
+          );
           // The strategy recovered the failure into a Response — return it.
           if (!isPrincipal(resolved)) return resolved;
           const auth = AuthContext.of(authContextFromPrincipal(resolved));

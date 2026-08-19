@@ -112,6 +112,30 @@ export const createPkceCodeChallenge = (verifier: string): Promise<string> =>
  *  and redeemed by `oauth.complete`. */
 export const createOAuthState = (): string => oauth.generateRandomState();
 
+/** Withings implements OAuth 2.0 with a few provider-specific wire quirks:
+ * comma-delimited scopes, no PKCE support, an `action=requesttoken` grant
+ * parameter, and a `{ status, body }` JSON envelope around token responses.
+ * Keep recognition exact so no other provider silently loses PKCE. */
+const isWithingsAuthorizationUrl = (value: string): boolean => {
+  if (!URL.canParse(value)) return false;
+  const url = new URL(value);
+  return (
+    url.protocol === "https:" &&
+    url.hostname.toLowerCase() === "account.withings.com" &&
+    url.pathname === "/oauth2_user/authorize2"
+  );
+};
+
+const isWithingsTokenUrl = (value: string): boolean => {
+  if (!URL.canParse(value)) return false;
+  const url = new URL(value);
+  return (
+    url.protocol === "https:" &&
+    url.hostname.toLowerCase() === "wbsapi.withings.net" &&
+    url.pathname.replace(/\/+$/g, "") === "/v2/oauth2"
+  );
+};
+
 // ---------------------------------------------------------------------------
 // Authorization URL builder
 // ---------------------------------------------------------------------------
@@ -145,10 +169,11 @@ export const buildAuthorizationUrl = (input: BuildAuthorizationUrlInput): string
       input.endpointUrlPolicy,
     ),
   );
+  const withings = isWithingsAuthorizationUrl(input.authorizationUrl);
   // Benign default kept by design: a single space is the RFC 6749 scope
   // separator. Callers targeting a legacy comma-separated provider pass
   // `scopeSeparator` explicitly (see the field's JSDoc).
-  const separator = input.scopeSeparator ?? " ";
+  const separator = withings ? "," : (input.scopeSeparator ?? " ");
   url.searchParams.set("client_id", input.clientId);
   url.searchParams.set("redirect_uri", input.redirectUrl);
   url.searchParams.set("response_type", "code");
@@ -156,8 +181,10 @@ export const buildAuthorizationUrl = (input: BuildAuthorizationUrlInput): string
     url.searchParams.set("scope", input.scopes.join(separator));
   }
   url.searchParams.set("state", input.state);
-  url.searchParams.set("code_challenge_method", "S256");
-  url.searchParams.set("code_challenge", input.codeChallenge);
+  if (!withings) {
+    url.searchParams.set("code_challenge_method", "S256");
+    url.searchParams.set("code_challenge", input.codeChallenge);
+  }
   if (input.resource) {
     url.searchParams.set("resource", input.resource);
   }
@@ -560,6 +587,77 @@ const tokenResponseFrom = (r: oauth.TokenEndpointResponse): OAuth2TokenResponse 
   scope: r.scope,
 });
 
+const withingsOAuthErrorCode = (payload: Readonly<Record<string, unknown>>): string => {
+  const message = typeof payload.error === "string" ? payload.error.toLowerCase() : "";
+  if (message.includes("client id") || message.includes("client secret")) {
+    return "invalid_client";
+  }
+  if (
+    message.includes("refresh token") ||
+    message.includes("authorization code") ||
+    message.includes("invalid code")
+  ) {
+    return "invalid_grant";
+  }
+  if (message.includes("scope")) return "invalid_scope";
+  return "invalid_request";
+};
+
+const tokenJsonResponse = (
+  response: Response,
+  payload: unknown,
+  status = response.status,
+): Response => {
+  const headers = new Headers(response.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.set("content-type", "application/json");
+  return new Response(JSON.stringify(payload), {
+    status,
+    statusText: status === response.status ? response.statusText : "",
+    headers,
+  });
+};
+
+const normalizeWithingsTokenEndpointResponse = async (
+  response: Response,
+  tokenUrl = response.url,
+): Promise<Response> => {
+  if (!isWithingsTokenUrl(tokenUrl)) return response;
+  const payload = await response
+    .clone()
+    .json()
+    .then(
+      (value: unknown) => value,
+      () => null,
+    );
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return response;
+
+  const envelope = payload as Readonly<Record<string, unknown>>;
+  if (
+    envelope.status === 0 &&
+    envelope.body !== null &&
+    typeof envelope.body === "object" &&
+    !Array.isArray(envelope.body)
+  ) {
+    return tokenJsonResponse(response, envelope.body);
+  }
+  if (typeof envelope.status === "number" && envelope.status !== 0) {
+    return tokenJsonResponse(
+      response,
+      {
+        error: withingsOAuthErrorCode(envelope),
+        error_description:
+          typeof envelope.error === "string"
+            ? envelope.error
+            : `Withings OAuth error ${envelope.status}`,
+      },
+      400,
+    );
+  }
+  return response;
+};
+
 const JwtClaims = Schema.Record(Schema.String, Schema.Unknown);
 const decodeJwtClaims = Schema.decodeUnknownOption(Schema.fromJsonString(JwtClaims));
 
@@ -637,7 +735,9 @@ const processTokenEndpointResponse = async (
   client: oauth.Client,
   response: Response,
 ): Promise<OAuth2TokenResponse> => {
-  const stripped = await stripIdToken(response);
+  const stripped = await stripIdToken(
+    await normalizeWithingsTokenEndpointResponse(response, as.token_endpoint),
+  );
   const token = tokenResponseFrom(
     await oauth.processGenericTokenEndpointResponse(as, client, stripped.response),
   );
@@ -691,8 +791,12 @@ export const exchangeAuthorizationCode = (
       const params = new URLSearchParams({
         code: input.code,
         redirect_uri: input.redirectUrl,
-        code_verifier: input.codeVerifier,
       });
+      if (isWithingsTokenUrl(input.tokenUrl)) {
+        params.set("action", "requesttoken");
+      } else {
+        params.set("code_verifier", input.codeVerifier);
+      }
       if (input.resource) {
         params.set("resource", input.resource);
       }
@@ -823,8 +927,11 @@ export const refreshAccessToken = (
         input.clientAuth ?? DEFAULT_CLIENT_AUTH_METHOD,
       );
       const extraParams = new URLSearchParams();
-      if (input.scopes && input.scopes.length > 0) {
+      if (!isWithingsTokenUrl(input.tokenUrl) && input.scopes && input.scopes.length > 0) {
         extraParams.set("scope", input.scopes.join(input.scopeSeparator ?? " "));
+      }
+      if (isWithingsTokenUrl(input.tokenUrl)) {
+        extraParams.set("action", "requesttoken");
       }
       if (input.resource) {
         extraParams.set("resource", input.resource);
@@ -846,10 +953,11 @@ export const refreshAccessToken = (
           additionalParameters,
         },
       );
+      const normalized = await normalizeWithingsTokenEndpointResponse(response, input.tokenUrl);
       const result = await oauth.processRefreshTokenResponse(
         as,
         client,
-        (await stripIdToken(response)).response,
+        (await stripIdToken(normalized)).response,
       );
       return tokenResponseFrom(result);
     },

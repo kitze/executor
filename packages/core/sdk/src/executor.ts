@@ -481,15 +481,14 @@ export interface AdminListSubjectsOptions {
 /**
  * Page size applied when a caller names none. Every admin list is BOUNDED:
  * `listSubjects()` with no arguments is the obvious call, and unbounded it
- * returns every subject in the tenant — which `listSubjectsWithConnections`
- * then turns into one sequential connection query PER SUBJECT, inside a single
- * request, over a per-request socket on cloud. A default is what keeps the
- * no-args call honest; a caller who wants more asks for more, up to
- * {@link ADMIN_MAX_PAGE_SIZE}.
+ * returns every subject in the tenant — an unbounded row count to build,
+ * serialize, and ship, and an unbounded `in` predicate for the joined read to
+ * carry. A default is what keeps the no-args call honest; a caller who wants
+ * more asks for more, up to {@link ADMIN_MAX_PAGE_SIZE}.
  *
  * 100 rather than the maximum: large enough that no realistic operator UI pages
- * twice for a first screen, small enough that the joined read's fan-out stays a
- * bounded cost even at its worst.
+ * twice for a first screen, small enough that one response stays a bounded
+ * amount of work even at its worst.
  */
 export const ADMIN_DEFAULT_PAGE_SIZE = 100;
 
@@ -546,12 +545,12 @@ export interface ExecutorAdmin {
   readonly listSubjectConnections: (
     externalId: string,
   ) => Effect.Effect<readonly AdminConnection[], StorageFailure>;
-  /** `listSubjects` joined with each subject's connections — one connection
-   *  query per subject IN THE PAGE, sequentially. The paging bound is what
-   *  makes that fan-out affordable: it is capped at
-   *  {@link ADMIN_DEFAULT_PAGE_SIZE} round trips by default and
-   *  {@link ADMIN_MAX_PAGE_SIZE} at worst, never "every subject in the
-   *  tenant". */
+  /** `listSubjects` joined with each subject's connections in TWO queries —
+   *  the page of subjects, then one batched connection read over that page.
+   *  The cost does not scale with page size, so {@link ADMIN_DEFAULT_PAGE_SIZE}
+   *  and {@link ADMIN_MAX_PAGE_SIZE} bound the ROWS returned rather than the
+   *  round trips taken. A subject with no connections reports an empty array;
+   *  it is never dropped from the page. */
   readonly listSubjectsWithConnections: (
     options?: AdminListSubjectsOptions,
   ) => Effect.Effect<readonly AdminSubjectWithConnections[], StorageFailure>;
@@ -772,18 +771,19 @@ const missingOAuthScopesFromProviderState = (value: unknown): readonly string[] 
     : [];
 };
 
-/** Epoch ms of the definitive refresh rejection recorded on `provider_state`,
- *  or null. Set when the AS rejects the grant itself (RFC 6749 invalid_grant —
- *  retrying cannot change the verdict); cleared by the reconnect mint, which
- *  rewrites `provider_state` wholesale. While set, refresh attempts are
- *  skipped: the pre-fix behavior re-sent a known-dead grant to the AS every
- *  proactive cycle, forever, and surfaced nothing to the user. */
-const oauthReauthRequiredAtFromProviderState = (value: unknown): number | null => {
-  const decoded = decodeJsonColumn(value);
-  if (decoded == null || typeof decoded !== "object" || Array.isArray(decoded)) return null;
-  const at = (decoded as Record<string, unknown>).oauthReauthRequiredAt;
-  return typeof at === "number" ? at : null;
-};
+/** The definitive refresh rejection recorded on `provider_state`, or null.
+ *  Set when the AS rejects the grant itself (RFC 6749 invalid_grant — retrying
+ *  cannot change the verdict); cleared by the reconnect mint, which rewrites
+ *  `provider_state` wholesale. While set, refresh attempts are skipped. */
+const decodeOAuthReauthRequiredProviderState = Schema.decodeUnknownOption(
+  Schema.Struct({
+    oauthReauthRequiredAt: Schema.Number,
+    oauthReauthRequiredDetail: Schema.optional(Schema.String),
+  }),
+);
+
+const oauthReauthRequiredFromProviderState = (value: unknown) =>
+  Option.getOrNull(decodeOAuthReauthRequiredProviderState(decodeJsonColumn(value)));
 
 const rowToConnection = (row: ConnectionRow): Connection => {
   const owner = row.owner as Owner;
@@ -1765,7 +1765,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               b("name", "=", String(row.name)),
             ),
           set: {
-            provider_state: { ...mergedState, oauthReauthRequiredAt: Date.now() },
+            provider_state: {
+              ...mergedState,
+              oauthReauthRequiredAt: Date.now(),
+              oauthReauthRequiredDetail: detail,
+            },
             last_health: health,
             updated_at: new Date(),
           },
@@ -1797,11 +1801,20 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // dead connection re-sent its dead grant on every proactive cycle,
         // indefinitely (owner.com's Datadog connections: 100+ identical
         // rejections over two days, surfacing nothing).
-        if (oauthReauthRequiredAtFromProviderState(row.provider_state) !== null) {
+        const reauthState = oauthReauthRequiredFromProviderState(row.provider_state);
+        if (reauthState !== null) {
           yield* Effect.annotateCurrentSpan({ "executor.oauth.refresh.skipped_known_dead": true });
-          return yield* reauth(
-            "The authorization server rejected this connection's refresh token (invalid_grant). Reconnect to continue.",
-          );
+          const recordedHealth = Option.getOrNull(decodeLastHealth(row.last_health));
+          const recordedDetail =
+            reauthState.oauthReauthRequiredDetail ??
+            (recordedHealth?.status === "expired" ? recordedHealth.detail : undefined);
+          const detail =
+            recordedDetail === undefined
+              ? "The authorization server rejected this connection's refresh token (invalid_grant). Reconnect to continue."
+              : recordedDetail.endsWith("Reconnect to continue.")
+                ? recordedDetail
+                : `${recordedDetail} Reconnect to continue.`;
+          return yield* reauth(detail);
         }
 
         // Load the backing app by the owner STORED on the connection (a Personal
@@ -2926,6 +2939,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 input.missingOAuthScopes && input.missingOAuthScopes.length > 0
                   ? { missingOAuthScopes: input.missingOAuthScopes }
                   : null,
+              // A re-mint replaces the grant, so any persisted verdict describes
+              // a credential that no longer exists. Clear it rather than let a
+              // pre-reconnect "expired" outlive the reconnect; the next health
+              // check writes the verdict for the new grant.
+              last_health: null,
               updated_at: now,
             };
             if (existing) {
@@ -3292,7 +3310,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           return result;
         }
         const spec = describeHealthCheckForRow(integrationRow) ?? undefined;
-        if (spec === undefined && connectionRow.oauth_client != null) {
+        if (
+          spec === undefined &&
+          connectionRow.oauth_client != null &&
+          integrationRow.plugin_id !== "mcp"
+        ) {
           // No probe operation is declared, so "healthy" here means only "the
           // credential resolved (refreshing if due)" — a refresh failure is
           // the one real signal this path can produce, and it must not hide
@@ -3549,6 +3571,13 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     // Best-effort: a failed rebuild leaves the stale-but-working catalog in
     // place and retries on the next read.
     const syncStaleConnectionTools = Effect.gen(function* () {
+      // The platform view can never persist a rebuilt catalog (writes are
+      // denied at the storage boundary), so attempting the sync would only
+      // fire upstream `resolveTools` calls whose results are thrown away —
+      // network side effects on a read-only credential. Skip it entirely:
+      // read-only-ness of the platform read path is a stated invariant here,
+      // not an accident of the best-effort catch below.
+      if (config.platformView === true) return;
       const integrations = yield* core.findMany("integration", {});
       if (integrations.length === 0) return;
       const integrationBySlug = new Map(integrations.map((row) => [row.slug, row] as const));
@@ -4348,7 +4377,23 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         ): unknown => {
           if (!opaqueValues) return value;
           const projectedCoolifyResult = coolifySafeProjectToolResult(String(address), value);
-          if (projectedCoolifyResult !== undefined) {
+          // A fresh OpenAPI binding can identify individual secret leaves. In
+          // that case preserve the generic opaque-source handoff below: the
+          // caller must be able to pass (for example) an environment value to
+          // a declared sink without ever seeing its plaintext. The narrow
+          // Coolify projector remains the fail-closed escape hatch when the
+          // whole response is sensitive (including legacy bindings), when no
+          // leaf metadata exists, and for its sanitized actionable failures.
+          const sensitiveOutputPaths = annotations?.sensitiveOutputPaths ?? [];
+          const hasWholeOutputSensitivity = sensitiveOutputPaths.includes("");
+          const hasLeafSensitiveOutput = sensitiveOutputPaths.some((path) => path !== "");
+          if (
+            projectedCoolifyResult !== undefined &&
+            (!isToolResult(value) ||
+              !value.ok ||
+              hasWholeOutputSensitivity ||
+              !hasLeafSensitiveOutput)
+          ) {
             return opaqueValues.redact(projectedCoolifyResult);
           }
           const hasSensitiveInput = (annotations?.sensitiveInputPaths?.length ?? 0) > 0;
@@ -5094,16 +5139,57 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           })
           .pipe(Effect.map((rows) => rows.map(rowToAdminConnection)));
 
+      // ONE connection query for the whole page, not one per subject. The
+      // per-subject form was an N+1: a default page issued 100 sequential
+      // `findMany`s over a per-request socket, which on cloud cost ~1.4s of a
+      // ~2.4s response. Cost is now two queries regardless of page size.
+      //
+      // The `in` predicate carries the SAME `owner: "user"` clause the keyed
+      // read does, so org rows (whose `subject` is the empty-string sentinel)
+      // stay excluded, and the tenant policy scopes both reads identically.
+      //
+      // Ordering is preserved WITHOUT a per-subject sort: the query orders by
+      // `(integration, name)` across the page, and grouping walks those rows
+      // in order, so each subject's bucket comes out in the same order the
+      // per-subject query produced. Subjects with no connections still report
+      // an empty array rather than dropping out of the page.
       const listSubjectsWithConnections = (
         options?: AdminListSubjectsOptions,
       ): Effect.Effect<readonly AdminSubjectWithConnections[], StorageFailure> =>
         Effect.gen(function* () {
           const subjects = yield* listSubjects(options);
-          return yield* Effect.forEach(subjects, (entry) =>
-            listSubjectConnections(entry.externalId).pipe(
-              Effect.map((connections) => ({ ...entry, connections })),
-            ),
-          );
+          // No page, no connection query — `in ([])` is a query that cannot
+          // match, so issuing it would be pure latency.
+          if (subjects.length === 0) return [];
+
+          const rows = yield* platformCore.findMany("connection", {
+            where: (b: AnyCb) =>
+              b.and(
+                b("owner", "=", "user"),
+                b(
+                  "subject",
+                  "in",
+                  subjects.map((entry) => entry.externalId),
+                ),
+              ),
+            orderBy: [
+              ["integration", "asc"],
+              ["name", "asc"],
+            ],
+          });
+
+          const bySubject = new Map<string, AdminConnection[]>();
+          for (const row of rows) {
+            const connection = rowToAdminConnection(row);
+            const bucket = bySubject.get(row.subject);
+            if (bucket) bucket.push(connection);
+            else bySubject.set(row.subject, [connection]);
+          }
+
+          return subjects.map((entry) => ({
+            ...entry,
+            connections: bySubject.get(entry.externalId) ?? [],
+          }));
         });
 
       // Absent subject short-circuits: no connection query is issued for a

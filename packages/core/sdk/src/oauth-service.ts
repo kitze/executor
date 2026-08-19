@@ -17,6 +17,7 @@
 import { Duration, Effect, Layer, Option, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 
+import { connectionIdentifier } from "./connection-name-identifier";
 import type { Connection } from "./connection";
 import type { IFumaClient, StorageFailure } from "./fuma-runtime";
 import { StorageError } from "./fuma-runtime";
@@ -210,7 +211,7 @@ const recordedOAuthScope = (
 ): string | null => {
   if (token.scope == null) return requestedScopes.join(" ") || null;
 
-  const granted = token.scope.split(/\s+/).filter(Boolean);
+  const granted = token.scope.split(/[\s,]+/).filter(Boolean);
   const coveredByRefreshToken =
     token.refresh_token && requestedScopes.includes("offline_access") ? ["offline_access"] : [];
   const recorded = dedupeScopes([...granted, ...coveredByRefreshToken]);
@@ -249,7 +250,7 @@ export const missingGrantedOAuthScopes = (
   requestedScopes: readonly string[],
   recordedScope: string | null,
 ): readonly string[] => {
-  const granted = normalizedOAuthScopeSet(recordedScope?.split(/\s+/).filter(Boolean) ?? []);
+  const granted = normalizedOAuthScopeSet(recordedScope?.split(/[\s,]+/).filter(Boolean) ?? []);
   const seen = new Set<string>();
   const out: string[] = [];
   for (const raw of requestedScopes) {
@@ -550,7 +551,27 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         discoveryOptions,
       );
       const resourceScopes = protectedResource?.metadata.scopes_supported;
-      if (resourceScopes !== undefined) return capScopes(resourceScopes);
+      if (resourceScopes !== undefined) {
+        // Protected-resource metadata normally describes only API scopes.
+        // When its named authorization server separately advertises
+        // `offline_access`, keep it as well so refresh-token-backed MCP
+        // connections (notably Glink) do not lose durable authorization.
+        const scopes = [...resourceScopes];
+        for (const issuer of (protectedResource?.metadata.authorization_servers ?? []).slice(
+          0,
+          MAX_DISCOVERY_AUTH_SERVERS,
+        )) {
+          const authServer = yield* discoverAuthorizationServerMetadata(
+            issuer,
+            discoveryOptions,
+          ).pipe(Effect.catchTag("OAuthDiscoveryError", () => Effect.succeed(null)));
+          if (authServer?.metadata.scopes_supported?.includes("offline_access")) {
+            scopes.push("offline_access");
+            break;
+          }
+        }
+        return capScopes(scopes);
+      }
 
       // The resource is silent on scopes — read them from the authorization
       // servers it names, in order. An advertised list is authoritative even
@@ -1072,13 +1093,16 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         });
       }
 
+      // Normalize the name the same way the mint stores it, so the free-name
+      // guard below compares against the exact stored form.
+      const requestedName = connectionIdentifier(String(input.name));
       // newConnection: resolve the requested name to a FREE one against the
       // stored rows (not a client-side, policy-filtered view), so a second
       // untyped connect mints `personalGmail2` instead of silently re-minting
       // the first account's row. Reconnects omit the flag and keep targeting
       // their existing row. Bounded: a pathological owner with 1000 same-named
       // connections fails loudly rather than scanning forever.
-      let name = input.name;
+      let name = requestedName;
       if (input.newConnection === true) {
         let suffix = 2;
         while (
@@ -1093,7 +1117,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               message: `No free connection name derivable from ${input.name}.`,
             });
           }
-          name = ConnectionName.make(`${String(input.name)}${suffix}`);
+          name = ConnectionName.make(`${String(requestedName)}${suffix}`);
           suffix++;
         }
       }

@@ -1,5 +1,47 @@
 # @executor-js/plugin-mcp
 
+## 1.5.41
+
+### Patch Changes
+
+- [#1617](https://github.com/UsefulSoftwareCo/executor/pull/1617) [`a9b33d2`](https://github.com/UsefulSoftwareCo/executor/commit/a9b33d25c32fbb4a292b7e8963e22392f862a16f) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Support MCP spec 2026-07-28 end to end. The MCP client negotiates the protocol era automatically (`server/discover` probe with legacy fallback), so integrations hosted on modern-only MCP servers connect without the server enabling legacy compatibility. Executor-hosted MCP endpoints serve both eras, and the `executor mcp` stdio bridge passes either era through to the daemon.
+
+- Updated dependencies [[`d572658`](https://github.com/UsefulSoftwareCo/executor/commit/d572658d74097917412256f10a3ea2e3974f44dd)]:
+  - @executor-js/sdk@1.5.41
+  - @executor-js/api@1.4.61
+  - @executor-js/config@1.5.41
+  - @executor-js/react@1.4.61
+
+## 1.5.40
+
+### Patch Changes
+
+- Updated dependencies [[`8ba64f6`](https://github.com/UsefulSoftwareCo/executor/commit/8ba64f675f6d6ab5302d4f68390c0b055d006f4a)]:
+  - @executor-js/sdk@1.5.40
+  - @executor-js/api@1.4.60
+  - @executor-js/config@1.5.40
+  - @executor-js/react@1.4.60
+
+## 1.5.39
+
+### Patch Changes
+
+- Updated dependencies [[`6c316c7`](https://github.com/UsefulSoftwareCo/executor/commit/6c316c77a9efc98784976236852b58c6156e016e)]:
+  - @executor-js/sdk@1.5.39
+  - @executor-js/api@1.4.59
+  - @executor-js/config@1.5.39
+  - @executor-js/react@1.4.59
+
+## 1.5.38
+
+### Patch Changes
+
+- Updated dependencies [[`6a924dd`](https://github.com/UsefulSoftwareCo/executor/commit/6a924dd98de916d6ff8cea2329bf672f149b64f4), [`1de85fc`](https://github.com/UsefulSoftwareCo/executor/commit/1de85fc0201c0c23c0e71e003c49228d406af6c8)]:
+  - @executor-js/sdk@1.5.38
+  - @executor-js/react@1.4.58
+  - @executor-js/api@1.4.58
+  - @executor-js/config@1.5.38
+
 ## 1.5.37
 
 ### Patch Changes

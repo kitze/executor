@@ -20,14 +20,22 @@ import { useConnectionsHealth } from "../lib/use-connection-health";
 // many connections back it.
 //
 // Display only: the row is a Link, so this must never introduce a nested
-// interactive element. No connections, or nothing but never-probed ones,
-// renders nothing at all: a gray dot on every row would be pure noise.
+// interactive element. The compact form is used in the sidebar; its caller
+// disables duplicate background probes because the integrations page already
+// owns list revalidation.
 // ---------------------------------------------------------------------------
 
-export function IntegrationHealthSummary(props: { readonly integration: IntegrationSlug }) {
-  const { integration } = props;
-  const org = useAtomValue(connectionsForIntegrationAtom({ integration, owner: "org" }));
-  const user = useAtomValue(connectionsForIntegrationAtom({ integration, owner: "user" }));
+export function IntegrationHealthSummary(props: {
+  readonly integration: IntegrationSlug;
+  readonly compact?: boolean;
+  readonly revalidate?: boolean;
+}) {
+  const org = useAtomValue(
+    connectionsForIntegrationAtom({ integration: props.integration, owner: "org" }),
+  );
+  const user = useAtomValue(
+    connectionsForIntegrationAtom({ integration: props.integration, owner: "user" }),
+  );
 
   const connections = useMemo<readonly Connection[]>(
     () => [
@@ -37,18 +45,33 @@ export function IntegrationHealthSummary(props: { readonly integration: Integrat
     [org, user],
   );
 
-  const probeFor = useConnectionsHealth(connections);
+  const probeFor = useConnectionsHealth(connections, { revalidate: props.revalidate });
+  const isExecutor = String(props.integration) === "executor";
+  const loaded = AsyncResult.isSuccess(org) && AsyncResult.isSuccess(user);
+  if (!isExecutor && !loaded) return null;
 
-  const status = worstHealthStatus(
-    connections.map((connection) => probeFor(connection)?.status ?? "unknown"),
-  );
-  // No connections, or none has ever produced a verdict: no signal, no dot.
-  if (status === null) return null;
+  const statuses = connections.map((connection) => probeFor(connection)?.status ?? "unknown");
+  const worst = worstHealthStatus(statuses);
+  const hasUnknown = statuses.includes("unknown");
 
-  const label = HEALTH_STATUS_LABEL[status];
+  const status = isExecutor
+    ? "healthy"
+    : connections.length === 0
+      ? "expired"
+      : worst === null || (worst === "healthy" && hasUnknown)
+        ? "degraded"
+        : worst;
+
+  const label = isExecutor
+    ? "Healthy"
+    : connections.length === 0
+      ? "Unconnected"
+      : worst === null || (worst === "healthy" && hasUnknown)
+        ? "No health check"
+        : HEALTH_STATUS_LABEL[status];
   return (
     <span className="flex shrink-0 items-center gap-1.5" title={`Status: ${label}`}>
-      {status !== "healthy" ? (
+      {!props.compact && status !== "healthy" ? (
         <span
           className={`font-mono text-[11px] font-medium uppercase tracking-[0.08em] ${HEALTH_TEXT_CLASS[status]}`}
         >

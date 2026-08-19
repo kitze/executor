@@ -48,6 +48,7 @@ export { RouterConfigLive } from "./server/router-config";
 export { consoleErrorCapture } from "./server/console-error-capture";
 export {
   makeExecutionStack,
+  makePlatformExecutionStack,
   CodeExecutorProvider,
   EngineDecorator,
   EngineDecoratorNoop,
@@ -58,6 +59,7 @@ export {
 export {
   makeMcpBuildServer,
   makeConsoleMcpErrorReporter,
+  type McpBuildServer,
   type McpExecutionStackLayer,
 } from "./server/mcp-build";
 // Host-composition seams re-homed out of `@executor-js/sdk` (the plugin-author
@@ -96,8 +98,13 @@ export {
   Unauthorized,
   NoOrganization,
   Unavailable,
+  ReadOnlyCredential,
   authContextFromPrincipal,
+  authContextFromPlatform,
+  isPlatformPrincipal,
   type Principal,
+  type PlatformPrincipal,
+  type ResolvedPrincipal,
   type IdentityProviderShape,
   type IdentityFailure,
 } from "./server/identity";
