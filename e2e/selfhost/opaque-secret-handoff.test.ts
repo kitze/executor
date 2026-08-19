@@ -189,7 +189,12 @@ const source = await callable(${JSON.stringify(input.sourceAddress)})({
   decrypt: true,
 });
 console.log("source response", source);
-const value = source.data.envs.find((entry) => entry.key === ${JSON.stringify(ENV_KEY)}).value;
+// The fail-closed public projection deliberately drops sibling metadata such
+// as the environment key once the response contains a sensitive value. This
+// fixture seeds exactly one environment value, so consume that opaque handle
+// without depending on metadata that must not cross the sandbox boundary.
+const value = source.data.envs[0]?.value;
+if (!value) throw new Error("opaque source response carried no environment value");
 console.log("opaque source value", value);
 const created = await callable(${JSON.stringify(input.sinkAddress)})({
   idOrName: ${JSON.stringify(input.targetProject)},

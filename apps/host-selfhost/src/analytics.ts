@@ -10,6 +10,7 @@ import { EngineDecorator } from "@executor-js/api/server";
 
 import packageJson from "../package.json" with { type: "json" };
 import { resolveDataDir } from "./config";
+import { makeLiveExecutionRouter } from "./live-execution-router";
 
 // ---------------------------------------------------------------------------
 // Self-host product analytics: one anonymous per-install service for the
@@ -81,3 +82,29 @@ export const SelfHostAnalyticsEngineDecorator: Layer.Layer<EngineDecorator> = La
       toolkit: context.mcpResource?.kind === "toolkit",
     }),
 });
+
+/**
+ * HTTP-plane decorator for one self-host app instance. In addition to the
+ * normal execution analytics it retains approval-owning engines across the
+ * console's execute/resume HTTP requests. The registry is instance-local and
+ * disposed with the app, so test apps and separate server instances cannot
+ * route execution ids into one another.
+ */
+export const makeSelfHostHttpEngineDecorator = (): {
+  readonly layer: Layer.Layer<EngineDecorator>;
+  readonly dispose: () => Promise<void>;
+} => {
+  const router = makeLiveExecutionRouter();
+  return {
+    layer: Layer.succeed(EngineDecorator)({
+      decorate: (engine, identity, context) => {
+        const tracked = withExecutionAnalytics(engine, selfHostAnalytics, {
+          plane: context.mcpResource === undefined ? "api" : "mcp",
+          toolkit: context.mcpResource?.kind === "toolkit",
+        });
+        return context.mcpResource === undefined ? router.decorate(tracked, identity) : tracked;
+      },
+    }),
+    dispose: () => Effect.runPromise(router.dispose),
+  };
+};

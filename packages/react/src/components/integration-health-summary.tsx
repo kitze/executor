@@ -6,9 +6,8 @@ import type { Connection, IntegrationSlug } from "@executor-js/sdk/shared";
 import { connectionsForIntegrationAtom } from "../api/atoms";
 import {
   HEALTH_INDICATOR_COLOR,
-  HEALTH_STATUS_LABEL,
   HEALTH_TEXT_CLASS,
-  worstHealthStatus,
+  integrationHealthVerdict,
 } from "../lib/health-display";
 import { useConnectionsHealth } from "../lib/use-connection-health";
 
@@ -50,25 +49,11 @@ export function IntegrationHealthSummary(props: {
   const loaded = AsyncResult.isSuccess(org) && AsyncResult.isSuccess(user);
   if (!isExecutor && !loaded) return null;
 
-  const statuses = connections.map((connection) => probeFor(connection)?.status ?? "unknown");
-  const worst = worstHealthStatus(statuses);
-  const hasUnknown = statuses.includes("unknown");
-
-  const status = isExecutor
-    ? "healthy"
-    : connections.length === 0
-      ? "expired"
-      : worst === null || (worst === "healthy" && hasUnknown)
-        ? "degraded"
-        : worst;
-
-  const label = isExecutor
-    ? "Healthy"
-    : connections.length === 0
-      ? "Unconnected"
-      : worst === null || (worst === "healthy" && hasUnknown)
-        ? "No health check"
-        : HEALTH_STATUS_LABEL[status];
+  const verdict = integrationHealthVerdict(
+    String(props.integration),
+    connections.map((connection) => probeFor(connection)?.status ?? "unknown"),
+  );
+  const { status, label } = verdict;
   return (
     <span className="flex shrink-0 items-center gap-1.5" title={`Status: ${label}`}>
       {!props.compact && status !== "healthy" ? (

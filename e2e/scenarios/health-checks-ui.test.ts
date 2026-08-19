@@ -1127,11 +1127,11 @@ scenario(
           // from the list page's own automatic revalidation.
 
           yield* browser.session(identity, async ({ page, step }) => {
-            // The integration's LIST row. The sidebar nav carries a look-alike
-            // link to the same detail page, so scope to the card-stack entry.
-            const row = page
-              .getByRole("link", { name: new RegExp(String(slug)) })
-              .and(page.locator('[data-slot="card-stack-entry"]'));
+            // The integration's LIST card. The sidebar nav carries a look-alike
+            // link to the same detail page, so use the grid card's semantic id.
+            const row = page.getByTestId(`integration-entry-${String(slug)}`);
+            const executorRow = page.getByTestId("integration-entry-executor");
+            const overview = page.getByTestId("integration-health-overview");
 
             await step(
               "Load the integrations list: the dead MCP row reads Expired with no clicks",
@@ -1146,6 +1146,28 @@ scenario(
                 await row.getByLabel("Status: Expired").waitFor();
               },
             );
+
+            await step("The top summary filters services by red, green, and yellow", async () => {
+              const all = page.getByTestId("integration-status-filter-all");
+              const green = page.getByTestId("integration-status-filter-healthy");
+              const yellow = page.getByTestId("integration-status-filter-degraded");
+              const red = page.getByTestId("integration-status-filter-expired");
+
+              await overview.getByText(/\d+ green · \d+ yellow · \d+ red/).waitFor();
+              await red.click();
+              await row.waitFor();
+              await executorRow.waitFor({ state: "hidden" });
+
+              await green.click();
+              await executorRow.waitFor();
+              await row.waitFor({ state: "hidden" });
+
+              await yellow.click();
+              await row.waitFor({ state: "hidden" });
+
+              await all.click();
+              await row.waitFor();
+            });
 
             await step(
               "The row is still a plain click-through link to the detail page",

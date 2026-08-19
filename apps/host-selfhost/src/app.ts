@@ -19,7 +19,7 @@ import { makeSelfHostSystemApiLayer } from "./system/handlers";
 import { selfHostAccountMiddleware } from "./account";
 import { loadConfig, SELF_HOST_NAMESPACE, SELF_HOST_SCHEMA_VERSION } from "./config";
 import { createSelfHostDb, SelfHostDb, SelfHostDbProvider } from "./db/self-host-db";
-import { selfHostAnalytics, SelfHostAnalyticsEngineDecorator } from "./analytics";
+import { makeSelfHostHttpEngineDecorator, selfHostAnalytics } from "./analytics";
 import {
   SelfHostCodeExecutorProvider,
   SelfHostHostConfig,
@@ -84,6 +84,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     config.webBaseUrl,
     config.mcp20260728Enabled,
   );
+  const httpEngineDecorator = makeSelfHostHttpEngineDecorator();
 
   // CLI device-login discovery (`executor login`). Points the CLI at Better
   // Auth's device endpoints; `requestFormat: "json"` because those endpoints
@@ -113,7 +114,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
         codeExecutor: SelfHostCodeExecutorProvider,
         // Anonymous execution analytics (this seam is the HTTP plane; the MCP
         // plane's decorator is wired in mcp/session-store.ts's stack layer).
-        decorator: SelfHostAnalyticsEngineDecorator,
+        decorator: httpEngineDecorator.layer,
       },
       mcp: {
         auth: mcp.auth,
@@ -173,6 +174,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     toWebHandler,
     betterAuth,
     closeDb: async () => {
+      await httpEngineDecorator.dispose();
       await mcp.close();
       await dbHandle.close();
     },

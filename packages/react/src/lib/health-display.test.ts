@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 
-import { worstHealthStatus } from "./health-display";
+import { integrationHealthVerdict, worstHealthStatus } from "./health-display";
 
 describe("worstHealthStatus", () => {
   it("orders expired above degraded above healthy", () => {
@@ -17,5 +17,30 @@ describe("worstHealthStatus", () => {
   it("has no verdict when nothing has been probed", () => {
     expect(worstHealthStatus([])).toBeNull();
     expect(worstHealthStatus(["unknown", "unknown"])).toBeNull();
+  });
+});
+
+describe("integrationHealthVerdict", () => {
+  it("maps integrations to the shared traffic-light semantics", () => {
+    expect(integrationHealthVerdict("executor", [])).toEqual({
+      status: "healthy",
+      label: "Healthy",
+    });
+    expect(integrationHealthVerdict("unconnected", [])).toEqual({
+      status: "expired",
+      label: "Unconnected",
+    });
+    expect(integrationHealthVerdict("unchecked", ["unknown"])).toEqual({
+      status: "degraded",
+      label: "No health check",
+    });
+    expect(integrationHealthVerdict("partial", ["healthy", "unknown"])).toEqual({
+      status: "degraded",
+      label: "No health check",
+    });
+    expect(integrationHealthVerdict("broken", ["healthy", "expired"])).toEqual({
+      status: "expired",
+      label: "Expired",
+    });
   });
 });
