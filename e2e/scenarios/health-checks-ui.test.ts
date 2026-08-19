@@ -1147,27 +1147,31 @@ scenario(
               },
             );
 
-            await step("The top summary filters services by red, green, and yellow", async () => {
-              const all = page.getByTestId("integration-status-filter-all");
-              const green = page.getByTestId("integration-status-filter-healthy");
-              const yellow = page.getByTestId("integration-status-filter-degraded");
-              const red = page.getByTestId("integration-status-filter-expired");
+            await step(
+              "The sticky sidebar summary filters services by red, green, and yellow",
+              async () => {
+                const all = page.getByTestId("integration-status-filter-all");
+                const green = page.getByTestId("integration-status-filter-healthy");
+                const yellow = page.getByTestId("integration-status-filter-degraded");
+                const red = page.getByTestId("integration-status-filter-expired");
 
-              await overview.getByText(/\d+ green · \d+ yellow · \d+ red/).waitFor();
-              await red.click();
-              await row.waitFor();
-              await executorRow.waitFor({ state: "hidden" });
+                await overview.getByText("Health", { exact: true }).waitFor();
+                await overview.getByText(/\d+ total/).waitFor();
+                await red.click();
+                await row.waitFor();
+                await executorRow.waitFor({ state: "hidden" });
 
-              await green.click();
-              await executorRow.waitFor();
-              await row.waitFor({ state: "hidden" });
+                await green.click();
+                await executorRow.waitFor();
+                await row.waitFor({ state: "hidden" });
 
-              await yellow.click();
-              await row.waitFor({ state: "hidden" });
+                await yellow.click();
+                await row.waitFor({ state: "hidden" });
 
-              await all.click();
-              await row.waitFor();
-            });
+                await all.click();
+                await row.waitFor();
+              },
+            );
 
             await step(
               "The row is still a plain click-through link to the detail page",
@@ -1176,6 +1180,7 @@ scenario(
                 await page.waitForURL(new RegExp(`/integrations/${String(slug)}`), {
                   timeout: 15_000,
                 });
+                await overview.waitFor();
               },
             );
           });
