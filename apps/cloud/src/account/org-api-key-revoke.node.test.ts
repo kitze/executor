@@ -79,7 +79,7 @@ const stubWorkOS = Layer.succeed(
 );
 
 const stubUsers = Layer.succeed(UserStoreService)({
-  use: (fn) =>
+  use: (_op, fn) =>
     Effect.promise(() =>
       fn({
         ensureAccount: async (id: string) => ({ id, createdAt }),

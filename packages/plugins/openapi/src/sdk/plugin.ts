@@ -649,7 +649,9 @@ export const openApiPlugin = definePlugin<
     config: Pick<
       OpenApiSpecConfig,
       "spec" | "specFormat" | "specOverrides" | "headers" | "queryParams" | "baseUrl"
-    >,
+    > & {
+      readonly authenticationTemplate?: readonly (Authentication | AuthenticationInput)[];
+    },
     httpClientLayer: Layer.Layer<HttpClient.HttpClient, never, never>,
   ): Effect.Effect<
     ResolvedSpec,
@@ -672,6 +674,13 @@ export const openApiPlugin = definePlugin<
             ...(config.headers ? { headers: config.headers } : {}),
             ...(config.queryParams ? { queryParams: config.queryParams } : {}),
           },
+          ...(config.authenticationTemplate
+            ? {
+                consentScopes: config.authenticationTemplate.flatMap((template) =>
+                  "kind" in template && template.kind === "oauth2" ? template.scopes : [],
+                ),
+              }
+            : {}),
           httpClientLayer,
         });
         return yield* applyOverridesToResolvedSpec(resolved, config.specOverrides);
@@ -978,6 +987,7 @@ export const openApiPlugin = definePlugin<
               headers: current.headers,
               queryParams: current.queryParams,
               baseUrl: current.baseUrl,
+              authenticationTemplate: current.authenticationTemplate,
             },
             httpClientLayer,
           );
