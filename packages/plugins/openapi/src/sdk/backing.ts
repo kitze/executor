@@ -929,6 +929,44 @@ export const resolveOpenApiBackedTools = ({
             .listOperations(String(integration.slug))
             .pipe(Effect.catch(() => Effect.succeed(null)));
           if (ops == null) return incomplete("OpenAPI operation bindings could not be loaded.");
+          // Bindings persisted before sensitivity metadata existed fail closed
+          // by sealing their whole output. Rebuild plain OpenAPI integrations
+          // once from their content-addressed spec so a normal connection
+          // refresh upgrades those bindings instead of keeping every response
+          // permanently opaque. Adapter-backed integrations may have filtered
+          // or transformed the source spec; they must be rebuilt through their
+          // adapter-specific update path rather than from the raw saved blob.
+          if (
+            openApiConfig.specFormat == null &&
+            ops.some((operation) => operation.binding.sensitivityVersion !== 2)
+          ) {
+            const specText = yield* loadOpenApiSpecText(storage, openApiConfig).pipe(
+              Effect.catch(() => Effect.succeed(null)),
+            );
+            const compiled =
+              specText == null
+                ? null
+                : yield* compileOpenApiSpecCached(openApiConfig.specHash, specText).pipe(
+                    Effect.catch(() => Effect.succeed(null)),
+                  );
+            if (compiled) {
+              const upgraded = openApiStoredOperationsFromCompiled(
+                String(integration.slug),
+                compiled,
+              );
+              const storedNames = new Set(ops.map((operation) => operation.toolName));
+              const sameCatalog =
+                upgraded.length === storedNames.size &&
+                upgraded.every((operation) => storedNames.has(operation.toolName));
+              if (sameCatalog) {
+                yield* storage.putOperations(String(integration.slug), upgraded);
+                return {
+                  tools: upgraded.map(toolDefFromStoredOperation),
+                  definitions,
+                };
+              }
+            }
+          }
           return {
             tools: ops.map(toolDefFromStoredOperation),
             definitions,

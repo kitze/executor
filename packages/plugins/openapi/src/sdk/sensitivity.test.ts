@@ -6,9 +6,11 @@ import {
   openApiStoredOperationsFromCompiled,
   openApiToolDefsFromCompiled,
   resolveOpenApiBackedAnnotations,
+  resolveOpenApiBackedTools,
 } from "./backing";
 import { streamOperationBindingsFromStructure } from "./extract";
 import { structuralSplit } from "./split";
+import type { OpenapiStore, StoredOperation } from "./store";
 
 const spec = JSON.stringify({
   openapi: "3.0.3",
@@ -612,6 +614,94 @@ describe("OpenAPI explicit sensitivity metadata", () => {
       expect(resolved[transfer.toolName]).toEqual({
         requiresApproval: true,
         approvalDescription: "POST /transfer",
+        sensitiveOutputPaths: [""],
+        sensitiveResponseHeaders: true,
+      });
+    }),
+  );
+
+  it.effect("connection refresh upgrades legacy plain OpenAPI bindings from the saved spec", () =>
+    Effect.gen(function* () {
+      const compiled = yield* compileOpenApiSpec(spec);
+      const current = openApiStoredOperationsFromCompiled("fixture", compiled);
+      let persisted: readonly StoredOperation[] = current.map((operation) => ({
+        ...operation,
+        binding: {
+          ...operation.binding,
+          sensitivityVersion: undefined,
+          sensitiveInputPaths: undefined,
+          sensitiveOutputPaths: undefined,
+          sensitiveOutputSafeScalars: undefined,
+          sensitiveResponseHeaders: undefined,
+        },
+      }));
+      const storage: OpenapiStore = {
+        putOperations: (_integration, operations) =>
+          Effect.sync(() => {
+            persisted = [...operations];
+          }),
+        appendOperations: () => Effect.void,
+        getOperation: (_integration, toolName) =>
+          Effect.succeed(persisted.find((operation) => operation.toolName === toolName) ?? null),
+        listOperations: () => Effect.succeed(persisted),
+        removeOperations: () => Effect.void,
+        putSpec: () => Effect.void,
+        getSpec: (hash) => Effect.succeed(hash === "fixture-hash" ? spec : null),
+        putDefs: () => Effect.void,
+        getDefs: (hash) =>
+          Effect.succeed(hash === "fixture-hash" ? JSON.stringify(compiled.hoistedDefs) : null),
+      };
+
+      const resolved = yield* resolveOpenApiBackedTools({
+        integration: { slug: "fixture" },
+        config: { specHash: "fixture-hash" },
+        storage,
+      });
+
+      expect(persisted.every((operation) => operation.binding.sensitivityVersion === 2)).toBe(true);
+      const transfer = resolved.tools.find((tool) => String(tool.name) === "transfer");
+      expect(transfer?.annotations).toEqual(
+        openApiToolDefsFromCompiled(compiled).find((tool) => String(tool.name) === "transfer")
+          ?.annotations,
+      );
+      expect(transfer?.annotations).not.toMatchObject({
+        sensitiveOutputPaths: [""],
+      });
+    }),
+  );
+
+  it.effect("connection refresh keeps adapter-backed legacy bindings sealed", () =>
+    Effect.gen(function* () {
+      const compiled = yield* compileOpenApiSpec(spec);
+      const current = openApiStoredOperationsFromCompiled("fixture", compiled);
+      const persisted = current.map((operation) => ({
+        ...operation,
+        binding: { ...operation.binding, sensitivityVersion: undefined },
+      }));
+      let writes = 0;
+      const storage: OpenapiStore = {
+        putOperations: () =>
+          Effect.sync(() => {
+            writes += 1;
+          }),
+        appendOperations: () => Effect.void,
+        getOperation: () => Effect.succeed(null),
+        listOperations: () => Effect.succeed(persisted),
+        removeOperations: () => Effect.void,
+        putSpec: () => Effect.void,
+        getSpec: () => Effect.succeed(spec),
+        putDefs: () => Effect.void,
+        getDefs: () => Effect.succeed(JSON.stringify(compiled.hoistedDefs)),
+      };
+
+      const resolved = yield* resolveOpenApiBackedTools({
+        integration: { slug: "fixture" },
+        config: { specHash: "fixture-hash", specFormat: "filtered-adapter" },
+        storage,
+      });
+
+      expect(writes).toBe(0);
+      expect(resolved.tools[0]?.annotations).toMatchObject({
         sensitiveOutputPaths: [""],
         sensitiveResponseHeaders: true,
       });
