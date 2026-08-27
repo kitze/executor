@@ -495,6 +495,37 @@ describe("exchangeAuthorizationCode", () => {
     ),
   );
 
+  it.effect("unwraps Withings-style successful token response bodies", () =>
+    withTokenEndpoint(
+      tokenResponse({
+        status: "0",
+        body: {
+          userid: 123,
+          access_token: "withings-token",
+          refresh_token: "withings-refresh",
+          token_type: "Bearer",
+          expires_in: 10_800,
+          scope: "user.info,user.metrics,user.activity",
+        },
+      }),
+      ({ tokenUrl }) =>
+        Effect.gen(function* () {
+          const result = yield* exchangeAuthorizationCode({
+            tokenUrl,
+            clientId: "cid",
+            clientSecret: "csecret",
+            redirectUrl: "https://app.example.com/cb",
+            codeVerifier: "verifier",
+            code: "abc",
+          });
+          expect(result.access_token).toBe("withings-token");
+          expect(result.refresh_token).toBe("withings-refresh");
+          expect(result.expires_in).toBe(10_800);
+          expect(result.scope).toBe("user.info,user.metrics,user.activity");
+        }),
+    ),
+  );
+
   it.effect("uses nested granted scopes for Slack-style user token responses", () =>
     withTokenEndpoint(
       tokenResponse({
@@ -1049,6 +1080,35 @@ describe("refreshAccessToken", () => {
     ),
   );
 
+  it.effect("unwraps Withings-style successful refresh response bodies", () =>
+    withTokenEndpoint(
+      tokenResponse({
+        status: 0,
+        body: {
+          userid: 123,
+          access_token: "withings-refreshed-token",
+          refresh_token: "withings-rotated-refresh",
+          token_type: "Bearer",
+          expires_in: 10_800,
+          scope: "user.info,user.metrics,user.activity",
+        },
+      }),
+      ({ tokenUrl }) =>
+        Effect.gen(function* () {
+          const result = yield* refreshAccessToken({
+            tokenUrl,
+            clientId: "cid",
+            clientSecret: "csecret",
+            refreshToken: "old",
+          });
+          expect(result.access_token).toBe("withings-refreshed-token");
+          expect(result.refresh_token).toBe("withings-rotated-refresh");
+          expect(result.expires_in).toBe(10_800);
+          expect(result.scope).toBe("user.info,user.metrics,user.activity");
+        }),
+    ),
+  );
+
   // Datadog answers refresh grants with a non-conform envelope; the §5.2 code
   // must still be recovered so invalid_grant classifies as reauth-required
   // instead of a retried-forever transient (owner.com prod, 2026-07-30).
@@ -1065,6 +1125,27 @@ describe("refreshAccessToken", () => {
           );
           expect(error).toBeInstanceOf(OAuth2Error);
           expect((error as OAuth2Error).error).toBe("invalid_grant");
+        }),
+    ),
+  );
+
+  it.effect("recovers invalid_grant from Withings's HTTP 200 error envelope", () =>
+    withTokenEndpoint(
+      () =>
+        json(200, {
+          status: 401,
+          error: "Invalid Params: invalid refresh_token",
+        }),
+      ({ tokenUrl }) =>
+        Effect.gen(function* () {
+          const error = yield* Effect.flip(
+            refreshAccessToken({ tokenUrl, clientId: "cid", refreshToken: "old" }),
+          );
+          expect(error).toBeInstanceOf(OAuth2Error);
+          expect((error as OAuth2Error).error).toBe("invalid_grant");
+          expect(error).toMatchObject({
+            message: expect.stringContaining("Invalid Params: invalid refresh_token"),
+          });
         }),
     ),
   );

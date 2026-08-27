@@ -404,7 +404,7 @@ const toOAuth2ErrorWithHttpSummary = (cause: unknown): Effect.Effect<OAuth2Error
   return Effect.promise(async () => {
     const summary = await tokenEndpointHttpSummary(response);
     // A 4xx the spec parser refused may still carry the AS's verdict in a
-    // non-conform envelope; recover it so classification (invalid_grant →
+    // non-conform envelope; recover it so classification (invalid_grant ->
     // reauth-required) sees the code instead of a code-less "transient".
     const recovered =
       base.error === undefined && response.status >= 400 && response.status < 500
@@ -626,6 +626,64 @@ type StrippedTokenResponse = {
   readonly idTokenIdentityLabel?: string;
 };
 
+const NestedTokenBodyEnvelope = Schema.Struct({
+  body: Schema.Struct({
+    access_token: Schema.String,
+  }),
+});
+const decodeNestedTokenBodyEnvelope = Schema.decodeUnknownOption(NestedTokenBodyEnvelope);
+
+const WithingsTokenErrorEnvelope = Schema.Struct({
+  status: Schema.Number,
+  error: Schema.String,
+});
+const decodeWithingsTokenErrorEnvelope = Schema.decodeUnknownOption(WithingsTokenErrorEnvelope);
+
+const jsonResponseWithBody = (
+  response: Response,
+  body: Readonly<Record<string, unknown>>,
+  status = response.status,
+  statusText = response.statusText,
+): Response => {
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.set("content-type", "application/json");
+  return new Response(JSON.stringify(body), { status, statusText, headers });
+};
+
+/** Withings returns successful OAuth grants as
+ *  `{ status, body: { access_token, ... } }` instead of RFC 6749's top-level
+ *  token response. It also returns token errors with HTTP 200 in
+ *  `{ status, error }`. Normalize the known dead-refresh-token verdict before
+ *  oauth4webapi processes the response so it is classified as a terminal
+ *  `invalid_grant`, while preserving the provider's original explanation.
+ *  Ordinary token responses and unknown provider errors keep their envelopes. */
+const unwrapNestedTokenBody = async (response: Response): Promise<Response> => {
+  if (!response.ok) return response;
+  const value = await response
+    .clone()
+    .json()
+    .then(
+      (body: unknown) => body,
+      () => null,
+    );
+  const withingsError = decodeWithingsTokenErrorEnvelope(value);
+  if (Option.isSome(withingsError) && /invalid\s+refresh_token/i.test(withingsError.value.error)) {
+    return jsonResponseWithBody(
+      response,
+      {
+        error: "invalid_grant",
+        error_description: withingsError.value.error,
+      },
+      400,
+      "Bad Request",
+    );
+  }
+  if (Option.isNone(decodeNestedTokenBodyEnvelope(value))) return response;
+  const body = (value as { readonly body: Readonly<Record<string, unknown>> }).body;
+  return jsonResponseWithBody(response, body);
+};
+
 const NestedAuthedUserScope = Schema.Struct({
   authed_user: Schema.Struct({
     scope: Schema.String,
@@ -713,7 +771,7 @@ const processTokenEndpointResponse = async (
   client: oauth.Client,
   response: Response,
 ): Promise<OAuth2TokenResponse> => {
-  const stripped = await stripIdToken(response);
+  const stripped = await stripIdToken(await unwrapNestedTokenBody(response));
   const providerUserGrant = await nestedAuthedUserGrant(stripped.response);
   const parsed = tokenResponseFrom(
     as,
@@ -939,7 +997,7 @@ export const refreshAccessToken = (
       const result = await oauth.processRefreshTokenResponse(
         as,
         client,
-        (await stripIdToken(response)).response,
+        (await stripIdToken(await unwrapNestedTokenBody(response))).response,
       );
       return tokenResponseFrom(as, result);
     },
