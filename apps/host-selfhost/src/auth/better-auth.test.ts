@@ -9,6 +9,7 @@ import { mintInviteCode } from "../testing/mint-invite";
 // Real Better Auth path: set a secret + bootstrap admin before importing.
 process.env.EXECUTOR_DATA_DIR = mkdtempSync(join(tmpdir(), "eh-auth-"));
 process.env.BETTER_AUTH_SECRET = "test-secret-0123456789-abcdefghijklmnop-qrstuv";
+process.env.EXECUTOR_WEB_BASE_URL = "https://executor.test";
 process.env.EXECUTOR_BOOTSTRAP_ADMIN_EMAIL = "admin@test.local";
 process.env.EXECUTOR_BOOTSTRAP_ADMIN_PASSWORD = "admin-password-123";
 
@@ -17,7 +18,7 @@ const { makeSelfHostApiHandler } = await import("../app");
 const { handler, dispose } = await makeSelfHostApiHandler();
 afterAll(() => dispose());
 
-const BASE = "http://localhost:4788";
+const BASE = "https://executor.test";
 
 test("migrations create both the Better Auth and FumaDB executor schema regions", async () => {
   // Open a SEPARATE libSQL connection to the same file Better Auth (via its own
@@ -71,6 +72,10 @@ test("sign-up issues a bearer token and resolves to a per-user org-pinned identi
   expect(signUp.status).toBe(200);
   const token = signUp.headers.get("set-auth-token");
   expect(token).toBeTruthy();
+  const sessionCookie = signUp.headers.get("set-cookie") ?? "";
+  expect(sessionCookie).toContain("Secure");
+  expect(sessionCookie).toContain("SameSite=None");
+  expect(sessionCookie).toContain("Partitioned");
 
   // The bearer token resolves to the user pinned to their own org (the v2 binding
   // is `{ tenant: org, subject: user }`; `/api/account/me` reflects both).

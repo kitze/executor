@@ -98,6 +98,21 @@ const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?:
     // origin keeps host-header injection out of OAuth redirects and links.
     baseURL: config.webBaseUrl,
     trustedOrigins: [config.webBaseUrl],
+    // Executor is also opened inside embedded app browsers. In that context
+    // the instance is cross-site relative to the host app, so a SameSite=Lax
+    // session cookie is rejected: sign-in succeeds, the page reloads, and the
+    // next /account/me request is anonymous. HTTPS deployments use a CHIPS
+    // partitioned cookie so the session works in the embedding app without
+    // becoming a shared third-party cookie. Keep Better Auth's Lax default for
+    // plain HTTP installs, where SameSite=None cookies would be rejected unless
+    // they were Secure.
+    ...(config.webBaseUrl.startsWith("https://")
+      ? {
+          advanced: {
+            defaultCookieAttributes: { sameSite: "none" as const, partitioned: true },
+          },
+        }
+      : {}),
     emailAndPassword: { enabled: true },
     // `apiKey` issues long-lived personal keys (the API-keys page). With
     // `enableSessionForAPIKeys`, presenting a key resolves to its owner's
