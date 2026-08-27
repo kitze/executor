@@ -252,7 +252,9 @@ export function IntegrationDetailPage(props: {
     );
   }, [connectionsResult, slug]);
 
-  const healthProbeFor = useConnectionsHealth(integrationConnections);
+  // The persistent shell overview owns automatic revalidation globally; this
+  // detail view only derives its warning from the coherent connection rows.
+  const healthProbeFor = useConnectionsHealth(integrationConnections, { revalidate: false });
   const toolsHealthIssue = useMemo(() => {
     const issues = integrationConnections
       .map((connection) => ({ connection, probe: healthProbeFor(connection) }))

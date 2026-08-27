@@ -99,10 +99,13 @@ function AccountRow(props: {
   // NOT derive expiry from the stored `expiresAt`: that's the access-token
   // lifetime, which refreshes, so a passive countdown means nothing.
   //
-  // Health checks are AUTOMATIC: the hook revalidates on mount, stale-while-
-  // revalidate style (shared with the integrations-list summary), and the
-  // persisted verdict renders instantly while the probe corrects it in place.
-  const { probe, status, runCheck } = useConnectionHealth(connection);
+  // The shell-level health overview owns automatic and periodic revalidation
+  // for every saved connection. This row consumes the persisted/live result
+  // and retains its explicit "Check now" action without launching a duplicate
+  // mount-time probe.
+  const { probe, status, runCheck } = useConnectionHealth(connection, {
+    revalidate: false,
+  });
   const indicator = HEALTH_INDICATOR_COLOR[status];
 
   // Prefer the stored label from the connection row, then a probed identity,

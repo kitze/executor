@@ -48,13 +48,40 @@ const HEALTH_SEVERITY: Record<Exclude<HealthStatus, "unknown">, number> = {
 /** Collapse many connection statuses to the group's worst: expired > degraded
  *  > healthy. `unknown` entries are ignored; when nothing else remains (empty
  *  input or all unknown) there is no verdict and the caller renders nothing. */
-export const worstHealthStatus = (statuses: readonly HealthStatus[]): HealthStatus | null => {
+export const worstHealthStatus = (
+  statuses: readonly HealthStatus[],
+): Exclude<HealthStatus, "unknown"> | null => {
   let worst: Exclude<HealthStatus, "unknown"> | null = null;
   for (const status of statuses) {
     if (status === "unknown") continue;
     if (worst === null || HEALTH_SEVERITY[status] > HEALTH_SEVERITY[worst]) worst = status;
   }
   return worst;
+};
+
+export interface IntegrationHealthVerdict {
+  readonly status: Exclude<HealthStatus, "unknown">;
+  readonly label: string;
+}
+
+/** Traffic-light verdict for one integration. Executor is intrinsically
+ * healthy while its console is running; an integration with no saved
+ * connection is red; unknown or partially unknown connection health is
+ * yellow; otherwise the worst saved connection wins. Keeping this alongside
+ * `worstHealthStatus` makes the card dot, sidebar summary, and status filters
+ * use exactly the same classification. */
+export const integrationHealthVerdict = (
+  integration: string,
+  statuses: readonly HealthStatus[],
+): IntegrationHealthVerdict => {
+  if (integration === "executor") return { status: "healthy", label: "Healthy" };
+  if (statuses.length === 0) return { status: "expired", label: "Unconnected" };
+
+  const worst = worstHealthStatus(statuses);
+  if (worst === null || (worst === "healthy" && statuses.includes("unknown"))) {
+    return { status: "degraded", label: "No health check" };
+  }
+  return { status: worst, label: HEALTH_STATUS_LABEL[worst] };
 };
 
 /** Badge variant per status: semantic color via the Badge component. */

@@ -1,12 +1,13 @@
-import { Link, Outlet, useLocation, useParams } from "@tanstack/react-router";
+import { Link, Outlet, useLocation, useNavigate, useParams } from "@tanstack/react-router";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
-import { BookOpen, Command, ExternalLink } from "lucide-react";
+import { BookOpen, Command, ExternalLink, RefreshCw } from "lucide-react";
 import type { Integration } from "@executor-js/sdk/shared";
-import { integrationsOptimisticAtom } from "../api/atoms";
+import { connectionsAllAtom, integrationsOptimisticAtom } from "../api/atoms";
 import { trackEvent } from "../api/analytics";
 import { Button } from "../components/button";
+import { IntegrationHealthSummary } from "../components/integration-health-summary";
 import { Skeleton } from "../components/skeleton";
 import { SidebarUpdateCard } from "../components/update-card";
 import {
@@ -23,6 +24,13 @@ import {
 } from "../components/integration-favicon";
 import { CommandPalette } from "../components/command-palette";
 import { Wordmark } from "../components/wordmark";
+import { HEALTH_INDICATOR_COLOR } from "../lib/health-display";
+import {
+  INTEGRATION_STATUS_FILTER_OPTIONS,
+  IntegrationHealthOverviewProvider,
+  useIntegrationHealthOverview,
+} from "../lib/integration-health-overview";
+import { useRunConnectionHealthCheck } from "../lib/use-connection-health";
 import { useClientPlugins, useIntegrationPlugins } from "@executor-js/sdk/client";
 import { useAuth } from "./auth-context";
 
@@ -181,10 +189,101 @@ function CommandsButton(props: { onOpen: () => void }) {
 
 // ── IntegrationList ───────────────────────────────────────────────────────────
 
+function RefreshAllIntegrationsButton() {
+  const connectionsResult = useAtomValue(connectionsAllAtom);
+  const runHealthCheck = useRunConnectionHealthCheck();
+  const [checking, setChecking] = useState(false);
+  const connections = AsyncResult.isSuccess(connectionsResult) ? connectionsResult.value : [];
+
+  const refreshAll = async () => {
+    if (checking) return;
+    setChecking(true);
+    await Promise.all(connections.map((connection) => runHealthCheck(connection, { force: true })));
+    setChecking(false);
+  };
+
+  return (
+    // oxlint-disable-next-line react/forbid-elements -- compact sidebar action; Button styling is intentionally too large here
+    <button
+      type="button"
+      data-testid="refresh-all-integrations"
+      onClick={() => void refreshAll()}
+      disabled={checking || !AsyncResult.isSuccess(connectionsResult)}
+      title={`Check all ${connections.length} saved connections`}
+      className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-muted-foreground transition-colors hover:bg-sidebar-active hover:text-foreground disabled:cursor-wait disabled:opacity-50"
+    >
+      <RefreshCw className={`size-2.5 ${checking ? "animate-spin" : ""}`} />
+      {checking ? "Checking…" : "Refresh"}
+    </button>
+  );
+}
+
+function IntegrationHealthSidebarSummary(props: { readonly onNavigate?: () => void }) {
+  const navigate = useNavigate();
+  const { counts, ready, statusFilter, setStatusFilter } = useIntegrationHealthOverview();
+
+  return (
+    <section
+      data-testid="integration-health-overview"
+      aria-label="Integration status summary"
+      className="rounded-md border border-sidebar-border bg-sidebar-active/25 p-1.5"
+    >
+      <div className="mb-1 flex items-center justify-between px-1">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+          Health
+        </span>
+        <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+          {counts.all} total
+        </span>
+      </div>
+      <div className="grid grid-cols-4 gap-1" aria-label="Filter services by status">
+        {INTEGRATION_STATUS_FILTER_OPTIONS.map((option) => {
+          const active = statusFilter === option.value;
+          const disabled = !ready && option.value !== "all";
+          const count = ready || option.value === "all" ? counts[option.value] : "—";
+          return (
+            <Button
+              key={option.value}
+              type="button"
+              size="xs"
+              variant={active ? "secondary" : "ghost"}
+              data-testid={`integration-status-filter-${option.value}`}
+              aria-label={`Show ${option.label.toLowerCase()} services (${String(count)})`}
+              aria-pressed={active}
+              title={option.description}
+              disabled={disabled}
+              onClick={() => {
+                setStatusFilter(option.value);
+                props.onNavigate?.();
+                void navigate({ to: "/{-$orgSlug}" });
+              }}
+              className="h-6 min-w-0 gap-1 px-1 text-[10px]"
+            >
+              {option.value === "all" ? (
+                <span>All</span>
+              ) : (
+                <>
+                  <span
+                    aria-hidden="true"
+                    className={`size-1.5 rounded-full ${HEALTH_INDICATOR_COLOR[option.value].dot}`}
+                  />
+                  <span className="sr-only">{option.label}</span>
+                </>
+              )}
+              <span className="font-mono tabular-nums text-muted-foreground">{count}</span>
+            </Button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 // `pathname` is scope-relative (org-slug prefix already stripped).
 function IntegrationList(props: { pathname: string; onNavigate?: () => void }) {
   const integrations = useAtomValue(integrationsOptimisticAtom);
   const integrationPlugins = useIntegrationPlugins();
+  const { ready, healthByIntegration, statusFilter } = useIntegrationHealthOverview();
 
   return AsyncResult.match(integrations, {
     onInitial: () => (
@@ -200,14 +299,29 @@ function IntegrationList(props: { pathname: string; onNavigate?: () => void }) {
     onFailure: () => (
       <div className="px-2.5 py-2 text-xs text-muted-foreground">No integrations yet</div>
     ),
-    onSuccess: ({ value }) =>
-      value.length === 0 ? (
+    onSuccess: ({ value }) => {
+      const visibleIntegrations =
+        !ready || statusFilter === "all"
+          ? value
+          : value.filter(
+              (integration) =>
+                healthByIntegration.get(String(integration.slug))?.status === statusFilter,
+            );
+      return value.length === 0 ? (
         <div className="px-2.5 py-2 text-sm leading-relaxed text-muted-foreground">
           No integrations yet
         </div>
+      ) : visibleIntegrations.length === 0 ? (
+        <div className="px-2.5 py-2 text-xs text-muted-foreground">
+          No{" "}
+          {INTEGRATION_STATUS_FILTER_OPTIONS.find(
+            (option) => option.value === statusFilter,
+          )?.label.toLowerCase()}{" "}
+          services
+        </div>
       ) : (
         <div className="flex flex-col gap-px">
-          {value.map((integration: Integration) => {
+          {visibleIntegrations.map((integration: Integration) => {
             const slug = String(integration.slug);
             const name = integration.name || slug;
             const detailPath = `/integrations/${slug}`;
@@ -239,11 +353,17 @@ function IntegrationList(props: { pathname: string; onNavigate?: () => void }) {
                   }
                 />
                 <span className="flex-1 truncate">{name}</span>
+                <IntegrationHealthSummary
+                  integration={integration.slug}
+                  compact
+                  revalidate={false}
+                />
               </Link>
             );
           })}
         </div>
-      ),
+      );
+    },
   });
 }
 
@@ -382,8 +502,12 @@ function SidebarContent(
           />
         ))}
 
-        <div className="mt-5 mb-1 px-2.5 text-xs font-medium uppercase tracking-widest text-muted-foreground">
-          <span>Integrations</span>
+        <div className="sticky top-0 z-10 -mx-2 mt-5 bg-sidebar px-2 pb-2">
+          <div className="mb-1 flex items-center justify-between px-2.5 text-xs font-medium uppercase tracking-widest text-muted-foreground">
+            <span>Integrations</span>
+            <RefreshAllIntegrationsButton />
+          </div>
+          <IntegrationHealthSidebarSummary onNavigate={props.onNavigate} />
         </div>
 
         <IntegrationList pathname={props.pathname} onNavigate={props.onNavigate} />
@@ -430,89 +554,91 @@ export function Shell(props: ShellProps) {
   }, [mobileSidebarOpen]);
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
-      {/* Desktop sidebar */}
-      <aside className="hidden w-52 shrink-0 border-r border-sidebar-border bg-sidebar md:flex md:flex-col lg:w-56">
-        <SidebarContent
-          {...props}
-          pathname={pathname}
-          onOpenCommands={() => setCommandPaletteOpen(true)}
-        />
-      </aside>
-
-      {/* Mobile sidebar overlay */}
-      {mobileSidebarOpen && (
-        <div className="fixed inset-0 z-50 flex md:hidden">
-          {/* oxlint-disable-next-line react/forbid-elements */}
-          <button
-            type="button"
-            aria-label="Close navigation"
-            className="absolute inset-0 bg-black/45 backdrop-blur-[1px]"
-            onClick={() => setMobileSidebarOpen(false)}
+    <IntegrationHealthOverviewProvider>
+      <div className="flex h-screen overflow-hidden">
+        <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
+        {/* Desktop sidebar */}
+        <aside className="hidden w-52 shrink-0 border-r border-sidebar-border bg-sidebar md:flex md:flex-col lg:w-56">
+          <SidebarContent
+            {...props}
+            pathname={pathname}
+            onOpenCommands={() => setCommandPaletteOpen(true)}
           />
-          <div className="relative flex h-full w-[84vw] max-w-xs flex-col border-r border-sidebar-border bg-sidebar shadow-2xl">
-            <div className="flex h-12 shrink-0 items-center justify-between border-b border-sidebar-border px-4">
-              <Brand onNavigate={() => setMobileSidebarOpen(false)} />
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                type="button"
-                aria-label="Close navigation"
-                onClick={() => setMobileSidebarOpen(false)}
-                className="text-sidebar-foreground hover:bg-sidebar-active hover:text-foreground"
-              >
-                <svg viewBox="0 0 16 16" className="size-3.5">
-                  <path
-                    d="M3 3l10 10M13 3L3 13"
-                    stroke="currentColor"
-                    strokeWidth="1.4"
-                    strokeLinecap="round"
-                  />
-                </svg>
-              </Button>
-            </div>
-            <SidebarContent
-              {...props}
-              pathname={pathname}
-              onNavigate={() => setMobileSidebarOpen(false)}
-              showBrand={false}
-              onOpenCommands={() => {
-                setMobileSidebarOpen(false);
-                setCommandPaletteOpen(true);
-              }}
+        </aside>
+
+        {/* Mobile sidebar overlay */}
+        {mobileSidebarOpen && (
+          <div className="fixed inset-0 z-50 flex md:hidden">
+            {/* oxlint-disable-next-line react/forbid-elements */}
+            <button
+              type="button"
+              aria-label="Close navigation"
+              className="absolute inset-0 bg-black/45 backdrop-blur-[1px]"
+              onClick={() => setMobileSidebarOpen(false)}
             />
-          </div>
-        </div>
-      )}
-
-      {/* Main content */}
-      <main className="flex min-h-0 flex-1 flex-col min-w-0 overflow-hidden">
-        {/* Mobile top bar */}
-        <div className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-background px-4 md:hidden">
-          <Button
-            variant="outline"
-            size="icon-sm"
-            type="button"
-            aria-label="Open navigation"
-            onClick={() => setMobileSidebarOpen(true)}
-            className="bg-card hover:bg-accent/50"
-          >
-            <svg viewBox="0 0 16 16" className="size-4">
-              <path
-                d="M2 4h12M2 8h12M2 12h12"
-                stroke="currentColor"
-                strokeWidth="1.2"
-                strokeLinecap="round"
+            <div className="relative flex h-full w-[84vw] max-w-xs flex-col border-r border-sidebar-border bg-sidebar shadow-2xl">
+              <div className="flex h-12 shrink-0 items-center justify-between border-b border-sidebar-border px-4">
+                <Brand onNavigate={() => setMobileSidebarOpen(false)} />
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  type="button"
+                  aria-label="Close navigation"
+                  onClick={() => setMobileSidebarOpen(false)}
+                  className="text-sidebar-foreground hover:bg-sidebar-active hover:text-foreground"
+                >
+                  <svg viewBox="0 0 16 16" className="size-3.5">
+                    <path
+                      d="M3 3l10 10M13 3L3 13"
+                      stroke="currentColor"
+                      strokeWidth="1.4"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                </Button>
+              </div>
+              <SidebarContent
+                {...props}
+                pathname={pathname}
+                onNavigate={() => setMobileSidebarOpen(false)}
+                showBrand={false}
+                onOpenCommands={() => {
+                  setMobileSidebarOpen(false);
+                  setCommandPaletteOpen(true);
+                }}
               />
-            </svg>
-          </Button>
-          <Brand />
-          <div className="w-8 shrink-0" />
-        </div>
+            </div>
+          </div>
+        )}
 
-        {props.content ?? <Outlet />}
-      </main>
-    </div>
+        {/* Main content */}
+        <main className="flex min-h-0 flex-1 flex-col min-w-0 overflow-hidden">
+          {/* Mobile top bar */}
+          <div className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-background px-4 md:hidden">
+            <Button
+              variant="outline"
+              size="icon-sm"
+              type="button"
+              aria-label="Open navigation"
+              onClick={() => setMobileSidebarOpen(true)}
+              className="bg-card hover:bg-accent/50"
+            >
+              <svg viewBox="0 0 16 16" className="size-4">
+                <path
+                  d="M2 4h12M2 8h12M2 12h12"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </Button>
+            <Brand />
+            <div className="w-8 shrink-0" />
+          </div>
+
+          {props.content ?? <Outlet />}
+        </main>
+      </div>
+    </IntegrationHealthOverviewProvider>
   );
 }
