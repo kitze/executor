@@ -26,6 +26,7 @@ import { McpConsentPage } from "../chromeless/mcp-consent-page";
 import { LoginPage } from "../login";
 import { SetupPage } from "../setup";
 import { fetchNeedsSetup } from "../setup-status";
+import { clearSessionBearer, sessionBearerAuthorizationHeader } from "../session-bearer";
 
 // ---------------------------------------------------------------------------
 // Self-host root: the SHARED multiplayer composition with Better Auth as the
@@ -63,8 +64,18 @@ const selfHostNavItems = [
 const selfHostAdminNavItems = [{ to: "/users", label: "Users" }];
 
 const signOut = async () => {
-  await authClient.signOut();
-  window.location.href = "/";
+  const authorization = sessionBearerAuthorizationHeader();
+  // oxlint-disable-next-line executor/no-try-catch-or-throw -- cleanup boundary: clear the local bearer even when server sign-out is unavailable
+  try {
+    if (authorization) {
+      await authClient.signOut({ fetchOptions: { headers: { authorization } } });
+    } else {
+      await authClient.signOut();
+    }
+  } finally {
+    clearSessionBearer();
+    window.location.href = "/";
+  }
 };
 
 function NotFoundPage() {

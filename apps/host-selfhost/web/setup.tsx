@@ -6,6 +6,7 @@ import { Label } from "@executor-js/react/components/label";
 
 import { authClient } from "./auth-client";
 import { AuthLayout } from "./auth-layout";
+import { persistSessionBearer } from "./session-bearer";
 
 // First-run setup. A fresh instance has no users, so the first visitor creates
 // the admin account here. The server admits the first signup into the empty org
@@ -29,6 +30,13 @@ export const SetupPage = () => {
       setError(result.error.message ?? "Could not create the admin account.");
       return;
     }
+    const token = result.data?.token;
+    if (!token) {
+      setBusy(false);
+      setError("The account was created without a session. Please sign in.");
+      return;
+    }
+    persistSessionBearer(token);
     window.location.href = "/";
   };
 

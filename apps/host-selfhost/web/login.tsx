@@ -6,6 +6,7 @@ import { Label } from "@executor-js/react/components/label";
 
 import { authClient } from "./auth-client";
 import { AuthLayout } from "./auth-layout";
+import { persistSessionBearer } from "./session-bearer";
 import { postLoginTarget } from "../src/auth/return-to";
 
 // Self-host login: email + password sign-in via Better Auth. On success we
@@ -38,6 +39,13 @@ export const LoginPage = () => {
       setError(result.error.message ?? "Sign in failed");
       return;
     }
+    const token = result.data?.token;
+    if (!token) {
+      setBusy(false);
+      setError("Sign in did not create a session. Please try again.");
+      return;
+    }
+    persistSessionBearer(token);
     window.location.href = postLogin;
   };
 

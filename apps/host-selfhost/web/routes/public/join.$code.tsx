@@ -7,6 +7,7 @@ import { Input } from "@executor-js/react/components/input";
 import { Label } from "@executor-js/react/components/label";
 
 import { authClient } from "../../auth-client";
+import { persistSessionBearer } from "../../session-bearer";
 
 export const Route = createFileRoute("/join/$code")({
   component: JoinPage,
@@ -66,6 +67,13 @@ function JoinPage() {
       );
       return;
     }
+    const token = result.data?.token;
+    if (!token) {
+      setBusy(false);
+      setError("Your account was created without a session. Please sign in.");
+      return;
+    }
+    persistSessionBearer(token);
     window.location.href = "/";
   };
 

@@ -70,8 +70,10 @@ test("sign-up issues a bearer token and resolves to a per-user org-pinned identi
     }),
   );
   expect(signUp.status).toBe(200);
-  const token = signUp.headers.get("set-auth-token");
-  expect(token).toBeTruthy();
+  const signedToken = signUp.headers.get("set-auth-token");
+  expect(signedToken).toBeTruthy();
+  const signUpBody = (await signUp.json()) as { token?: string };
+  expect(signUpBody.token).toBeTruthy();
   const sessionCookie = signUp.headers.get("set-cookie") ?? "";
   expect(sessionCookie).toContain("Secure");
   expect(sessionCookie).toContain("SameSite=None");
@@ -81,7 +83,9 @@ test("sign-up issues a bearer token and resolves to a per-user org-pinned identi
   // is `{ tenant: org, subject: user }`; `/api/account/me` reflects both).
   const me = await handler(
     new Request("http://localhost/api/account/me", {
-      headers: { authorization: `Bearer ${token}` },
+      // The browser fallback stores the raw token from the JSON body. The
+      // bearer plugin accepts it without relying on the rejected cookie.
+      headers: { authorization: `Bearer ${signUpBody.token}` },
     }),
   );
   expect(me.status).toBe(200);
