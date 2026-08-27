@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Predicate } from "effect";
+import { Deferred, Effect, Fiber, Predicate, Ref } from "effect";
 
 import {
   AuthTemplateSlug,
@@ -13,11 +13,13 @@ import {
 import { authToolFailure } from "./auth-tool-failure";
 import { decodeOAuthCallbackState } from "./oauth";
 import { OAuthStartError } from "./oauth-client";
+import { makeOAuthRefreshCoordinator } from "./oauth-refresh-coordinator";
 import { missingGrantedOAuthScopes } from "./oauth-service";
 import { definePlugin } from "./plugin";
 import { makeTestWorkspaceHarness, memoryCredentialsPlugin } from "./test-config";
 import { ToolResult } from "./tool-result";
 import { serveOAuthTestServer } from "./testing/oauth-test-server";
+import { createExecutor } from "./executor";
 
 // Milestone 2: prove the v2 `oauth.start` / `oauth.complete` token-minting flow
 // and OAuth access-token refresh end to end against the test authorization
@@ -812,6 +814,131 @@ describe("oauth.start / oauth.complete", () => {
 });
 
 describe("oauth token refresh in resolveConnectionValue", () => {
+  it.effect("keeps a shared refresh gated when its first waiter is interrupted", () =>
+    Effect.gen(function* () {
+      const coordinator = makeOAuthRefreshCoordinator();
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const calls = yield* Ref.make(0);
+      const identity = {
+        tenant: "tenant",
+        owner: "org",
+        subject: "*",
+        integration: "acme",
+        connection: "main",
+      };
+      const refresh = Ref.update(calls, (count) => count + 1).pipe(
+        Effect.andThen(Deferred.succeed(started, undefined)),
+        Effect.andThen(Deferred.await(release)),
+        Effect.as("rotated-token"),
+      );
+
+      const first = yield* Effect.forkChild(coordinator.coordinate(identity, refresh));
+      yield* Deferred.await(started);
+      const interruption = yield* Effect.forkChild(Fiber.interrupt(first));
+      const late = yield* Effect.forkChild(coordinator.coordinate(identity, refresh));
+      yield* Effect.yieldNow;
+
+      expect(yield* Ref.get(calls), "cancellation leaves the active grant gated").toBe(1);
+      expect(
+        interruption.pollUnsafe(),
+        "the initiating request scope stays alive until its refresh settles",
+      ).toBeUndefined();
+      yield* Deferred.succeed(release, undefined);
+      expect(yield* Fiber.join(late)).toBe("rotated-token");
+      yield* Fiber.join(interruption);
+      expect(yield* Ref.get(calls), "the late waiter reused the same grant").toBe(1);
+    }),
+  );
+
+  it.effect("coalesces a rotating refresh grant across request-created executors", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const oauthRefreshCoordinator = makeOAuthRefreshCoordinator();
+        const harness = yield* makeTestWorkspaceHarness({
+          plugins,
+          oauthRefreshCoordinator,
+        });
+        const { executor, config } = harness;
+
+        yield* executor.acme.seed();
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          resource: server.mcpResourceUrl,
+        });
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("sharedRefresh"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        yield* executor.oauth.complete({ state: started.state, code: callback.code });
+
+        const connection = {
+          owner: "org" as const,
+          integration: INTEG,
+          name: ConnectionName.make("sharedRefresh"),
+        };
+        expect(yield* executor.connections.get(connection)).not.toBeNull();
+
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "sharedRefresh"),
+            set: { expires_at: Date.now() - 60_000 },
+          }),
+        );
+        yield* server.clearRequests;
+
+        // Match the request-scoped host: both callers get fresh Executor
+        // instances over the same database, provider, and host coordinator.
+        const requestConfig = { ...config, db: config.testDb.db };
+        const leftExecutor = yield* createExecutor(requestConfig);
+        const rightExecutor = yield* createExecutor(requestConfig);
+        yield* Effect.addFinalizer(() => leftExecutor.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() => rightExecutor.close().pipe(Effect.ignore));
+        expect(yield* leftExecutor.connections.get(connection)).not.toBeNull();
+        expect(yield* rightExecutor.connections.get(connection)).not.toBeNull();
+
+        const [left, right] = yield* Effect.all(
+          [
+            leftExecutor.connections.checkHealth(connection),
+            rightExecutor.connections.checkHealth(connection),
+          ],
+          { concurrency: "unbounded" },
+        );
+
+        expect(left).toMatchObject({ status: "healthy" });
+        expect(right).toMatchObject({ status: "healthy" });
+        const refreshRequests = (yield* server.requests).filter(
+          (request) => request.path === "/token" && request.body.includes("refresh_token"),
+        );
+        expect(refreshRequests, "both executors await one rotating-token grant").toHaveLength(1);
+
+        const row = yield* Effect.promise(() =>
+          config.db.findFirst("connection", {
+            where: (b) => b("name", "=", "sharedRefresh"),
+          }),
+        );
+        expect(row?.provider_state).toBeNull();
+      }),
+    ),
+  );
+
   it.effect("an expired access token is refreshed before resolving", () =>
     Effect.scoped(
       Effect.gen(function* () {

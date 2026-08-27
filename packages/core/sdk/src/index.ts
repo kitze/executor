@@ -412,6 +412,11 @@ export {
   connectionAddress,
   toolAddress,
 } from "./executor";
+export {
+  makeOAuthRefreshCoordinator,
+  type OAuthRefreshCoordinator,
+  type OAuthRefreshIdentity,
+} from "./oauth-refresh-coordinator";
 export { coolifySafeProjectToolResult } from "./coolify-safe-projection";
 
 // CLI / runtime config.

@@ -8,6 +8,7 @@ import {
   PluginsProvider,
 } from "@executor-js/api/server";
 import { makeQuickJsExecutor } from "@executor-js/runtime-quickjs";
+import { makeOAuthRefreshCoordinator } from "@executor-js/sdk";
 
 import executorConfig from "../executor.config";
 import { selfHostAnalytics, SelfHostAnalyticsEngineDecorator } from "./analytics";
@@ -49,12 +50,18 @@ export const SelfHostPluginsProvider: Layer.Layer<PluginsProvider> = Layer.succe
   },
 );
 
+// `makeScopedExecutor` builds a fresh Executor for every HTTP/MCP request. Keep
+// the rotating-token gate at process lifetime so overlapping requests converge
+// on one refresh grant instead of invalidating one another's token family.
+const selfHostOAuthRefreshCoordinator = makeOAuthRefreshCoordinator();
+
 export const SelfHostHostConfig: Layer.Layer<HostConfig> = Layer.sync(HostConfig, () => {
   const config = loadConfig();
   return {
     allowLocalNetwork: config.allowLocalNetwork,
     webBaseUrl: config.webBaseUrl,
     oauthCallbackPath: "/api/oauth/callback",
+    oauthRefreshCoordinator: selfHostOAuthRefreshCoordinator,
     onIntegrationChange: (event) =>
       selfHostAnalytics.record(
         event.kind === "added" ? "integration_added" : "integration_removed",

@@ -171,6 +171,10 @@ import { connectionIdentifier } from "./connection-name-identifier";
 import { annotateToolResultOutcome, isToolResult } from "./tool-result";
 import { isUnauthorizedToolFailure } from "./auth-tool-failure";
 import { coolifySafeProjectToolResult } from "./coolify-safe-projection";
+import {
+  makeOAuthRefreshCoordinator,
+  type OAuthRefreshCoordinator,
+} from "./oauth-refresh-coordinator";
 
 const PLUGIN_STORAGE_DELETE_KEY_BATCH_SIZE = 90;
 const PLUGIN_STORAGE_CREATE_ROW_BATCH_SIZE = 90;
@@ -615,6 +619,14 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
   /** Optional URL selected organization slug to carry inside OAuth `state`. */
   readonly oauthCallbackStateOrgSlug?: string;
   readonly oauthEndpointUrlPolicy?: OAuthEndpointUrlPolicy;
+  /**
+   * Host-level gate for rotating OAuth refresh tokens. Request-scoped hosts
+   * must share one coordinator across every Executor backed by the same
+   * credential store; otherwise concurrent requests can reuse one rotating
+   * refresh token and invalidate the whole grant family. Defaults to a
+   * coordinator owned by this Executor instance.
+   */
+  readonly oauthRefreshCoordinator?: OAuthRefreshCoordinator;
   /**
    * Host-operated OAuth apps (the deployment's own registered GitHub/Google/…
    * apps), addressed as `first-party:<name>`. Users connect through them with
@@ -1533,6 +1545,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
     const tenant = String(config.tenant);
     const subject = config.subject != null ? String(config.subject) : null;
+    const oauthRefreshCoordinator = config.oauthRefreshCoordinator ?? makeOAuthRefreshCoordinator();
 
     const ownerBinding: OwnerBinding = {
       tenant: config.tenant,
@@ -1720,18 +1733,6 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           ),
       });
 
-    // In-flight refresh gate — concurrent resolves of the same connection share
-    // one refresh (mirrors v1's refresh deferred-map) so we never fire two
-    // refresh-token grants for the same connection in parallel (the AS rotates
-    // the refresh token; the second request would race on a consumed token).
-    const refreshInFlight = new Map<
-      string,
-      Effect.Effect<string | null, StorageFailure | CredentialResolutionError>
-    >();
-
-    const connectionKey = (row: ConnectionRow): string =>
-      `${row.owner}:${row.subject}:${row.integration}:${row.name}`;
-
     const loadOAuthClientRow = (
       owner: Owner,
       slug: string,
@@ -1760,6 +1761,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     /** What drove a refresh: the pre-call expiry check (`proactive`), or an
      *  upstream 401 on a token we believed was still valid (`reactive`). */
     type RefreshTrigger = "proactive" | "reactive";
+
+    const primaryConnectionItemId = (row: ConnectionRow): ProviderItemId =>
+      ProviderItemId.make(
+        connectionItemIds(row)[PRIMARY_INPUT_VARIABLE] ??
+          `connection:${row.owner}:${row.integration}:${row.name}:${PRIMARY_INPUT_VARIABLE}`,
+      );
 
     /** Record the AS's invalid_grant verdict on the row so later refreshes
      *  skip the doomed token request, and stamp `last_health` expired so the
@@ -1985,10 +1992,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         if (provider.set) {
           // OAuth is always single-input: the access token lives in the `token`
           // item. Fall back to a deterministic id if the map is somehow empty.
-          const tokenItemId =
-            connectionItemIds(row)[PRIMARY_INPUT_VARIABLE] ??
-            `connection:${row.owner}:${row.integration}:${row.name}:${PRIMARY_INPUT_VARIABLE}`;
-          yield* provider.set(ProviderItemId.make(tokenItemId), token.access_token);
+          yield* provider.set(primaryConnectionItemId(row), token.access_token);
           if (token.refresh_token && row.refresh_item_id) {
             yield* provider.set(ProviderItemId.make(row.refresh_item_id), token.refresh_token);
           }
@@ -2066,33 +2070,35 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       row: ConnectionRow,
       provider: CredentialProvider,
       trigger: RefreshTrigger = "proactive",
+      rejectedAccessToken?: string,
     ): Effect.Effect<string | null, StorageFailure | CredentialResolutionError> =>
-      // Share a single refresh per connection so concurrent resolves of the same
-      // connection all await one refresh-token grant (the AS rotates the refresh
-      // token; parallel grants would race on a consumed token — v1's refresh
-      // deferred-map). The gate is cleared once the refresh settles so a later
-      // expiry can refresh again.
-      Effect.gen(function* () {
-        const key = connectionKey(row);
-        // Joining an in-flight grant is correct for BOTH triggers: whatever
-        // that peer mints is newer than the token this fiber just saw rejected,
-        // which is exactly what a reactive retry wants. The gate is cleared on
-        // settle, so a 401 arriving after a refresh completed starts a fresh
-        // grant rather than replaying the stale memoized one.
-        const existing = refreshInFlight.get(key);
-        if (existing) return yield* existing;
-        // `Effect.cached` memoizes the grant onto a deferred: it runs once and
-        // replays to every awaiter sharing this entry.
-        const memoized = yield* Effect.cached(performTokenRefresh(row, provider, trigger));
-        const gated = memoized.pipe(
-          Effect.ensuring(Effect.sync(() => refreshInFlight.delete(key))),
-        );
-        // Re-check after building (a peer fiber may have registered first while
-        // we built ours) so everyone converges on the same shared grant.
-        const winner = refreshInFlight.get(key) ?? gated;
-        if (winner === gated) refreshInFlight.set(key, gated);
-        return yield* winner;
-      });
+      // Joining an in-flight grant is correct for BOTH triggers: whatever that
+      // peer mints is newer than the token this fiber just saw rejected, which
+      // is exactly what a reactive retry wants. The coordinator clears settled
+      // grants so a later expiry can refresh again.
+      oauthRefreshCoordinator.coordinate(
+        {
+          tenant,
+          owner: row.owner,
+          subject: row.subject,
+          integration: row.integration,
+          connection: row.name,
+        },
+        trigger === "reactive" && rejectedAccessToken !== undefined
+          ? Effect.gen(function* () {
+              // The request may receive its 401 just after a peer finished
+              // rotating the grant and left the in-flight gate. Compare the
+              // token this request actually sent with the current stored one;
+              // if they differ, the peer's token is already the correct retry
+              // credential and another single-use refresh would be harmful.
+              const currentAccessToken = yield* provider.get(primaryConnectionItemId(row));
+              if (currentAccessToken != null && currentAccessToken !== rejectedAccessToken) {
+                return currentAccessToken;
+              }
+              return yield* performTokenRefresh(row, provider, trigger);
+            })
+          : performTokenRefresh(row, provider, trigger),
+      );
 
     // Resolve every named input of a connection (`variable → value`). A
     // single-secret connection yields `{ token: <value> }`; an apiKey method with
@@ -2144,6 +2150,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
      *  upstream's own auth failure instead of inventing one. */
     const forceRefreshConnectionValues = (
       row: ConnectionRow,
+      rejectedAccessToken: string | null,
     ): Effect.Effect<
       Record<string, string | null> | null,
       StorageFailure | CredentialResolutionError
@@ -2152,7 +2159,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         if (row.oauth_client == null || row.refresh_item_id == null) return null;
         const provider = credentialProviders.get(row.provider);
         if (!provider) return null;
-        const access = yield* refreshConnectionToken(row, provider, "reactive");
+        const access = yield* refreshConnectionToken(
+          row,
+          provider,
+          "reactive",
+          rejectedAccessToken ?? undefined,
+        );
         return { [PRIMARY_INPUT_VARIABLE]: access };
       });
 
@@ -4825,7 +4837,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             prepared.containsOpaqueValue,
           );
         }
-        const refreshed = yield* forceRefreshConnectionValues(connectionRow).pipe(
+        const refreshed = yield* forceRefreshConnectionValues(
+          connectionRow,
+          values[PRIMARY_INPUT_VARIABLE] ?? null,
+        ).pipe(
           // A failed re-mint is not this call's failure to report: the upstream
           // already produced an auth failure with recovery guidance, which is
           // strictly more actionable than a refresh-plumbing error. Keep it.

@@ -42,6 +42,7 @@ import {
   type Executor,
   type ExecutorConfig,
   type FirstPartyOAuthClientConfig,
+  type OAuthRefreshCoordinator,
   type StorageFailure,
 } from "@executor-js/sdk";
 import {
@@ -106,6 +107,9 @@ export interface HostConfigShape {
    * ship none simply omit it.
    */
   readonly firstPartyOAuthClients?: readonly FirstPartyOAuthClientConfig[];
+  /** Shared refresh-token gate for request-created executors. Process hosts
+   *  should keep one instance for the lifetime of the host. */
+  readonly oauthRefreshCoordinator?: OAuthRefreshCoordinator;
 }
 
 export class HostConfig extends Context.Service<HostConfig, HostConfigShape>()(
@@ -290,6 +294,7 @@ export const makeScopedExecutor = <
       onElicitation: "accept-all",
       redirectUri,
       oauthCallbackStateOrgSlug: orgSlug,
+      oauthRefreshCoordinator: config.oauthRefreshCoordinator,
       firstPartyOAuthClients: config.firstPartyOAuthClients,
       coreTools: {
         webBaseUrl,
