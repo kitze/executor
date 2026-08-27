@@ -194,6 +194,32 @@ export const providerAuthorizeExtras = (
   return {};
 };
 
+/** Provider-specific token-request parameters that are required in addition
+ *  to the RFC grant fields.
+ *
+ *  Withings multiplexes token operations behind `/v2/oauth2` and requires
+ *  `action=requesttoken` for both authorization-code exchange and refresh.
+ *  Without it the endpoint returns `{ status: 2554, error: "Not implemented" }`.
+ *  Match the exact HTTPS host and path so no credential-bearing request gains
+ *  provider parameters merely because its URL contains a similar substring. */
+const isWithingsTokenEndpoint = (tokenUrl: string): boolean => {
+  // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: URL() throws on invalid input; endpoint validation later surfaces the canonical error
+  try {
+    const url = new URL(tokenUrl);
+    return (
+      url.protocol === "https:" &&
+      url.hostname.toLowerCase() === "wbsapi.withings.net" &&
+      url.pathname.replace(/\/+$/, "") === "/v2/oauth2"
+    );
+  } catch {
+    // Invalid token URL -- let the existing endpoint validator reject it.
+    return false;
+  }
+};
+
+const providerTokenRequestExtras = (tokenUrl: string): Readonly<Record<string, string>> =>
+  isWithingsTokenEndpoint(tokenUrl) ? { action: "requesttoken" } : {};
+
 // ---------------------------------------------------------------------------
 // Regional token-endpoint rebind
 //
@@ -404,7 +430,7 @@ const toOAuth2ErrorWithHttpSummary = (cause: unknown): Effect.Effect<OAuth2Error
   return Effect.promise(async () => {
     const summary = await tokenEndpointHttpSummary(response);
     // A 4xx the spec parser refused may still carry the AS's verdict in a
-    // non-conform envelope; recover it so classification (invalid_grant →
+    // non-conform envelope; recover it so classification (invalid_grant ->
     // reauth-required) sees the code instead of a code-less "transient".
     const recovered =
       base.error === undefined && response.status >= 400 && response.status < 500
@@ -626,6 +652,86 @@ type StrippedTokenResponse = {
   readonly idTokenIdentityLabel?: string;
 };
 
+const NestedTokenBodyEnvelope = Schema.Struct({
+  body: Schema.Struct({
+    access_token: Schema.String,
+  }),
+});
+const decodeNestedTokenBodyEnvelope = Schema.decodeUnknownOption(NestedTokenBodyEnvelope);
+
+const WithingsTokenErrorEnvelope = Schema.Struct({
+  status: Schema.Number,
+  error: Schema.String,
+});
+const decodeWithingsTokenErrorEnvelope = Schema.decodeUnknownOption(WithingsTokenErrorEnvelope);
+
+const WrappedWithingsTokenErrorEnvelope = Schema.Struct({
+  body: WithingsTokenErrorEnvelope,
+});
+const decodeWrappedWithingsTokenErrorEnvelope = Schema.decodeUnknownOption(
+  WrappedWithingsTokenErrorEnvelope,
+);
+
+type WithingsTokenError = {
+  readonly status: number;
+  readonly error: string;
+};
+
+const withingsTokenErrorFrom = (value: unknown): WithingsTokenError | undefined => {
+  const direct = decodeWithingsTokenErrorEnvelope(value);
+  if (Option.isSome(direct)) return direct.value;
+  const wrapped = decodeWrappedWithingsTokenErrorEnvelope(value);
+  return Option.isSome(wrapped) ? wrapped.value.body : undefined;
+};
+
+const jsonResponseWithBody = (
+  response: Response,
+  body: Readonly<Record<string, unknown>>,
+  status = response.status,
+  statusText = response.statusText,
+): Response => {
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.set("content-type", "application/json");
+  return new Response(JSON.stringify(body), { status, statusText, headers });
+};
+
+/** Withings returns successful OAuth grants as
+ *  `{ status, body: { access_token, ... } }` instead of RFC 6749's top-level
+ *  token response. It also returns token errors in `{ status, error }`, using
+ *  either HTTP 200 or HTTP 400. Normalize those before oauth4webapi processes
+ *  the response so dead refresh tokens become terminal `invalid_grant`
+ *  failures and other provider errors retain their original explanation.
+ *  Ordinary token responses and unknown provider errors keep their envelopes. */
+const unwrapNestedTokenBody = async (response: Response): Promise<Response> => {
+  const value = await response
+    .clone()
+    .json()
+    .then(
+      (body: unknown) => body,
+      () => null,
+    );
+  const withingsError = withingsTokenErrorFrom(value);
+  if (withingsError) {
+    const code = /invalid\s+refresh[_ ]token/i.test(withingsError.error)
+      ? "invalid_grant"
+      : "invalid_request";
+    return jsonResponseWithBody(
+      response,
+      {
+        error: code,
+        error_description: withingsError.error,
+      },
+      400,
+      "Bad Request",
+    );
+  }
+  if (!response.ok) return response;
+  if (Option.isNone(decodeNestedTokenBodyEnvelope(value))) return response;
+  const body = (value as { readonly body: Readonly<Record<string, unknown>> }).body;
+  return jsonResponseWithBody(response, body);
+};
+
 const NestedAuthedUserScope = Schema.Struct({
   authed_user: Schema.Struct({
     scope: Schema.String,
@@ -713,7 +819,7 @@ const processTokenEndpointResponse = async (
   client: oauth.Client,
   response: Response,
 ): Promise<OAuth2TokenResponse> => {
-  const stripped = await stripIdToken(response);
+  const stripped = await stripIdToken(await unwrapNestedTokenBody(response));
   const providerUserGrant = await nestedAuthedUserGrant(stripped.response);
   const parsed = tokenResponseFrom(
     as,
@@ -783,6 +889,9 @@ export const exchangeAuthorizationCode = (
         redirect_uri: input.redirectUrl,
         code_verifier: input.codeVerifier,
       });
+      for (const [name, value] of Object.entries(providerTokenRequestExtras(input.tokenUrl))) {
+        params.set(name, value);
+      }
       if (input.resource) {
         params.set("resource", input.resource);
       }
@@ -913,7 +1022,13 @@ export const refreshAccessToken = (
         input.clientAuth ?? DEFAULT_CLIENT_AUTH_METHOD,
       );
       const extraParams = new URLSearchParams();
-      if (input.scopes && input.scopes.length > 0) {
+      for (const [name, value] of Object.entries(providerTokenRequestExtras(input.tokenUrl))) {
+        extraParams.set(name, value);
+      }
+      // Withings's refresh-token schema is closed over action, client id/secret,
+      // grant type, and refresh token; unlike RFC 6749 it rejects the optional
+      // `scope` field as Invalid Params.
+      if (input.scopes && input.scopes.length > 0 && !isWithingsTokenEndpoint(input.tokenUrl)) {
         extraParams.set("scope", input.scopes.join(input.scopeSeparator ?? " "));
       }
       if (input.resource) {
@@ -939,7 +1054,7 @@ export const refreshAccessToken = (
       const result = await oauth.processRefreshTokenResponse(
         as,
         client,
-        (await stripIdToken(response)).response,
+        (await stripIdToken(await unwrapNestedTokenBody(response))).response,
       );
       return tokenResponseFrom(as, result);
     },
