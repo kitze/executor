@@ -317,6 +317,9 @@ const readOnlyExecutionEngine: ExecutionEngine<Cause.YieldableError> = {
   executeWithPause: () => Effect.die(new PlatformEngineUnavailable({ member: "executeWithPause" })),
   // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: unreachable behind the middleware's safe-request gate; reaching it is a wiring bug, not a typed product outcome
   resume: () => Effect.die(new PlatformEngineUnavailable({ member: "resume" })),
+  grantLiveApproval: () =>
+    // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: unreachable behind the middleware's safe-request gate; reaching it is a wiring bug, not a typed product outcome
+    Effect.die(new PlatformEngineUnavailable({ member: "grantLiveApproval" })),
   getPausedExecution: () => Effect.succeed(null),
   pausedExecutionCount: () => Effect.succeed(0),
   hasPausedExecutions: () => Effect.succeed(false),

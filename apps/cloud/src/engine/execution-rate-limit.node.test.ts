@@ -20,6 +20,7 @@ const engineStub: ExecutionEngine = {
   execute: () => Effect.succeed({ result: "ran" }),
   executeWithPause: () => Effect.succeed({ status: "completed", result: { result: "ran" } }),
   resume: () => Effect.succeed(null),
+  grantLiveApproval: (_executionId, response) => Effect.succeed(response),
   getPausedExecution: () => Effect.succeed(null),
   pausedExecutionCount: () => Effect.succeed(0),
   hasPausedExecutions: () => Effect.succeed(false),
