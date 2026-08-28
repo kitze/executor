@@ -34,6 +34,10 @@ import {
 } from "../mcp/session-store";
 import { selfHostPlugins } from "../plugins";
 import { ErrorCaptureLive } from "../observability";
+import {
+  makeSelfHostExecutionRetention,
+  makeSelfHostExecutionRetentionDecorator,
+} from "../execution-retention";
 
 // ===========================================================================
 // Self-host TEST harness — the throwaway composition tests use to exercise the
@@ -213,6 +217,7 @@ export const makeSelfHostTestApp = async (
   });
 
   const sessionStore = makeSelfHostMcpSessionStore(dbHandle);
+  const executionRetention = makeSelfHostExecutionRetention();
   const pluginsProvider = options.pluginDeps
     ? Layer.succeed(PluginsProvider)({
         plugins: (context) =>
@@ -234,7 +239,10 @@ export const makeSelfHostTestApp = async (
     providers: {
       identity: options.identity,
       db: SelfHostDbProvider,
-      engine: { codeExecutor: SelfHostCodeExecutorProvider },
+      engine: {
+        codeExecutor: SelfHostCodeExecutorProvider,
+        decorator: makeSelfHostExecutionRetentionDecorator(executionRetention),
+      },
       mcp: {
         auth: stubMcpAuth,
         sessions: selfHostMcpSessions(sessionStore),
@@ -260,6 +268,7 @@ export const makeSelfHostTestApp = async (
     handler: web.handler,
     dispose: async () => {
       await web.dispose();
+      await Effect.runPromise(executionRetention.dispose);
       await sessionStore.close();
       await dbHandle.close();
     },

@@ -10,6 +10,7 @@ import { EngineDecorator } from "@executor-js/api/server";
 
 import packageJson from "../package.json" with { type: "json" };
 import { resolveDataDir } from "./config";
+import type { SelfHostExecutionRetention } from "./execution-retention";
 
 // ---------------------------------------------------------------------------
 // Self-host product analytics: one anonymous per-install service for the
@@ -72,12 +73,22 @@ export const disposeAnalytics = async (): Promise<void> => {
  * executions plane has none. The wrap point IS the plane, so misattribution
  * is structurally impossible.
  */
-export const SelfHostAnalyticsEngineDecorator: Layer.Layer<EngineDecorator> = Layer.succeed(
-  EngineDecorator,
-)({
-  decorate: (engine, _identity, context) =>
-    withExecutionAnalytics(engine, selfHostAnalytics, {
-      plane: context.mcpResource === undefined ? "api" : "mcp",
-      toolkit: context.mcpResource?.kind === "toolkit",
-    }),
-});
+export const makeSelfHostAnalyticsEngineDecorator = (
+  executionRetention?: SelfHostExecutionRetention,
+): Layer.Layer<EngineDecorator> =>
+  Layer.succeed(EngineDecorator)({
+    decorate: (engine, identity, context) => {
+      const tracked = withExecutionAnalytics(engine, selfHostAnalytics, {
+        plane: context.mcpResource === undefined ? "api" : "mcp",
+        toolkit: context.mcpResource?.kind === "toolkit",
+      });
+      return context.mcpResource === undefined && executionRetention
+        ? executionRetention.decorate(tracked, identity)
+        : tracked;
+    },
+  });
+
+// MCP session engines already live in the session store between requests and
+// never pass through the HTTP request finalizer. They only need analytics.
+export const SelfHostAnalyticsEngineDecorator: Layer.Layer<EngineDecorator> =
+  makeSelfHostAnalyticsEngineDecorator();

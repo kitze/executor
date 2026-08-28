@@ -19,7 +19,8 @@ import { makeSelfHostSystemApiLayer } from "./system/handlers";
 import { selfHostAccountMiddleware } from "./account";
 import { loadConfig, SELF_HOST_NAMESPACE, SELF_HOST_SCHEMA_VERSION } from "./config";
 import { createSelfHostDb, SelfHostDb, SelfHostDbProvider } from "./db/self-host-db";
-import { selfHostAnalytics, SelfHostAnalyticsEngineDecorator } from "./analytics";
+import { makeSelfHostAnalyticsEngineDecorator, selfHostAnalytics } from "./analytics";
+import { makeSelfHostExecutionRetention } from "./execution-retention";
 import {
   SelfHostCodeExecutorProvider,
   SelfHostHostConfig,
@@ -80,6 +81,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
   // Pass the pinned public origin so browser-approval URLs are reachable behind
   // a reverse proxy (not the internal 127.0.0.1 bind from the request URL).
   const mcp = makeSelfHostMcpSeams(dbHandle, betterAuth, config.webBaseUrl);
+  const executionRetention = makeSelfHostExecutionRetention();
 
   // CLI device-login discovery (`executor login`). Points the CLI at Better
   // Auth's device endpoints; `requestFormat: "json"` because those endpoints
@@ -109,7 +111,10 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
         codeExecutor: SelfHostCodeExecutorProvider,
         // Anonymous execution analytics (this seam is the HTTP plane; the MCP
         // plane's decorator is wired in mcp/session-store.ts's stack layer).
-        decorator: SelfHostAnalyticsEngineDecorator,
+        // The HTTP decorator also retains a genuinely paused engine across the
+        // execute/resume requests. Self-host's DB is process-lived, so this is
+        // safe and preserves the live (non-replayed) approval capability.
+        decorator: makeSelfHostAnalyticsEngineDecorator(executionRetention),
       },
       mcp: { auth: mcp.auth, sessions: mcp.sessions, reporter: mcp.reporter },
       plugins: { provider: SelfHostPluginsProvider, config: SelfHostHostConfig },
@@ -164,7 +169,9 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     toWebHandler,
     betterAuth,
     oauthCallbackPrincipalResolver,
+    disposeExecutionRetention: () => Effect.runPromise(executionRetention.dispose),
     closeDb: async () => {
+      await Effect.runPromise(executionRetention.dispose);
       await mcp.close();
       await dbHandle.close();
     },

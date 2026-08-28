@@ -118,7 +118,8 @@ const selfHostHttpMiddleware = (
 
 export const startServer = async (): Promise<void> => {
   const config = loadConfig();
-  const { AppLayer, betterAuth, oauthCallbackPrincipalResolver } = await makeSelfHostApp();
+  const { AppLayer, betterAuth, oauthCallbackPrincipalResolver, disposeExecutionRetention } =
+    await makeSelfHostApp();
 
   // Serve the built SPA, split by cacheability so a redeploy is picked up at
   // once instead of stranding browsers on a stale shell:
@@ -145,9 +146,15 @@ export const startServer = async (): Promise<void> => {
     cacheControl: "no-cache",
   }).pipe(Layer.provide(BunFileSystem.layer), Layer.provide(BunPath.layer));
 
-  // Server-scope finalizer: flush buffered analytics on graceful shutdown.
+  // Server-scope finalizer: end retained HTTP approval fibers before the host
+  // disappears, then flush buffered analytics on graceful shutdown.
   const AnalyticsFlushLive = Layer.effectDiscard(
-    Effect.addFinalizer(() => Effect.promise(() => disposeAnalytics())),
+    Effect.addFinalizer(() =>
+      Effect.promise(async () => {
+        await disposeExecutionRetention();
+        await disposeAnalytics();
+      }),
+    ),
   );
 
   // OTLP export, or `Layer.empty` when no collector is configured (see
