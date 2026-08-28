@@ -60,6 +60,7 @@ const fakeEngine = (paused: PausedExecution) => {
     pausedExecutionCount: () => Effect.succeed(1),
     hasPausedExecutions: () => Effect.succeed(true),
     getDescription: Effect.succeed("fixture engine"),
+    shutdown: Effect.void,
   };
   return { engine, grants, grantedResponses, resumes };
 };

@@ -37,6 +37,7 @@ import {
   OAuth2Preset,
   SecurityScheme,
   previewSpecText,
+  previewSpecTextStreaming,
   type SpecPreview,
 } from "./preview";
 import { deriveAuthenticationTemplateFromPreview, firstBaseUrlForPreview } from "./derive-auth";
@@ -289,6 +290,7 @@ const AuthenticationSchema = Schema.Union([
   Schema.Struct({
     slug: Schema.String,
     kind: Schema.Literal("oauth2"),
+    label: Schema.optional(Schema.String),
     authorizationUrl: Schema.String,
     tokenUrl: Schema.String,
     resource: Schema.optional(Schema.NullOr(Schema.String)),
@@ -321,6 +323,18 @@ const AddIntegrationOutputSchema = Schema.Struct({
   toolCount: Schema.Number,
 });
 
+const StaticUpdateIntegrationInputSchema = Schema.Struct({
+  slug: Schema.String,
+  spec: OpenApiSpecInputSchema,
+});
+
+const StaticUpdateIntegrationOutputSchema = Schema.Struct({
+  slug: Schema.String,
+  toolCount: Schema.Number,
+  addedTools: Schema.Array(Schema.String),
+  removedTools: Schema.Array(Schema.String),
+});
+
 const PreviewSpecInputStandardSchema = Schema.toStandardSchemaV1(
   Schema.toStandardJSONSchemaV1(PreviewSpecInputSchema),
 );
@@ -332,6 +346,12 @@ const AddIntegrationInputStandardSchema = Schema.toStandardSchemaV1(
 );
 const AddIntegrationOutputStandardSchema = Schema.toStandardSchemaV1(
   Schema.toStandardJSONSchemaV1(AddIntegrationOutputSchema),
+);
+const StaticUpdateIntegrationInputStandardSchema = Schema.toStandardSchemaV1(
+  Schema.toStandardJSONSchemaV1(StaticUpdateIntegrationInputSchema),
+);
+const StaticUpdateIntegrationOutputStandardSchema = Schema.toStandardSchemaV1(
+  Schema.toStandardJSONSchemaV1(StaticUpdateIntegrationOutputSchema),
 );
 
 const openApiToolFailure = (code: string, message: string, details?: unknown) =>
@@ -581,7 +601,7 @@ export const describeOpenApiAuthMethods = (
       if (template.kind === "oauth2") {
         return {
           id: String(template.slug),
-          label: "OAuth2",
+          label: template.label ?? "OAuth2",
           kind: "oauth",
           template: String(template.slug),
           oauth: {
@@ -809,18 +829,25 @@ export const openApiPlugin = definePlugin<
           const explicitBaseUrl = config.baseUrl ?? resolved.baseUrl;
           const needsDerivedBaseUrl = explicitBaseUrl == null;
           const needsDerivedAuth = config.authenticationTemplate == null;
+          // Spec-format selections (resolved.keepPathItem) preview via the
+          // streaming path: the whole-document parse of a Graph-sized source is
+          // the measured isolate OOM. The OAuth-discovery enrich re-parses the
+          // full text for the same reason, and an adapter spec declares its
+          // auth (or the adapter supplies the template), so it is skipped.
           const preview =
             needsDerivedBaseUrl || needsDerivedAuth
-              ? yield* previewSpecText(resolved.specText).pipe(
-                  Effect.flatMap((rawPreview) =>
-                    enrichPreviewWithDiscoveredOAuth({
-                      specText: resolved.specText,
-                      preview: rawPreview,
-                      specUrl: resolved.specUrl ?? specInputToSpecUrl(config.spec),
-                      baseUrl: explicitBaseUrl,
-                    }),
-                  ),
-                )
+              ? resolved.keepPathItem
+                ? yield* previewSpecTextStreaming(resolved.specText, resolved.keepPathItem)
+                : yield* previewSpecText(resolved.specText).pipe(
+                    Effect.flatMap((rawPreview) =>
+                      enrichPreviewWithDiscoveredOAuth({
+                        specText: resolved.specText,
+                        preview: rawPreview,
+                        specUrl: resolved.specUrl ?? specInputToSpecUrl(config.spec),
+                        baseUrl: explicitBaseUrl,
+                      }),
+                    ),
+                  )
               : undefined;
           const derivedBaseUrl =
             needsDerivedBaseUrl && preview ? firstBaseUrlForPreview(preview) : undefined;
@@ -1103,6 +1130,12 @@ export const openApiPlugin = definePlugin<
               },
               httpClientLayer,
             );
+            // Spec-format selections stream (whole-parse of a Graph-sized
+            // source OOMs the isolate) and skip the OAuth-discovery enrich —
+            // same rationale as the addSpec derived preview above.
+            if (resolved.keepPathItem) {
+              return yield* previewSpecTextStreaming(resolved.specText, resolved.keepPathItem);
+            }
             const preview = yield* previewSpecText(resolved.specText);
             return yield* enrichPreviewWithDiscoveredOAuth({
               specText: resolved.specText,
@@ -1266,6 +1299,45 @@ export const openApiPlugin = definePlugin<
                       ),
                   }),
                 ),
+          }),
+          tool({
+            name: "updateSpec",
+            description:
+              "Update an existing OpenAPI integration in place while preserving its saved connections and credentials. Use this for a pasted replacement spec or an updated spec URL. The operation recompiles the integration tools atomically and reports added and removed tool names.",
+            annotations: {
+              requiresApproval: true,
+              approvalDescription: "Update an existing OpenAPI integration",
+            },
+            inputSchema: StaticUpdateIntegrationInputStandardSchema,
+            outputSchema: StaticUpdateIntegrationOutputStandardSchema,
+            execute: (input: typeof StaticUpdateIntegrationInputSchema.Type) =>
+              self.updateSpec(input.slug, { spec: input.spec }).pipe(
+                Effect.map((result) =>
+                  ToolResult.ok({
+                    slug: String(result.slug),
+                    toolCount: result.toolCount,
+                    addedTools: [...result.addedTools],
+                    removedTools: [...result.removedTools],
+                  }),
+                ),
+                Effect.catchTags({
+                  OpenApiParseError: ({ message }: OpenApiParseError) =>
+                    Effect.succeed(openApiToolFailure("openapi_parse_failed", message)),
+                  OpenApiExtractionError: ({ message }: OpenApiExtractionError) =>
+                    Effect.succeed(openApiToolFailure("openapi_extraction_failed", message)),
+                  OpenApiOAuthError: ({ message }: OpenApiOAuthError) =>
+                    Effect.succeed(openApiToolFailure("openapi_oauth_failed", message)),
+                  OpenApiSpecOverrideError: ({ message }) =>
+                    Effect.succeed(openApiToolFailure("openapi_spec_override_failed", message)),
+                  IntegrationNotFoundError: ({ slug }: IntegrationNotFoundError) =>
+                    Effect.succeed(
+                      openApiToolFailure(
+                        "integration_not_found",
+                        `Integration ${slug} was not found.`,
+                      ),
+                    ),
+                }),
+              ),
           }),
         ],
       },

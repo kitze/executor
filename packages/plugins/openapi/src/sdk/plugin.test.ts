@@ -497,6 +497,46 @@ describe("OpenAPI Plugin", () => {
     }),
   );
 
+  it.effect("invokes static updateSpec through executor.execute", () =>
+    Effect.gen(function* () {
+      const executor = yield* createExecutor(makeTestConfig({ plugins: testPlugins() }));
+      yield* executor.openapi.addSpec({
+        spec: { kind: "blob", value: testApiSpecText() },
+        slug: "runtime",
+      });
+
+      const replacementSpec = JSON.stringify({
+        openapi: "3.0.0",
+        info: { title: "Runtime replacement", version: "1.0.0" },
+        servers: [{ url: "https://example.com" }],
+        paths: {
+          "/snapshots": {
+            get: {
+              operationId: "listSnapshots",
+              responses: { "200": { description: "ok" } },
+            },
+          },
+        },
+      });
+      const result = unwrapInvocation(
+        yield* executor.execute(ToolAddress.make("executor.openapi.updateSpec"), {
+          slug: "runtime",
+          spec: { kind: "blob", value: replacementSpec },
+        }),
+      ).data as {
+        slug: string;
+        toolCount: number;
+        addedTools: readonly string[];
+        removedTools: readonly string[];
+      };
+
+      expect(result.slug).toBe("runtime");
+      expect(result.toolCount).toBe(1);
+      expect(result.addedTools).toEqual(["snapshots.listSnapshots"]);
+      expect(result.removedTools.length).toBeGreaterThan(0);
+    }),
+  );
+
   it.effect("static previewSpec returns actionable tool failures", () =>
     Effect.gen(function* () {
       const config = makeTestConfig({ plugins: [openApiPlugin()] as const });

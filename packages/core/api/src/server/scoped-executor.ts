@@ -110,6 +110,15 @@ export interface HostConfigShape {
   /** Shared refresh-token gate for request-created executors. Process hosts
    *  should keep one instance for the lifetime of the host. */
   readonly oauthRefreshCoordinator?: OAuthRefreshCoordinator;
+  /**
+   * Forwarded to `ExecutorConfig.enterpriseManagedRollout`: the host's rollout
+   * gate for enterprise-managed authorization (the MCP EMA profile). Declared
+   * here — not per-request — because it is a deployment-wide capability; the
+   * per-connect identity it needs is supplied by the SDK at the call site.
+   * Hosts that operate no feature-flag service omit it, and the profile is
+   * attempted as it was before the gate existed.
+   */
+  readonly enterpriseManagedRollout?: ExecutorConfig["enterpriseManagedRollout"];
 }
 
 export class HostConfig extends Context.Service<HostConfig, HostConfigShape>()(
@@ -296,6 +305,7 @@ export const makeScopedExecutor = <
       oauthCallbackStateOrgSlug: orgSlug,
       oauthRefreshCoordinator: config.oauthRefreshCoordinator,
       firstPartyOAuthClients: config.firstPartyOAuthClients,
+      enterpriseManagedRollout: config.enterpriseManagedRollout,
       coreTools: {
         webBaseUrl,
         orgSlug,
