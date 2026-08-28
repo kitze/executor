@@ -3,6 +3,7 @@ import { Effect, Layer } from "effect";
 import { IdentityProvider, Unauthorized } from "@executor-js/api/server";
 
 import { BetterAuth } from "./better-auth";
+import type { OAuthCallbackPrincipalResolver } from "./oauth-callback-principal";
 
 // ---------------------------------------------------------------------------
 // The self-host identity seam — the production implementation of the shared
@@ -39,13 +40,23 @@ const bearerToken = (headers: Headers): string | undefined => {
 // Single-org instance, so organizationName is the boot-cached org name.
 // ---------------------------------------------------------------------------
 
-export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, BetterAuth> =
+export const makeBetterAuthIdentityLayer = (
+  resolveOAuthCallbackPrincipal: OAuthCallbackPrincipalResolver,
+): Layer.Layer<IdentityProvider, never, BetterAuth> =>
   Layer.effect(IdentityProvider)(
     Effect.gen(function* () {
       const { auth, organizationId, organizationName, organizationSlug } = yield* BetterAuth;
       return IdentityProvider.of({
         authenticate: (request) =>
           Effect.gen(function* () {
+            // OAuth providers return through a top-level navigation. In an
+            // embedded browser that loses both the partitioned cookie and the
+            // tab-scoped bearer, so a valid, persisted callback state resolves
+            // the original actor before ordinary credential lookup. This is a
+            // server-side capability check, never a client-supplied identity.
+            const callbackPrincipal = yield* resolveOAuthCallbackPrincipal(request);
+            if (callbackPrincipal) return callbackPrincipal;
+
             // A direct x-api-key request can resolve through Better Auth's
             // enableSessionForAPIKeys path on this first lookup. Treat the mere
             // presence of that credential as API-key provenance even if a
@@ -95,3 +106,9 @@ export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, Bette
       });
     }),
   );
+
+// Retain the public, credential-only layer for consumers outside the
+// self-host composition root. Production uses the factory above to install the
+// callback-state capability resolver alongside Better Auth.
+export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, BetterAuth> =
+  makeBetterAuthIdentityLayer(() => Effect.succeed(null));

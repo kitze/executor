@@ -274,35 +274,30 @@ export const missingGrantedOAuthScopes = (
   return out;
 };
 
-const decodeJsonPayload = Schema.decodeUnknownOption(Schema.UnknownFromJsonString);
+/** The persisted OAuth-session payload. `callbackSubject` is deliberately the
+ * acting member, not the row's `subject`: org rows use the empty-string owner
+ * sentinel, which cannot identify who is allowed to redeem a callback. */
+const OAuthSessionPayload = Schema.Struct({
+  owner: Schema.optional(Owner),
+  clientOwner: Schema.optional(Owner),
+  requestedScopes: Schema.optional(Schema.Array(Schema.String)),
+  callbackSubject: Schema.optional(Schema.NullOr(Schema.String)),
+});
+type OAuthSessionPayload = typeof OAuthSessionPayload.Type;
 
-/** Extract the persisted `requestedScopes` from an `oauth_session.payload`. The
- *  jsonColumn may surface as a parsed object (in-memory backends) or a JSON
- *  string (serialized backends); decode strings before reading. Returns `null`
- *  for legacy sessions written before `requestedScopes` was persisted, so
- *  `complete` can fall back to the client's scopes. */
-const requestedScopesFromPayload = (payload: unknown): readonly string[] | null => {
-  const decoded =
-    typeof payload === "string"
-      ? decodeJsonPayload(payload).pipe(Option.getOrElse(() => payload))
-      : payload;
-  if (decoded === null || typeof decoded !== "object") return null;
-  const value = (decoded as Record<string, unknown>).requestedScopes;
-  return Array.isArray(value) ? value.filter((s): s is string => typeof s === "string") : null;
-};
+const decodeOAuthSessionPayload = Schema.decodeUnknownOption(OAuthSessionPayload);
+const decodeOAuthSessionPayloadJson = Schema.decodeUnknownOption(
+  Schema.fromJsonString(OAuthSessionPayload),
+);
 
-/** Read the app owner `start` recorded on the session payload. Null when absent
- *  (same-owner connects, or sessions written before this field), so `complete`
- *  falls back to the session owner. */
-const clientOwnerFromPayload = (payload: unknown): Owner | null => {
-  const decoded =
+/** Decode an `oauth_session.payload` at the storage boundary. JSON columns
+ * surface as objects on some backends and serialized strings on others. */
+const oauthSessionPayloadFromColumn = (payload: unknown): OAuthSessionPayload | null =>
+  Option.getOrNull(
     typeof payload === "string"
-      ? decodeJsonPayload(payload).pipe(Option.getOrElse(() => payload))
-      : payload;
-  if (decoded === null || typeof decoded !== "object") return null;
-  const value = (decoded as Record<string, unknown>).clientOwner;
-  return value === "user" || value === "org" ? value : null;
-};
+      ? decodeOAuthSessionPayloadJson(payload)
+      : decodeOAuthSessionPayload(payload),
+  );
 
 /** Narrow a stored `grant` string to the `OAuthGrant` union, or `null` when the
  *  value is neither known grant. EXPLICIT — there is no silent fallback to
@@ -1340,6 +1335,9 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             owner: input.owner,
             clientOwner: input.clientOwner,
             requestedScopes: authorizationRequestedScopes,
+            // Org-owned rows carry a sentinel `subject`, so retain the actual
+            // member who began the flow for the callback capability check.
+            callbackSubject: deps.subject,
           },
           expires_at: expiresAt,
           created_at: now,
@@ -1387,6 +1385,34 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       if (!sessionRow) {
         return yield* new OAuthSessionNotFoundError({ state: input.state });
       }
+      const payload = oauthSessionPayloadFromColumn(sessionRow.payload);
+      const sessionOwner = String(sessionRow.owner);
+      const sessionSubject = String(sessionRow.subject);
+
+      // User-owned rows are already partitioned by their non-empty subject, so
+      // they remain safely redeemable when an older session payload predates
+      // `callbackSubject`. If a payload does carry the newer binding, it must
+      // agree with the row. Org-owned rows use the shared empty-subject
+      // sentinel and therefore always require the explicit callback binding.
+      const callbackSubjectMatches =
+        sessionOwner === "user"
+          ? sessionSubject.length > 0 &&
+            deps.subject === sessionSubject &&
+            (payload?.callbackSubject === undefined || payload.callbackSubject === sessionSubject)
+          : sessionOwner === "org"
+            ? payload !== null &&
+              payload.callbackSubject !== undefined &&
+              payload.callbackSubject === deps.subject
+            : false;
+
+      // `state` is a short-lived callback capability, not a bearer credential
+      // for whichever executor happens to receive it. The owner policy already
+      // hides cross-tenant rows, but org rows are visible to every member in a
+      // tenant; bind the stored capability to the tenant + acting subject that
+      // minted it before doing any token exchange.
+      if (String(sessionRow.tenant) !== deps.tenant || !callbackSubjectMatches) {
+        return yield* new OAuthSessionNotFoundError({ state: input.state });
+      }
       const session = {
         owner: String(sessionRow.owner) as Owner,
         clientSlug: OAuthClientSlug.make(String(sessionRow.client_slug)),
@@ -1399,14 +1425,14 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         expiresAt: Number(sessionRow.expires_at),
         // The scope set `start` requested (the integration's declared or
         // discovered scopes), persisted on the session payload. Drives the
-        // recorded-scope fallback when the AS omits `scope`. Missing/legacy
-        // payloads fall back to the client's scopes below.
-        requestedScopes: requestedScopesFromPayload(sessionRow.payload),
+        // recorded-scope fallback when the AS omits `scope`. A valid current
+        // payload without this optional field falls back to the client's scopes
+        // below.
+        requestedScopes: payload?.requestedScopes ?? null,
         // The app's owner, recorded by `start` — reload the SAME app at
         // completion by explicit owner (no derivation). Defaults to the session
-        // owner for same-owner connects.
-        clientOwner:
-          clientOwnerFromPayload(sessionRow.payload) ?? (String(sessionRow.owner) as Owner),
+        // owner for same-owner connects when the optional field is absent.
+        clientOwner: payload?.clientOwner ?? (String(sessionRow.owner) as Owner),
       };
 
       // Annotate as soon as the session resolves the flow's identity, so even

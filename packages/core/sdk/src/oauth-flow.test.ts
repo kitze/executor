@@ -7,6 +7,7 @@ import {
   IntegrationSlug,
   OAuthClientSlug,
   OAuthState,
+  Subject,
   ToolAddress,
   ToolName,
 } from "./ids";
@@ -124,6 +125,130 @@ const routeTokenEndpointToLoopback = (
 };
 
 describe("oauth.start / oauth.complete", () => {
+  it.effect(
+    "binds an org callback state to the member who started it",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+          const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
+          yield* executor.acme.seed();
+
+          yield* executor.oauth.createClient({
+            owner: "org",
+            slug: CLIENT,
+            authorizationUrl: server.authorizationEndpoint,
+            tokenUrl: server.tokenEndpoint,
+            grant: "authorization_code",
+            clientId: "test-client",
+            clientSecret: "test-secret",
+            resource: server.mcpResourceUrl,
+          });
+
+          const started = yield* executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("member-bound"),
+            integration: INTEG,
+            template: TEMPLATE,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return;
+          const callback = yield* server.completeAuthorizationCodeFlow({
+            authorizationUrl: started.authorizationUrl,
+          });
+
+          // Org rows are visible to every member of a tenant. A new Executor
+          // bound to another member must not be able to redeem this state.
+          const otherMember = yield* createExecutor({
+            ...config,
+            subject: Subject.make("another-member"),
+            db: config.testDb.db,
+          });
+          yield* Effect.addFinalizer(() => otherMember.close().pipe(Effect.ignore));
+          const denied = yield* Effect.flip(
+            otherMember.oauth.complete({ state: started.state, code: callback.code }),
+          );
+          expect(Predicate.isTagged("OAuthSessionNotFoundError")(denied)).toBe(true);
+          expect(
+            (yield* server.requests).filter(
+              (request) => request.path === "/token" && request.method === "POST",
+            ),
+          ).toHaveLength(0);
+
+          // A failed mismatched callback neither exchanges nor consumes the state:
+          // the member that started the flow can still complete it normally.
+          const connection = yield* executor.oauth.complete({
+            state: started.state,
+            code: callback.code,
+          });
+          expect(String(connection.name)).toBe("memberBound");
+        }),
+      ),
+    15_000,
+  );
+
+  it.effect(
+    "binds a legacy user callback through its owned row subject",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+          const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
+          yield* executor.acme.seed();
+
+          yield* executor.oauth.createClient({
+            owner: "user",
+            slug: CLIENT,
+            authorizationUrl: server.authorizationEndpoint,
+            tokenUrl: server.tokenEndpoint,
+            grant: "authorization_code",
+            clientId: "test-client",
+            clientSecret: "test-secret",
+            resource: server.mcpResourceUrl,
+          });
+
+          const started = yield* executor.oauth.start({
+            owner: "user",
+            client: CLIENT,
+            clientOwner: "user",
+            name: ConnectionName.make("legacy-user-bound"),
+            integration: INTEG,
+            template: TEMPLATE,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return;
+          const callback = yield* server.completeAuthorizationCodeFlow({
+            authorizationUrl: started.authorizationUrl,
+          });
+
+          // User-owned rows already carry the actor as their partition key. A
+          // session written before callbackSubject was introduced remains bound
+          // to that row subject and can finish without weakening org sessions.
+          yield* Effect.promise(() =>
+            config.db.updateMany("oauth_session", {
+              where: (builder) => builder("state", "=", String(started.state)),
+              set: {
+                payload: {
+                  owner: "user",
+                  clientOwner: "user",
+                  requestedScopes: ["read"],
+                },
+              },
+            }),
+          );
+
+          const connection = yield* executor.oauth.complete({
+            state: started.state,
+            code: callback.code,
+          });
+          expect(String(connection.name)).toBe("legacyUserBound");
+        }),
+      ),
+    15_000,
+  );
+
   it.effect(
     "createClient → start (redirect) → complete mints a connection + tools, executable",
     () =>

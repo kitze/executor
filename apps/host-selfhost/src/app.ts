@@ -28,7 +28,7 @@ import {
 import { makeSelfHostMcpSeams } from "./mcp";
 import { selfHostPlugins } from "./plugins";
 import { ErrorCaptureLive } from "./observability";
-import { oauthCallbackSignInRedirectLocation } from "./auth/oauth-callback-login";
+import { oauthCallbackUnauthenticatedFailureDocument } from "./auth/oauth-callback-login";
 
 // ===========================================================================
 // The self-hosted Executor app, as ONE `ExecutorApp.make` call.
@@ -73,7 +73,8 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
   // ---- auth providers ---------------------------------------------------
   // Better Auth: cookie/bearer/api-key identity + /api/auth handler + account
   // API + MCP OAuth seam, all over the shared libSQL handle.
-  const { identityLayer, authHandler, betterAuth } = await resolveAuthProviders(dbHandle);
+  const { identityLayer, authHandler, betterAuth, oauthCallbackPrincipalResolver } =
+    await resolveAuthProviders(dbHandle);
 
   // ---- the in-process MCP serving seams (+ shutdown hook) ----------------
   // Pass the pinned public origin so browser-approval URLs are reachable behind
@@ -162,6 +163,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     AppLayer: appLayer as Layer.Layer<never>,
     toWebHandler,
     betterAuth,
+    oauthCallbackPrincipalResolver,
     closeDb: async () => {
       await mcp.close();
       await dbHandle.close();
@@ -181,12 +183,22 @@ export interface SelfHostApiHandler {
 export const makeSelfHostApiHandler = async (
   options: MakeSelfHostAppOptions = {},
 ): Promise<SelfHostApiHandler> => {
-  const { toWebHandler, betterAuth, closeDb } = await makeSelfHostApp(options);
+  const { toWebHandler, betterAuth, oauthCallbackPrincipalResolver, closeDb } =
+    await makeSelfHostApp(options);
   const web = toWebHandler();
   return {
     handler: async (request) => {
-      const location = await oauthCallbackSignInRedirectLocation(request, betterAuth.auth);
-      if (location) return new Response(null, { status: 302, headers: { location } });
+      const callbackPrincipal = await Effect.runPromise(oauthCallbackPrincipalResolver(request));
+      const failureDocument = await oauthCallbackUnauthenticatedFailureDocument(
+        request,
+        betterAuth.auth,
+        callbackPrincipal !== null,
+      );
+      if (failureDocument) {
+        return new Response(failureDocument, {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
       return web.handler(request);
     },
     dispose: async () => {

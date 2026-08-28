@@ -5,12 +5,20 @@ import { IdentityProvider } from "@executor-js/api/server";
 import { loadConfig } from "../config";
 import type { SelfHostDbHandle } from "../db/self-host-db";
 import { BetterAuth, buildBetterAuth, type BetterAuthHandle } from "./better-auth";
-import { betterAuthIdentityLayer } from "./identity";
+import { makeBetterAuthIdentityLayer } from "./identity";
+import {
+  makeOAuthCallbackPrincipalResolver,
+  type OAuthCallbackPrincipalResolver,
+} from "./oauth-callback-principal";
 import { consentRedirectClientId, withClientName, withForcedMcpConsent } from "./force-mcp-consent";
 import { rewriteInvalidOrigin } from "./invalid-origin-help";
 
 export { BetterAuth, buildBetterAuth, type BetterAuthHandle } from "./better-auth";
-export { betterAuthIdentityLayer } from "./identity";
+export { betterAuthIdentityLayer, makeBetterAuthIdentityLayer } from "./identity";
+export {
+  makeOAuthCallbackPrincipalResolver,
+  type OAuthCallbackPrincipalResolver,
+} from "./oauth-callback-principal";
 
 // ---------------------------------------------------------------------------
 // Resolve the self-host auth providers.
@@ -33,6 +41,8 @@ export interface ResolvedAuthProviders {
   readonly authHandler: (request: Request) => Promise<Response>;
   /** The live Better Auth handle (account API + Better Auth MCP OAuth seam). */
   readonly betterAuth: BetterAuthHandle;
+  /** Resolve a wrapped, unexpired OAuth callback state to its acting member. */
+  readonly oauthCallbackPrincipalResolver: OAuthCallbackPrincipalResolver;
 }
 
 export const resolveAuthProviders = async (
@@ -40,6 +50,10 @@ export const resolveAuthProviders = async (
 ): Promise<ResolvedAuthProviders> => {
   const betterAuth = await buildBetterAuth(dbHandle.client);
   const betterAuthLayer = Layer.succeed(BetterAuth)(betterAuth);
+  const oauthCallbackPrincipalResolver = makeOAuthCallbackPrincipalResolver({
+    db: dbHandle,
+    betterAuth,
+  });
 
   // The consent redirect from Better Auth's authorize only carries the opaque
   // client_id; look the registered client_name up (its adapter sees the
@@ -77,8 +91,11 @@ export const resolveAuthProviders = async (
   };
 
   return {
-    identityLayer: betterAuthIdentityLayer.pipe(Layer.provide(betterAuthLayer)),
+    identityLayer: makeBetterAuthIdentityLayer(oauthCallbackPrincipalResolver).pipe(
+      Layer.provide(betterAuthLayer),
+    ),
     authHandler,
     betterAuth,
+    oauthCallbackPrincipalResolver,
   };
 };

@@ -29,11 +29,12 @@ import { jsonRpcErrorBody } from "@executor-js/host-mcp";
 
 import { disposeAnalytics } from "./analytics";
 import { makeSelfHostApp } from "./app";
+import type { OAuthCallbackPrincipalResolver } from "./auth/oauth-callback-principal";
 import { loadConfig } from "./config";
 import type { BetterAuthHandle } from "./auth";
 import {
   OAUTH_CALLBACK_PATH,
-  oauthCallbackSignInRedirectLocation,
+  oauthCallbackUnauthenticatedFailureDocument,
 } from "./auth/oauth-callback-login";
 import { isMcpServingPath, MCP_ORIGINAL_PATH_HEADER, stripMcpOrgSegment } from "./mcp/org-path";
 import { makeTelemetryLive } from "./telemetry";
@@ -50,7 +51,10 @@ const assetsDir = fileURLToPath(new URL("../dist/assets/", import.meta.url));
 // resource check for org-scoped clients). A no-op for every other request,
 // aside from scrubbing any client-supplied value of that header so it can't be
 // spoofed into an unrewritten request.
-const selfHostHttpMiddleware = (betterAuth: BetterAuthHandle) =>
+const selfHostHttpMiddleware = (
+  betterAuth: BetterAuthHandle,
+  oauthCallbackPrincipalResolver: OAuthCallbackPrincipalResolver,
+) =>
   HttpMiddleware.make((httpApp) =>
     Effect.gen(function* () {
       const request = yield* HttpServerRequest.HttpServerRequest;
@@ -74,10 +78,15 @@ const selfHostHttpMiddleware = (betterAuth: BetterAuthHandle) =>
       ) {
         const headers = new Headers(request.headers as Record<string, string>);
         const webRequest = new Request(url, { method: request.method, headers });
-        const location = yield* Effect.promise(() =>
-          oauthCallbackSignInRedirectLocation(webRequest, betterAuth.auth),
+        const callbackPrincipal = yield* oauthCallbackPrincipalResolver(webRequest);
+        const failureDocument = yield* Effect.promise(() =>
+          oauthCallbackUnauthenticatedFailureDocument(
+            webRequest,
+            betterAuth.auth,
+            callbackPrincipal !== null,
+          ),
         );
-        if (location) return HttpServerResponse.redirect(location, { status: 302 });
+        if (failureDocument) return HttpServerResponse.html(failureDocument);
       }
 
       const rewritten = stripMcpOrgSegment(url.pathname);
@@ -109,7 +118,7 @@ const selfHostHttpMiddleware = (betterAuth: BetterAuthHandle) =>
 
 export const startServer = async (): Promise<void> => {
   const config = loadConfig();
-  const { AppLayer, betterAuth } = await makeSelfHostApp();
+  const { AppLayer, betterAuth, oauthCallbackPrincipalResolver } = await makeSelfHostApp();
 
   // Serve the built SPA, split by cacheability so a redeploy is picked up at
   // once instead of stranding browsers on a stale shell:
@@ -151,7 +160,7 @@ export const startServer = async (): Promise<void> => {
   const TelemetryLive = makeTelemetryLive();
 
   const ServerLive = HttpRouter.serve(Layer.mergeAll(AppLayer, AssetsLive, SpaLive), {
-    middleware: selfHostHttpMiddleware(betterAuth),
+    middleware: selfHostHttpMiddleware(betterAuth, oauthCallbackPrincipalResolver),
   }).pipe(
     Layer.provide(
       BunHttpServer.layer({ hostname: config.host, port: config.port, idleTimeout: 0 }),
