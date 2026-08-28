@@ -194,8 +194,10 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 // Explicit opt-in is strongest, but OpenAPI's standardized secret semantics
-// also form deterministic safety metadata. This is intentionally conservative:
-// extra opacity is safe, while one plaintext credential field is not.
+// also form deterministic safety metadata. `writeOnly` is directional rather
+// than intrinsically secret: it may authorize a sensitive input sink, but a
+// request-only field must never turn an otherwise public response into an
+// opaque source.
 const SENSITIVE_SCHEMA_EXTENSION = "x-executor-sensitive";
 
 const SCHEMA_WILDCARD = Symbol("openapi-sensitive-wildcard");
@@ -213,7 +215,7 @@ const pointerAt = (segments: readonly SchemaPathSegment[]): string =>
 
 const hasSensitiveSchemaSemantics = (schema: Record<string, unknown>): boolean => {
   if (schema[SENSITIVE_SCHEMA_EXTENSION] === true) return true;
-  if (schema.writeOnly === true || schema["x-secret"] === true || schema["x-sensitive"] === true) {
+  if (schema["x-secret"] === true || schema["x-sensitive"] === true) {
     return true;
   }
   const format = typeof schema.format === "string" ? schema.format.toLowerCase() : "";
@@ -228,7 +230,9 @@ type SensitivityDirection = "input" | "output";
  * resolved through the current document and guarded as an active recursion
  * stack, rather than de-duplicated globally: the same component may appear at
  * several operation paths and every occurrence needs its own pointer. Unknown
- * output references seal their enclosing value; unknown inputs cannot become
+ * output references seal their enclosing value. Recursive output references
+ * seal only when their cycle can reach actual sensitive semantics; a public
+ * recursive schema is not itself a secret. Unknown inputs cannot become
  * secret-capable sinks. Array and map members use the shared `/*` wildcard
  * convention. */
 const collectSensitiveSchemaPaths = (
@@ -238,9 +242,21 @@ const collectSensitiveSchemaPaths = (
   path: readonly SchemaPathSegment[] = [],
   out = new Set<string>(),
   activeRefs = new Set<string>(),
+  sealRecursiveReferences = true,
 ): Set<string> => {
   if (!isRecord(schema)) return out;
-  if (hasSensitiveSchemaSemantics(schema)) out.add(pointerAt(path));
+  // OpenAPI readOnly/writeOnly apply to the entire property subtree. Besides
+  // avoiding false response sources, skipping read-only request branches keeps
+  // them from becoming opaque input sinks through a nested token-like format.
+  if (
+    (direction === "output" && schema.writeOnly === true) ||
+    (direction === "input" && schema.readOnly === true)
+  ) {
+    return out;
+  }
+  if (schema.writeOnly === true || hasSensitiveSchemaSemantics(schema)) {
+    out.add(pointerAt(path));
+  }
 
   for (const key of SCHEMA_REFERENCE_KEYS) {
     const ref: unknown = schema[key];
@@ -250,22 +266,56 @@ const collectSensitiveSchemaPaths = (
       continue;
     }
     const resolved: unknown = resolver.resolveReference<unknown>(ref);
-    if (activeRefs.has(ref) || !isRecord(resolved) || resolved === schema) {
-      // A cycle has no finite leaf projection. It is safe to seal an unknown
-      // output. Never turn that fallback into an input sink: only a concrete
-      // marker at a finite schema path authorizes opaque-value resolution.
+    if (!isRecord(resolved)) {
       if (direction === "output") out.add(pointerAt(path));
       continue;
     }
+    if (activeRefs.has(ref) || resolved === schema) {
+      // A recursive edge needs sealing only when the cycle can carry an actual
+      // sensitive field. Probe the component graph once while ignoring further
+      // recursive fallbacks; unresolved references still fail closed. This
+      // preserves recursive secret protection without making every recursive
+      // public API response opaque.
+      if (direction === "output" && sealRecursiveReferences) {
+        const nested = new Set<string>();
+        collectSensitiveSchemaPaths(
+          resolved,
+          resolver,
+          direction,
+          [],
+          nested,
+          new Set([ref]),
+          false,
+        );
+        if (nested.size > 0) out.add(pointerAt(path));
+      }
+      continue;
+    }
     activeRefs.add(ref);
-    collectSensitiveSchemaPaths(resolved, resolver, direction, path, out, activeRefs);
+    collectSensitiveSchemaPaths(
+      resolved,
+      resolver,
+      direction,
+      path,
+      out,
+      activeRefs,
+      sealRecursiveReferences,
+    );
     activeRefs.delete(ref);
   }
 
   const properties = schema.properties;
   if (isRecord(properties)) {
     for (const [name, nested] of Object.entries(properties)) {
-      collectSensitiveSchemaPaths(nested, resolver, direction, [...path, name], out, activeRefs);
+      collectSensitiveSchemaPaths(
+        nested,
+        resolver,
+        direction,
+        [...path, name],
+        out,
+        activeRefs,
+        sealRecursiveReferences,
+      );
     }
   }
   const patternProperties = schema.patternProperties;
@@ -278,6 +328,7 @@ const collectSensitiveSchemaPaths = (
         [...path, SCHEMA_WILDCARD],
         out,
         activeRefs,
+        sealRecursiveReferences,
       );
     }
   }
@@ -292,6 +343,7 @@ const collectSensitiveSchemaPaths = (
         [...path, String(index)],
         out,
         activeRefs,
+        sealRecursiveReferences,
       );
     }
   } else if (schema.items !== undefined) {
@@ -302,6 +354,7 @@ const collectSensitiveSchemaPaths = (
       [...path, SCHEMA_WILDCARD],
       out,
       activeRefs,
+      sealRecursiveReferences,
     );
   }
   if (Array.isArray(schema.prefixItems)) {
@@ -313,6 +366,7 @@ const collectSensitiveSchemaPaths = (
         [...path, String(index)],
         out,
         activeRefs,
+        sealRecursiveReferences,
       );
     }
   }
@@ -325,6 +379,7 @@ const collectSensitiveSchemaPaths = (
       [...path, SCHEMA_WILDCARD],
       out,
       activeRefs,
+      sealRecursiveReferences,
     );
   }
   for (const key of ["contains", "unevaluatedItems"] as const) {
@@ -336,6 +391,7 @@ const collectSensitiveSchemaPaths = (
         [...path, SCHEMA_WILDCARD],
         out,
         activeRefs,
+        sealRecursiveReferences,
       );
     }
   }
@@ -343,19 +399,43 @@ const collectSensitiveSchemaPaths = (
     const variants = schema[key];
     if (!Array.isArray(variants)) continue;
     for (const variant of variants) {
-      collectSensitiveSchemaPaths(variant, resolver, direction, path, out, activeRefs);
+      collectSensitiveSchemaPaths(
+        variant,
+        resolver,
+        direction,
+        path,
+        out,
+        activeRefs,
+        sealRecursiveReferences,
+      );
     }
   }
   for (const key of ["if", "then", "else", "not"] as const) {
     if (schema[key] !== undefined) {
-      collectSensitiveSchemaPaths(schema[key], resolver, direction, path, out, activeRefs);
+      collectSensitiveSchemaPaths(
+        schema[key],
+        resolver,
+        direction,
+        path,
+        out,
+        activeRefs,
+        sealRecursiveReferences,
+      );
     }
   }
   for (const key of ["dependentSchemas", "dependencies"] as const) {
     const schemas = schema[key];
     if (!isRecord(schemas)) continue;
     for (const nested of Object.values(schemas)) {
-      collectSensitiveSchemaPaths(nested, resolver, direction, path, out, activeRefs);
+      collectSensitiveSchemaPaths(
+        nested,
+        resolver,
+        direction,
+        path,
+        out,
+        activeRefs,
+        sealRecursiveReferences,
+      );
     }
   }
 
@@ -373,6 +453,7 @@ const collectSensitiveSchemaPaths = (
       path,
       nested,
       new Set(activeRefs),
+      sealRecursiveReferences,
     );
     if (nested.size > 0) out.add(pointerAt(path));
   }

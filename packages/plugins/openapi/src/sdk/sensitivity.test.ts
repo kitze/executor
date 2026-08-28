@@ -187,6 +187,11 @@ components:
             x-secret: true
         conditional:
           type: object
+          properties:
+            responseToken:
+              type: string
+              format: token
+              readOnly: true
           if:
             properties:
               mode:
@@ -473,7 +478,11 @@ describe("OpenAPI explicit sensitivity metadata", () => {
       // every depth, so seal the recursive edge. The same fallback must not
       // become an input sink: it would authorize an opaque value in an
       // otherwise public object position.
-      const expectedOutputBodyPaths = ["/body/recursive/next", ...expectedInputBodyPaths];
+      const expectedOutputBodyPaths = [
+        "/body/conditional/responseToken",
+        "/body/recursive/next",
+        ...expectedInputBodyPaths.filter((path) => path !== "/body/conditional/thenSecret"),
+      ];
       const expectedInput = [
         ...expectedInputBodyPaths,
         "/input/~2",
@@ -524,7 +533,7 @@ describe("OpenAPI explicit sensitivity metadata", () => {
       if (!operation) return;
 
       expect(operation.operation.sensitiveInputPaths).toBeUndefined();
-      expect(operation.operation.sensitiveOutputPaths).toEqual(["/recursive/next", "/unresolved"]);
+      expect(operation.operation.sensitiveOutputPaths).toEqual(["/unresolved"]);
     }),
   );
 
@@ -553,7 +562,6 @@ describe("OpenAPI explicit sensitivity metadata", () => {
         "/dependencies/dependencySecret",
         "/dynamic",
         "/pattern/*",
-        "/recursivePublic/next",
         "/tupleLegacy/1",
         "/unevaluated/*",
       ];
