@@ -11,6 +11,7 @@ import type { HttpApiClient } from "effect/unstable/httpapi";
 import type { Page } from "playwright";
 import { composePluginApi } from "@executor-js/api/server";
 import { mcpHttpPlugin } from "@executor-js/plugin-mcp/api";
+import { makeGreetingMcpServer, serveMcpServer } from "@executor-js/plugin-mcp/testing";
 import {
   AuthTemplateSlug,
   ConnectionName,
@@ -179,17 +180,18 @@ const seedDcrMcpOAuthConnection = (
   client: Client,
   prefix: string,
   oauth: OAuthTestServerShape,
-  options?: { readonly tokenUrl?: string },
+  options?: { readonly endpoint?: string; readonly tokenUrl?: string },
 ) =>
   Effect.gen(function* () {
     const slug = IntegrationSlug.make(freshSlug(prefix));
     const clientSlug = OAuthClientSlug.make(freshSlug(`${prefix}-client`));
+    const endpoint = options?.endpoint ?? oauth.mcpResourceUrl;
 
     yield* client.mcp.addServer({
       payload: {
         transport: "remote",
         name: `OAuth repro ${String(slug)}`,
-        endpoint: oauth.mcpResourceUrl,
+        endpoint,
         slug: String(slug),
         authenticationTemplate: [{ kind: "oauth2" }],
       },
@@ -198,7 +200,7 @@ const seedDcrMcpOAuthConnection = (
       client.mcp.removeServer({ params: { slug } }).pipe(Effect.ignore),
     );
 
-    const probe = yield* client.oauth.probe({ payload: { url: oauth.mcpResourceUrl } });
+    const probe = yield* client.oauth.probe({ payload: { url: endpoint } });
     if (!probe.registrationEndpoint) {
       return yield* Effect.die("OAuth probe did not discover a DCR registration endpoint");
     }
@@ -211,7 +213,7 @@ const seedDcrMcpOAuthConnection = (
         registrationEndpoint: probe.registrationEndpoint,
         authorizationUrl: probe.authorizationUrl,
         tokenUrl: options?.tokenUrl ?? probe.tokenUrl,
-        resource: probe.resource ?? oauth.mcpResourceUrl,
+        resource: probe.resource ?? endpoint,
         scopes: probe.scopesSupported ?? [],
         tokenEndpointAuthMethodsSupported: probe.tokenEndpointAuthMethodsSupported,
         clientName: "Executor e2e MCP OAuth repro",
@@ -361,8 +363,22 @@ scenario(
       const oauth = yield* serveOAuthTestServer({
         scopes: ["channels:history", "users:read"],
       });
+      // The OAuth fixture exposes the authorization server but only a minimal
+      // protected `/mcp` endpoint. Reconnect also re-syncs the tool catalog,
+      // so use a real authenticated MCP server here: otherwise a valid fresh
+      // token hangs in the fixture's non-MCP response and creates a false
+      // `Tool sync failing` verdict instead of exercising recovery.
+      const mcp = yield* serveMcpServer(() => makeGreetingMcpServer(), {
+        path: "/mcp",
+        auth: {
+          validateAuthorization: (authorization) => oauth.acceptsAuthorizationHeader(authorization),
+          authorizationServerUrls: [oauth.issuerUrl],
+          scopes: ["channels:history", "users:read"],
+        },
+      });
       const gate = yield* serveGrantRevocationGate(`${oauth.issuerUrl}/token`);
       const { slug } = yield* seedDcrMcpOAuthConnection(client, "mcp-reconnect-live", oauth, {
+        endpoint: mcp.endpoint,
         tokenUrl: gate.tokenUrl,
       });
 
