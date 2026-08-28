@@ -666,7 +666,7 @@ describe("OpenAPI explicit sensitivity metadata", () => {
         storage,
       });
 
-      expect(persisted.every((operation) => operation.binding.sensitivityVersion === 2)).toBe(true);
+      expect(persisted.every((operation) => operation.binding.sensitivityVersion === 3)).toBe(true);
       const transfer = resolved.tools.find((tool) => String(tool.name) === "transfer");
       expect(transfer?.annotations).toEqual(
         openApiToolDefsFromCompiled(compiled).find((tool) => String(tool.name) === "transfer")
@@ -674,6 +674,53 @@ describe("OpenAPI explicit sensitivity metadata", () => {
       );
       expect(transfer?.annotations).not.toMatchObject({
         sensitiveOutputPaths: [""],
+      });
+    }),
+  );
+
+  it.effect("connection refresh recompiles version 2 sensitivity bindings", () =>
+    Effect.gen(function* () {
+      const compiled = yield* compileOpenApiSpec(spec);
+      const current = openApiStoredOperationsFromCompiled("fixture", compiled);
+      let persisted: readonly StoredOperation[] = current.map((operation) => ({
+        ...operation,
+        binding: {
+          ...operation.binding,
+          sensitivityVersion: 2,
+          sensitiveOutputPaths: ["/stale-write-only-field"],
+        },
+      }));
+      const storage: OpenapiStore = {
+        putOperations: (_integration, operations) =>
+          Effect.sync(() => {
+            persisted = [...operations];
+          }),
+        appendOperations: () => Effect.void,
+        getOperation: (_integration, toolName) =>
+          Effect.succeed(persisted.find((operation) => operation.toolName === toolName) ?? null),
+        listOperations: () => Effect.succeed(persisted),
+        removeOperations: () => Effect.void,
+        putSpec: () => Effect.void,
+        getSpec: (hash) => Effect.succeed(hash === "fixture-hash" ? spec : null),
+        putDefs: () => Effect.void,
+        getDefs: (hash) =>
+          Effect.succeed(hash === "fixture-hash" ? JSON.stringify(compiled.hoistedDefs) : null),
+      };
+
+      const resolved = yield* resolveOpenApiBackedTools({
+        integration: { slug: "fixture" },
+        config: { specHash: "fixture-hash" },
+        storage,
+      });
+
+      expect(persisted.every((operation) => operation.binding.sensitivityVersion === 3)).toBe(true);
+      const transfer = resolved.tools.find((tool) => String(tool.name) === "transfer");
+      expect(transfer?.annotations).toEqual(
+        openApiToolDefsFromCompiled(compiled).find((tool) => String(tool.name) === "transfer")
+          ?.annotations,
+      );
+      expect(transfer?.annotations).not.toMatchObject({
+        sensitiveOutputPaths: ["/stale-write-only-field"],
       });
     }),
   );

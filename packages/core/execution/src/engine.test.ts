@@ -5,7 +5,7 @@ import { createExecutor, definePlugin } from "@executor-js/sdk";
 import { makeTestConfig } from "@executor-js/sdk/testing";
 import type { CodeExecutor, ExecuteResult } from "@executor-js/codemode-core";
 
-import { createExecutionEngine } from "./engine";
+import { createExecutionEngine, formatExecuteResult } from "./engine";
 
 // Regression for the hang reported as the executor-MCP "180s timeout" against
 // Cowork (Claude web). Cowork goes down the `executeWithPause` branch because
@@ -99,4 +99,22 @@ describe("pausedExecutionCount", () => {
       expect(yield* engine.hasPausedExecutions()).toBe(false);
     }),
   );
+});
+
+describe("formatExecuteResult", () => {
+  it("ignores a malformed redacted logs value at the public serialization boundary", () => {
+    const formatted = Reflect.apply(formatExecuteResult, undefined, [
+      { result: "ok", logs: "[redacted]" },
+    ]);
+
+    expect(formatted).toEqual({
+      text: "ok",
+      structured: {
+        status: "completed",
+        result: "ok",
+        logs: [],
+      },
+      isError: false,
+    });
+  });
 });

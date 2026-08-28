@@ -730,7 +730,10 @@ export const makeOpaqueValueHandoff = (
   };
 
   const rememberSensitiveValue = (value: unknown): void => {
-    redactionValues.push(value);
+    const isEmptyContainer =
+      (Array.isArray(value) && value.length === 0) ||
+      (typeof value === "object" && value !== null && Object.keys(value).length === 0);
+    if (value !== "" && !isEmptyContainer) redactionValues.push(value);
     for (const needle of stringsIn(value)) {
       for (const form of redactionFormsFor(needle)) redactionNeedles.add(form);
     }

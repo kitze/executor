@@ -137,7 +137,10 @@ export const formatExecuteResult = (
         : JSON.stringify(result.result, null, 2)
       : null;
 
-  const logText = result.logs && result.logs.length > 0 ? result.logs.join("\n") : null;
+  const logs = Array.isArray(result.logs)
+    ? result.logs.filter((log) => typeof log === "string")
+    : [];
+  const logText = logs.length > 0 ? logs.join("\n") : null;
 
   // `emit()` output is shown to the user, not returned to the model, so a
   // script that only emits comes back with a null result. Acknowledge the
@@ -156,7 +159,7 @@ export const formatExecuteResult = (
         status: "error",
         error: result.error,
         ...emittedField,
-        logs: result.logs ?? [],
+        logs,
       },
       isError: true,
     };
@@ -174,7 +177,7 @@ export const formatExecuteResult = (
       status: "completed",
       result: result.result ?? null,
       ...emittedField,
-      logs: result.logs ?? [],
+      logs,
     },
     isError: false,
   };

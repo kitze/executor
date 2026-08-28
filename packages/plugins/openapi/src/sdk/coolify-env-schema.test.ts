@@ -1094,7 +1094,7 @@ describe("Coolify application environment variable schema compatibility", () => 
       );
       expect(stored).toBeDefined();
       if (!stored) return;
-      expect(stored.binding.sensitivityVersion).toBe(2);
+      expect(stored.binding.sensitivityVersion).toBe(3);
 
       const persistedV1 = {
         ...stored,

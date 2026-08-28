@@ -50,7 +50,7 @@ import {
 import { parse, type ParsedDocument } from "./parse";
 import { parseEntry, structuralSplit, type KeepPathItem, type SpecStructure } from "./split";
 import { type OpenapiStore, type StoredOperation } from "./store";
-import { OperationBinding } from "./types";
+import { OPENAPI_SENSITIVITY_VERSION, OperationBinding } from "./types";
 
 const STRINGIFIED_BODY_CAP = 1024;
 const UpstreamMessageBody = Schema.Struct({ message: Schema.String });
@@ -208,7 +208,7 @@ const toBinding = (def: ToolDefinition): OperationBinding =>
       ? { sensitiveOutputSafeScalars: def.operation.sensitiveOutputSafeScalars }
       : {}),
     ...(def.operation.sensitiveResponseHeaders ? { sensitiveResponseHeaders: true } : {}),
-    sensitivityVersion: 2,
+    sensitivityVersion: OPENAPI_SENSITIVITY_VERSION,
     ...(def.operation.requiredScopeAlternatives
       ? { requiredScopeAlternatives: def.operation.requiredScopeAlternatives }
       : {}),
@@ -221,15 +221,15 @@ const descriptionFor = (def: ToolDefinition): string => {
   );
 };
 
-/** Bindings written before opaque sensitivity extraction have no trustworthy
+/** Bindings written under an older sensitivity contract have no trustworthy
  * source metadata. Do not turn their unknown inputs into secret sinks, but do
- * seal every output and header until a normal connection refresh writes a v2
- * binding from the saved specification. */
+ * seal every output and header until a normal connection refresh recompiles
+ * the saved specification under the current contract. */
 const annotationsForStoredOperation = (binding: OperationBinding) =>
   annotationsForOperation(
     binding.method,
     binding.pathTemplate,
-    binding.sensitivityVersion === 2
+    binding.sensitivityVersion === OPENAPI_SENSITIVITY_VERSION
       ? binding
       : {
           ...binding,
@@ -938,7 +938,9 @@ export const resolveOpenApiBackedTools = ({
           // adapter-specific update path rather than from the raw saved blob.
           if (
             openApiConfig.specFormat == null &&
-            ops.some((operation) => operation.binding.sensitivityVersion !== 2)
+            ops.some(
+              (operation) => operation.binding.sensitivityVersion !== OPENAPI_SENSITIVITY_VERSION,
+            )
           ) {
             const specText = yield* loadOpenApiSpecText(storage, openApiConfig).pipe(
               Effect.catch(() => Effect.succeed(null)),

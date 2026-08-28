@@ -7,6 +7,8 @@ import {
   type ApiKeyAuthTemplate,
 } from "@executor-js/sdk/http-auth";
 
+export const OPENAPI_SENSITIVITY_VERSION = 3 as const;
+
 // ---------------------------------------------------------------------------
 // Auth-template model.
 //
@@ -238,9 +240,9 @@ export const OperationBinding = Schema.Struct({
     ),
   ),
   sensitiveResponseHeaders: Schema.optional(Schema.Boolean),
-  /** Fresh bindings carry complete sensitivity extraction. Older bindings
-   * intentionally fail closed at runtime until their connection is refreshed. */
-  sensitivityVersion: Schema.optional(Schema.Literals([1, 2])),
+  /** Fresh bindings carry the current sensitivity extraction contract. Older
+   * bindings intentionally fail closed at runtime until their connection is refreshed. */
+  sensitivityVersion: Schema.optional(Schema.Literals([1, 2, OPENAPI_SENSITIVITY_VERSION])),
   /** Declared OAuth scope alternatives (see
    *  ExtractedOperation.requiredScopeAlternatives), persisted with the
    *  binding so the invoke path can annotate a scope-insufficient rejection

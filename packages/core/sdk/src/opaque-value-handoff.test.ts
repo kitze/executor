@@ -179,6 +179,33 @@ describe("opaque sensitive value handoff", () => {
     expect(handoff.redactText(`message: ${MARKER}`)).not.toContain(MARKER);
   });
 
+  it("does not treat empty sensitive values as universal structural redaction matches", () => {
+    const handoff = makeOpaqueValueHandoff();
+    handoff.protectOutput(
+      {
+        emptyArray: [],
+        emptyObject: {},
+        emptyString: "",
+        marker: MARKER,
+      },
+      ["/emptyArray", "/emptyObject", "/emptyString", "/marker"],
+    );
+
+    expect(
+      handoff.redact({
+        logs: [],
+        metadata: {},
+        label: "",
+        echoedMarker: MARKER,
+      }),
+    ).toEqual({
+      logs: [],
+      metadata: {},
+      label: "",
+      echoedMarker: "[redacted]",
+    });
+  });
+
   it("redacts structural clones, primitive/key echoes, and common serialized forms", () => {
     const handoff = makeOpaqueValueHandoff();
     const sensitive = {
