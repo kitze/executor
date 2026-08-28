@@ -1,7 +1,9 @@
 // ---------------------------------------------------------------------------
 // Vitest globalSetup — starts an in-process PGlite socket server so tests
 // running in the Cloudflare Workers runtime can connect to a real Postgres
-// via postgres.js. Port must match DATABASE_URL in vitest.config.ts.
+// via postgres.js. The default binds an OS-selected port and publishes the
+// resulting DATABASE_URL before Vitest starts the test workers. An explicit
+// CLOUD_TEST_DB_PORT remains available for the nested teardown-status fixture.
 // ---------------------------------------------------------------------------
 
 import { PGlite } from "@electric-sql/pglite";
@@ -14,7 +16,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const parsePort = (input: string | undefined): number => {
-  if (input === undefined) return 5434;
+  if (input === undefined) return 0;
   if (!/^\d+$/.test(input)) throw new Error("CLOUD_TEST_DB_PORT must be an integer");
   const port = Number(input);
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
@@ -39,9 +41,11 @@ export default async function setup() {
 
   server = new PGLiteSocketServer({ db, port: PORT, host: "127.0.0.1" });
   await server.start();
+  const serverConnection = server.getServerConn();
+  process.env.DATABASE_URL = `postgresql://postgres:postgres@${serverConnection}/postgres`;
 
   // eslint-disable-next-line no-console
-  console.log(`[test-db] PGlite socket server listening on 127.0.0.1:${PORT}`);
+  console.log(`[test-db] PGlite socket server listening on ${serverConnection}`);
 
   return async () => {
     // PGlite sets an internal 99 sentinel on startup and replaces it with 0 on

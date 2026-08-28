@@ -21,7 +21,6 @@ export default defineConfig({
     globalSetup: ["./scripts/test-globalsetup.ts"],
     fileParallelism: false,
     env: {
-      DATABASE_URL: "postgresql://postgres:postgres@127.0.0.1:5434/postgres",
       WORKOS_API_KEY: "test_api_key",
       WORKOS_CLIENT_ID: "test_client_id",
       WORKOS_COOKIE_PASSWORD: "test_cookie_password_at_least_32_chars!",
