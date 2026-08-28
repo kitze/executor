@@ -4829,7 +4829,17 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           consumedOpaqueInput: boolean,
         ): unknown => {
           if (!opaqueValues) return value;
-          const projectedCoolifyResult = coolifySafeProjectToolResult(String(address), value);
+          const hasSensitiveOutputPaths = (annotations?.sensitiveOutputPaths?.length ?? 0) > 0;
+          // The legacy Coolify projection is an allowlist for unannotated
+          // observations. A declared sensitive output is more specific: it
+          // describes a source whose values must become opaque capabilities.
+          // Projecting first would bypass that boundary, retain
+          // schema-independent metadata, and discard values needed by an
+          // approved downstream sink.
+          const projectedCoolifyResult =
+            hasSensitiveOutputPaths && isToolResult(value) && value.ok
+              ? undefined
+              : coolifySafeProjectToolResult(String(address), value);
           if (projectedCoolifyResult !== undefined) {
             return opaqueValues.redact(projectedCoolifyResult);
           }

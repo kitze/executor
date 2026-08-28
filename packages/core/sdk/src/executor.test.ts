@@ -17,7 +17,7 @@ import type { CredentialProvider } from "./provider";
 import { IntegrationDetectionResult } from "./types";
 import { makeTestExecutor, memoryCredentialsPlugin } from "./testing";
 import { serveOAuthTestServer } from "./testing/oauth-test-server";
-import { makeOpaqueValueHandoff } from "./opaque-value-handoff";
+import { isOpaqueValueReference, makeOpaqueValueHandoff } from "./opaque-value-handoff";
 import { ToolResult } from "./tool-result";
 
 // removed: v1 secret browser-handoff, source.configure, case-insensitive tool-id
@@ -699,7 +699,7 @@ describe("createExecutor", () => {
     }),
   );
 
-  it.effect("projects only allowlisted Coolify evidence before opaque transport masking", () =>
+  it.effect("seals source-marked Coolify observations before legacy projection", () =>
     Effect.gen(function* () {
       const executor = yield* makeTestExecutor({
         plugins: [coolifyProjectionPlugin] as const,
@@ -711,24 +711,19 @@ describe("createExecutor", () => {
         {},
         options,
       );
-      expect(application).toEqual({
-        ok: true,
-        data: {
-          uuid: "app_123",
-          git_repository: "[redacted]",
-          settings: {
-            is_preserve_repository_enabled: true,
-            is_raw_compose_deployment_enabled: true,
-            inject_build_args_to_dockerfile: true,
-          },
-        },
-      });
+      expect(application).toMatchObject({ ok: true });
+      expect(isOpaqueValueReference((application as { readonly data?: unknown }).data)).toBe(true);
+      expect(JSON.stringify(application)).not.toContain("app_123");
+      expect(JSON.stringify(application)).not.toContain("kitze/glink2");
 
       const validation = yield* executor.execute(
         ToolAddress.make("coolify.applications.updateApplicationByUuid"),
         {},
         options,
       );
+      // The source above declared its whole payload sensitive. Reusing the
+      // handoff must not reintroduce one of those values through a later,
+      // otherwise-safe validation projection.
       expect(validation).toEqual({
         ok: false,
         error: {
@@ -738,7 +733,7 @@ describe("createExecutor", () => {
           details: {
             validationIssues: [
               {
-                field: "is_raw_compose_deployment_enabled",
+                field: "[redacted]",
                 reason: "must_be_boolean",
               },
             ],
