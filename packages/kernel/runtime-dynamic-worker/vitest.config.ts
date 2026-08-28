@@ -1,11 +1,17 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
+import { runtimeDynamicWorkerDatabaseUrl } from "./scripts/test-context";
 
 export default defineConfig({
   plugins: [
-    cloudflareTest({
+    cloudflareTest(({ inject }) => ({
       wrangler: { configPath: "./wrangler.jsonc" },
-    }),
+      miniflare: {
+        bindings: {
+          DATABASE_URL: inject(runtimeDynamicWorkerDatabaseUrl),
+        },
+      },
+    })),
   ],
   test: {
     include: ["src/**/*.test.ts"],
