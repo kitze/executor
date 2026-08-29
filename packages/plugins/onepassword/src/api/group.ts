@@ -22,7 +22,7 @@ import {
 
 const ConfigurePayload = OnePasswordConfig;
 
-const ListVaultsParams = Schema.Struct({
+const ListVaultsPayload = Schema.Struct({
   authKind: Schema.Literals(["desktop-app", "service-account"]),
   account: Schema.String,
 });
@@ -77,8 +77,8 @@ export const OnePasswordGroup = HttpApiGroup.make("onepassword")
     }),
   )
   .add(
-    HttpApiEndpoint.get("listVaults", "/onepassword/vaults", {
-      query: ListVaultsParams,
+    HttpApiEndpoint.post("listVaults", "/onepassword/vaults", {
+      payload: ListVaultsPayload,
       success: ListVaultsResponse,
       error: [InternalError, OnePasswordError],
     }),

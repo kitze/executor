@@ -31,6 +31,7 @@ ENV NODE_ENV=production \
     PORT=4788 \
     EXECUTOR_DATA_DIR=/data
 COPY --from=prod-deps /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=prod-deps /app/.selfhost-runtime/onepassword-core_bg.wasm /usr/local/bin/onepassword-core_bg.wasm
 COPY --from=prod-deps /app/.selfhost-runtime /app
 COPY --from=build /app/apps/host-selfhost/dist /app/apps/host-selfhost/dist
 WORKDIR /app/apps/host-selfhost

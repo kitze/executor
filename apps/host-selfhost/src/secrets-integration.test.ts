@@ -117,3 +117,14 @@ test("a connection value is stored encrypted at rest by the 'encrypted' provider
   expect(cells.some((c) => c.includes(NEEDLE))).toBe(false);
   expect(cells.some((c) => c.includes("v1."))).toBe(true);
 });
+
+test("the self-host exposes 1Password without replacing the encrypted default", async () => {
+  const providers = await Effect.runPromise(
+    Effect.gen(function* () {
+      const admin = yield* createScopedExecutor("providers-admin", "default-org", "Default");
+      return yield* admin.providers.list();
+    }).pipe(Effect.provide(dbLayer), Effect.scoped),
+  );
+
+  expect(providers).toEqual(["encrypted", "onepassword"]);
+});

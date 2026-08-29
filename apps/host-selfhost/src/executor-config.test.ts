@@ -66,6 +66,13 @@ test("stdio MCP is enabled when the opt-in is exactly true", () => {
   expect(allowStdio()).toBe(true);
 });
 
+test("the self-host registers the 1Password credential provider", () => {
+  const onepassword = executorConfig.plugins().find((plugin) => plugin.id === "onepassword");
+
+  expect(onepassword).toBeDefined();
+  expect(onepassword?.packageName).toBe("@executor-js/plugin-onepassword");
+});
+
 test("an unset tools-sync TTL leaves the SDK default in place", () => {
   delete process.env[TTL_ENV_NAME];
   expect(loadConfig().toolsSyncTtlMs).toBeUndefined();

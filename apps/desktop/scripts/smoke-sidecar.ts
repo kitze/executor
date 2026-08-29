@@ -388,9 +388,17 @@ const restoreWorkspaceOnePasswordWasm = async (
 
 const assertOnePasswordSdkLoads = async (origin: string): Promise<void> => {
   const url = new URL("/api/onepassword/vaults", origin);
-  url.searchParams.set("authKind", "service-account");
-  url.searchParams.set("account", "ops_fake_smoke_token");
-  const response = await fetch(url, { headers: { Authorization: AUTH_HEADER } });
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: AUTH_HEADER,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      authKind: "service-account",
+      account: "ops_fake_smoke_token",
+    }),
+  });
   const body = await response.text();
 
   if (response.status !== 502) {

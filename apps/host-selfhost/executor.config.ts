@@ -11,6 +11,7 @@ import {
 import { mcpHttpPlugin } from "@executor-js/plugin-mcp/api";
 import { graphqlHttpPlugin } from "@executor-js/plugin-graphql/api";
 import { encryptedSecretsPlugin } from "@executor-js/plugin-encrypted-secrets";
+import { onepasswordHttpPlugin } from "@executor-js/plugin-onepassword/api";
 import { toolkitsPlugin } from "@executor-js/plugin-toolkits/server";
 
 import { resolveSecretKey } from "./src/config";
@@ -46,5 +47,8 @@ export default defineExecutorConfig({
       toolkitsPlugin({ activeToolkitSlug }),
       // First writable secret provider -> the default for `secrets.set`.
       encryptedSecretsPlugin({ key: resolveSecretKey() }),
+      // Read-only external provider. Self-host is headless, so production uses
+      // a vault-scoped 1Password service account configured from the console.
+      onepasswordHttpPlugin(),
     ] as const,
 });

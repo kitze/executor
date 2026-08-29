@@ -104,14 +104,6 @@ function VaultPicker(props: {
     },
   );
 
-  if (!account) {
-    return (
-      <p className="text-[11px] text-muted-foreground/50 py-1">
-        Enter account details to load vaults.
-      </p>
-    );
-  }
-
   // Selected vaults missing from the loaded list (renamed, revoked, or the
   // list failed to load while editing) stay visible so they can be unchecked.
   const loadedIds = new Set(vaults.map((v) => v.id));
@@ -187,7 +179,7 @@ function ConfigDialog(props: {
   const [authKind, setAuthKind] = useState<"desktop-app" | "service-account">(
     (props.initial?.authKind as "desktop-app" | "service-account") ?? "desktop-app",
   );
-  const [accountName, setAccountName] = useState(props.initial?.accountName ?? "my.1password.com");
+  const [accountName, setAccountName] = useState(props.initial?.accountName ?? "");
   const [selectedVaults, setSelectedVaults] = useState<ReadonlyArray<Vault>>(
     props.initial?.vaults ?? [],
   );
@@ -200,7 +192,7 @@ function ConfigDialog(props: {
   const reset = () => {
     if (!isEdit) {
       setAuthKind("desktop-app");
-      setAccountName("my.1password.com");
+      setAccountName("");
       setSelectedVaults([]);
       setDisplayName("");
     }
@@ -264,7 +256,14 @@ function ConfigDialog(props: {
             </Label>
             <Select
               value={authKind}
-              onValueChange={(v) => setAuthKind(v as "desktop-app" | "service-account")}
+              onValueChange={(value) => {
+                const next = value as "desktop-app" | "service-account";
+                if (next !== authKind) {
+                  setAuthKind(next);
+                  setAccountName("");
+                  setSelectedVaults([]);
+                }
+              }}
             >
               <SelectTrigger className="h-9 text-[13px]">
                 <SelectValue />
@@ -278,10 +277,17 @@ function ConfigDialog(props: {
 
           {/* Account / token */}
           <div className="grid gap-1.5">
-            <Label className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+            <Label
+              htmlFor="onepassword-account"
+              className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground"
+            >
               {authKind === "desktop-app" ? "Account domain" : "Service account token"}
             </Label>
             <Input
+              id="onepassword-account"
+              type={authKind === "service-account" ? "password" : "text"}
+              autoComplete="off"
+              spellCheck={false}
               placeholder={authKind === "desktop-app" ? "my.1password.com" : "ops_..."}
               value={accountName}
               onChange={(e) => setAccountName((e.target as HTMLInputElement).value)}
@@ -299,12 +305,18 @@ function ConfigDialog(props: {
             <Label className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
               Vaults
             </Label>
-            <VaultPicker
-              authKind={authKind}
-              accountName={accountName}
-              selected={selectedVaults}
-              onSelectedChange={setSelectedVaults}
-            />
+            {accountName.trim() ? (
+              <VaultPicker
+                authKind={authKind}
+                accountName={accountName}
+                selected={selectedVaults}
+                onSelectedChange={setSelectedVaults}
+              />
+            ) : (
+              <p className="text-[11px] text-muted-foreground/50 py-1">
+                Enter account details to load vaults.
+              </p>
+            )}
           </div>
 
           {/* Display name */}

@@ -74,14 +74,14 @@ export const OnePasswordHandlers = HttpApiBuilder.group(
           }),
         ),
       )
-      .handle("listVaults", ({ query: urlParams }) =>
+      .handle("listVaults", ({ payload }) =>
         capture(
           Effect.gen(function* () {
             const ext = yield* OnePasswordExtensionService;
             const auth =
-              urlParams.authKind === "desktop-app"
-                ? { kind: "desktop-app" as const, accountName: urlParams.account }
-                : { kind: "service-account" as const, token: urlParams.account };
+              payload.authKind === "desktop-app"
+                ? { kind: "desktop-app" as const, accountName: payload.account }
+                : { kind: "service-account" as const, token: payload.account };
             const vaults = yield* ext.listVaults(auth);
             return { vaults: [...vaults] };
           }),

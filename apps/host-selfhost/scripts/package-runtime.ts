@@ -7,6 +7,7 @@ const root = process.cwd();
 const out = join(root, ".selfhost-runtime");
 const serverOut = join(out, "apps/host-selfhost/dist-server");
 const requireFromSelfHost = createRequire(join(root, "apps/host-selfhost/package.json"));
+const ONEPASSWORD_CORE_WASM_FILENAME = "onepassword-core_bg.wasm";
 
 // libSQL ships its native addon as per-platform optional dependencies
 // (`@libsql/<os>-<arch>-<abi>`), and Bun installs only the one matching the
@@ -58,6 +59,24 @@ const workerdPlatformPackage = (): string => {
     );
   }
   return `@cloudflare/${target}`;
+};
+
+// The bundled 1Password SDK loads its native core through a wasm file. The
+// patched loader falls back to a sidecar beside process.execPath when Bun has
+// bundled the JS, so stage that sidecar for the distroless runtime.
+const onePasswordCoreWasmPath = (): string => {
+  const pluginPackageJson = requireFromSelfHost.resolve(
+    "@executor-js/plugin-onepassword/package.json",
+  );
+  const requireFromPlugin = createRequire(pluginPackageJson);
+  const sdkPackageJson = requireFromPlugin.resolve("@1password/sdk/package.json");
+  const requireFromSdk = createRequire(sdkPackageJson);
+  const sdkCorePackageJson = requireFromSdk.resolve("@1password/sdk-core/package.json");
+  const wasmPath = join(dirname(sdkCorePackageJson), "nodejs/core_bg.wasm");
+  if (!existsSync(wasmPath)) {
+    throw new Error(`package-runtime: 1Password SDK core WASM missing at ${wasmPath}`);
+  }
+  return wasmPath;
 };
 
 const externalPackages = [
@@ -123,11 +142,15 @@ await Bun.$`bun build apps/host-selfhost/src/serve.ts --target=bun --format=esm 
 
 for (const name of externalPackages) copyPackage(name);
 await writeBundledWorkerBundler();
+cpSync(onePasswordCoreWasmPath(), join(out, ONEPASSWORD_CORE_WASM_FILENAME));
 
 if (!existsSync(join(serverOut, "serve.js"))) {
   throw new Error(
     "Expected bundled self-host server at .selfhost-runtime/apps/host-selfhost/dist-server/serve.js",
   );
+}
+if (!existsSync(join(out, ONEPASSWORD_CORE_WASM_FILENAME))) {
+  throw new Error("Expected staged 1Password SDK core WASM");
 }
 
 console.log(`Packaged self-host runtime into ${out}`);

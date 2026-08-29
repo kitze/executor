@@ -27,12 +27,15 @@ export const onepasswordStatusAtom = OnePasswordClient.query("onepassword", "sta
 // Query atoms — vaults
 // ---------------------------------------------------------------------------
 
+// Vault discovery is still a reactive query, but it uses a POST payload: a
+// service-account token must never be put in a browser-visible request URL.
+
 export const onepasswordVaultsAtom = (
   authKind: "desktop-app" | "service-account",
   account: string,
 ) =>
   OnePasswordClient.query("onepassword", "listVaults", {
-    query: { authKind, account },
+    payload: { authKind, account },
     // Long retention on purpose: vault listing goes through the op CLI/SDK and
     // is slow, so a reopened dialog renders the last-known vaults instantly
     // and revalidates in the background instead of flashing a loading state.
