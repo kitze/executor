@@ -12,6 +12,7 @@ import {
 } from "./oauth-callback-principal";
 import { consentRedirectClientId, withClientName, withForcedMcpConsent } from "./force-mcp-consent";
 import { rewriteInvalidOrigin } from "./invalid-origin-help";
+import { mcpTransitionJsonResponse } from "./mcp-transition-json";
 
 export { BetterAuth, buildBetterAuth, type BetterAuthHandle } from "./better-auth";
 export { betterAuthIdentityLayer, makeBetterAuthIdentityLayer } from "./identity";
@@ -74,20 +75,25 @@ export const resolveAuthProviders = async (
   // resulting consent redirect with the registered client name.
   const config = loadConfig();
   const authHandler = async (request: Request): Promise<Response> => {
-    const response = await betterAuth.handler(withForcedMcpConsent(request));
+    let response = await betterAuth.handler(withForcedMcpConsent(request));
     // Turn Better Auth's bare 403 "Invalid origin" into a setup instruction —
     // on a fresh deploy it almost always means the public URL needs configuring.
     const friendlier = await rewriteInvalidOrigin(request, response, config.webBaseUrl);
     if (friendlier) return friendlier;
-    if (response.status !== 302) return response;
-    const clientId = consentRedirectClientId(response.headers.get("location"));
-    if (!clientId) return response;
-    const name = await lookupClientName(clientId);
-    if (!name) return response;
-    // Preserve the rest of the response — notably the signed consent cookie.
-    const headers = new Headers(response.headers);
-    headers.set("location", withClientName(response.headers.get("location")!, name));
-    return new Response(null, { status: 302, headers });
+    if (response.status === 302) {
+      const clientId = consentRedirectClientId(response.headers.get("location"));
+      if (clientId) {
+        const name = await lookupClientName(clientId);
+        if (name) {
+          // Preserve the rest of the response — notably the session/consent
+          // cookies and the tab bearer produced by Better Auth's hooks.
+          const headers = new Headers(response.headers);
+          headers.set("location", withClientName(response.headers.get("location")!, name));
+          response = new Response(null, { status: 302, headers });
+        }
+      }
+    }
+    return mcpTransitionJsonResponse(request, response);
   };
 
   return {

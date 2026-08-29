@@ -2,6 +2,8 @@ import { useState } from "react";
 
 import { Button } from "@executor-js/react/components/button";
 
+import { sessionBearerAuthorizationHeader } from "../session-bearer";
+
 // ---------------------------------------------------------------------------
 // MCP OAuth consent. Better Auth's mcp() plugin redirects /authorize here
 // (consentPage) with ?consent_code&client_id&scope once the user is signed in;
@@ -38,9 +40,13 @@ export const McpConsentPage = () => {
   const decide = async (accept: boolean) => {
     setBusy(accept ? "allow" : "deny");
     setError(null);
+    const authorization = sessionBearerAuthorizationHeader();
     const res = await fetch(`${globalThis.location.origin}/api/auth/oauth2/consent`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(authorization ? { authorization } : {}),
+      },
       credentials: "include",
       body: JSON.stringify({ accept, consent_code: consentCode }),
     });

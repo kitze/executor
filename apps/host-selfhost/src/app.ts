@@ -78,9 +78,10 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     await resolveAuthProviders(dbHandle);
 
   // ---- the in-process MCP serving seams (+ shutdown hook) ----------------
-  // Pass the pinned public origin so browser-approval URLs are reachable behind
-  // a reverse proxy (not the internal 127.0.0.1 bind from the request URL).
-  const mcp = makeSelfHostMcpSeams(dbHandle, betterAuth, config.webBaseUrl);
+  // Pass the resolved config so browser-approval URLs use the pinned public
+  // origin behind a reverse proxy, while the v1.6.3 idle-TTL setting reaches
+  // the in-process MCP store.
+  const mcp = makeSelfHostMcpSeams(dbHandle, betterAuth, config);
   const executionRetention = makeSelfHostExecutionRetention();
 
   // CLI device-login discovery (`executor login`). Points the CLI at Better

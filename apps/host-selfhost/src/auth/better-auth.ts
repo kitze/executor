@@ -25,6 +25,8 @@ interface SignupGate {
 // creation (the seed, or a future admin "add user") flows through other paths.
 const SIGNUP_PATH = "/sign-up/email";
 
+let warnedInsecureTrustedOrigin = false;
+
 // ---------------------------------------------------------------------------
 // Better Auth instance over the SAME libSQL CONNECTION as the FumaDB executor
 // tables ("one connection, two schema regions").
@@ -63,6 +65,27 @@ const SIGNUP_PATH = "/sign-up/email";
 
 const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?: SignupGate) => {
   const config = loadConfig();
+  // A `Secure` session cookie is never sent back over plain HTTP, so an HTTP
+  // alias can sign in and then look signed out on every later request. Drop the
+  // attribute when ANY trusted origin is HTTP. This is not a new relaxation for
+  // the common cases: Better Auth already infers `useSecureCookies` from the
+  // baseURL scheme, so an all-HTTPS instance still gets `true` and the plain
+  // `http://localhost` default still gets `false`. It only changes the mixed
+  // case an operator opts into with EXECUTOR_TRUSTED_ORIGINS.
+  const hasInsecureTrustedOrigin = config.trustedOrigins.some((origin) =>
+    origin.startsWith("http://"),
+  );
+  // Warn only for that mixed case. An HTTP-only instance (local dev, a LAN
+  // deploy) never had Secure cookies to lose, and warning there would fire on
+  // every default boot.
+  const downgradesCanonicalCookies =
+    hasInsecureTrustedOrigin && config.webBaseUrl.startsWith("https://");
+  if (downgradesCanonicalCookies && !warnedInsecureTrustedOrigin) {
+    warnedInsecureTrustedOrigin = true;
+    console.warn(
+      "[executor] EXECUTOR_TRUSTED_ORIGINS contains an http:// origin, so session cookies drop the Secure attribute for every origin — including the https:// canonical URL. Use https:// aliases to keep session cookies transport-secure.",
+    );
+  }
   // Always resolved (generated + persisted when no env is set); this guards only
   // an explicitly-set env secret that is too weak.
   const secret = config.authSecret;
@@ -88,16 +111,16 @@ const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?:
       type: "sqlite" as const,
     },
     secret,
-    // The browser Origin must match this exactly; CLI/MCP bearer requests carry
-    // no Origin and are unaffected. `config.webBaseUrl` resolves from an explicit
-    // EXECUTOR_WEB_BASE_URL, else a platform-injected origin (Railway/Render/Fly/
-    // …), else localhost — so a PaaS deploy is zero-config and any other host
-    // sets the one variable (a loud warning fires on the localhost fallback).
-    // See config.ts. We deliberately do NOT derive this from the request `Host`:
-    // matching the ecosystem (Windmill `BASE_URL`, n8n `WEBHOOK_URL`), a pinned
-    // origin keeps host-header injection out of OAuth redirects and links.
+    // The canonical browser Origin is config.webBaseUrl; explicitly configured
+    // aliases may also send cookie-authenticated requests. CLI/MCP bearer
+    // requests carry no Origin and are unaffected. We deliberately do NOT derive
+    // either value from the request `Host`: matching the ecosystem (Windmill
+    // `BASE_URL`, n8n `WEBHOOK_URL`), a pinned origin keeps host-header injection
+    // out of OAuth redirects and links. Additional trusted origins affect only
+    // Better Auth's request validation; generated links and OAuth callbacks stay
+    // pinned to config.webBaseUrl.
     baseURL: config.webBaseUrl,
-    trustedOrigins: [config.webBaseUrl],
+    trustedOrigins: [...config.trustedOrigins],
     // Executor is also opened inside embedded app browsers. In that context
     // the instance is cross-site relative to the host app, so a SameSite=Lax
     // session cookie is rejected: sign-in succeeds, the page reloads, and the
@@ -105,14 +128,16 @@ const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?:
     // partitioned cookie so the session works in the embedding app without
     // becoming a shared third-party cookie. Keep Better Auth's Lax default for
     // plain HTTP installs, where SameSite=None cookies would be rejected unless
-    // they were Secure.
-    ...(config.webBaseUrl.startsWith("https://")
-      ? {
-          advanced: {
+    // they were Secure. The same rule applies when an operator deliberately
+    // trusts an HTTP alias: its usable non-Secure cookie cannot also be CHIPS.
+    advanced: {
+      useSecureCookies: !hasInsecureTrustedOrigin,
+      ...(config.webBaseUrl.startsWith("https://") && !hasInsecureTrustedOrigin
+        ? {
             defaultCookieAttributes: { sameSite: "none" as const, partitioned: true },
-          },
-        }
-      : {}),
+          }
+        : {}),
+    },
     emailAndPassword: { enabled: true },
     // `apiKey` issues long-lived personal keys (the API-keys page). With
     // `enableSessionForAPIKeys`, presenting a key resolves to its owner's

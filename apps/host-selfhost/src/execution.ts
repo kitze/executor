@@ -62,6 +62,7 @@ export const SelfHostHostConfig: Layer.Layer<HostConfig> = Layer.sync(HostConfig
     webBaseUrl: config.webBaseUrl,
     oauthCallbackPath: "/api/oauth/callback",
     oauthRefreshCoordinator: selfHostOAuthRefreshCoordinator,
+    toolsSyncTtlMs: config.toolsSyncTtlMs,
     onIntegrationChange: (event) =>
       selfHostAnalytics.record(
         event.kind === "added" ? "integration_added" : "integration_removed",

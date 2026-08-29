@@ -3,12 +3,14 @@ import {
   Deferred,
   Duration,
   Effect,
+  Fiber,
   Inspectable,
   Layer,
   Option,
   Predicate,
   References,
   Schema,
+  Semaphore,
 } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 import { fumadb } from "@executor-js/fumadb";
@@ -116,6 +118,8 @@ import type {
 } from "./integration";
 import {
   makeOAuthService,
+  STORE_WRITABILITY_PROBE_VALUE,
+  storeWritabilityProbeItemIdFor,
   type MintOAuthConnectionInput,
   type OAuthScopePolicy,
 } from "./oauth-service";
@@ -193,13 +197,51 @@ import { annotateToolResultOutcome, isToolResult } from "./tool-result";
 import { makeShapeMemory, observedShapeToJsonSchema, SHAPE_MEMORY_PLUGIN_ID } from "./shape-memory";
 import { isUnauthorizedToolFailure } from "./auth-tool-failure";
 import { coolifySafeProjectToolResult } from "./coolify-safe-projection";
-import {
-  makeOAuthRefreshCoordinator,
-  type OAuthRefreshCoordinator,
-} from "./oauth-refresh-coordinator";
+import type { OAuthRefreshCoordinator } from "./oauth-refresh-coordinator";
 
 const PLUGIN_STORAGE_DELETE_KEY_BATCH_SIZE = 90;
-const PLUGIN_STORAGE_CREATE_ROW_BATCH_SIZE = 90;
+
+// ---------------------------------------------------------------------------
+// In-flight OAuth refresh gate — a CROSS-STACK resource.
+//
+// Concurrent resolves of one connection must share a single refresh-token
+// grant: the authorization server rotates the refresh token, so a second
+// grant redeems a token the first already consumed, and a provider that
+// detects reuse revokes the whole token family. The first refresh cycle still
+// succeeds, so the fault hides until a later expiry.
+//
+// The gate therefore cannot live on a single execution stack. A host builds a
+// fresh scoped executor per MCP session (and, since request-scoped stack
+// builds, per request), so a per-`createExecutor` map put every session in its
+// own gate and deduplicated nothing. Hanging it off the root DB handle instead
+// converges every stack over one handle on one map — the same object hosts
+// already treat as their shared, process-lived resource.
+//
+// SCOPE OF THE GUARANTEE: dedup reaches exactly as far as one root DB handle
+// in one process. A host that hands every scoped executor a FRESH handle keys
+// a different map each time and gets no dedup — silently, because an unshared
+// gate still behaves correctly for the one caller holding it. Multi-instance
+// deployments are outside it for the same reason: a process-local map cannot
+// see a peer isolate or replica. Both need database-backed coordination
+// (compare-and-swap on the stored refresh token) rather than a wider map.
+//
+// Weakly keyed so the map dies with the handle and a host that opens and drops
+// handles does not leak one gate per handle.
+type RefreshGate = Map<
+  string,
+  Deferred.Deferred<string | null, StorageFailure | CredentialResolutionError>
+>;
+
+const refreshGateByRootDb = new WeakMap<object, RefreshGate>();
+
+const refreshGateFor = (rootDb: object): RefreshGate => {
+  const existing = refreshGateByRootDb.get(rootDb);
+  if (existing) return existing;
+  const created: RefreshGate = new Map();
+  refreshGateByRootDb.set(rootDb, created);
+  return created;
+};
+
 // ---------------------------------------------------------------------------
 // Elicitation handler — resolved once at `createExecutor({ onElicitation })`
 // and overridable per `execute`. A tool that requests user input mid-execution
@@ -642,11 +684,10 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
   readonly oauthCallbackStateOrgSlug?: string;
   readonly oauthEndpointUrlPolicy?: OAuthEndpointUrlPolicy;
   /**
-   * Host-level gate for rotating OAuth refresh tokens. Request-scoped hosts
-   * must share one coordinator across every Executor backed by the same
-   * credential store; otherwise concurrent requests can reuse one rotating
-   * refresh token and invalidate the whole grant family. Defaults to a
-   * coordinator owned by this Executor instance.
+   * Optional host-level gate for rotating OAuth refresh tokens. The built-in
+   * root-database gate coordinates fresh Executors over one shared handle;
+   * hosts that span differently scoped handles or need durable coordination
+   * can additionally supply this broader gate.
    */
   readonly oauthRefreshCoordinator?: OAuthRefreshCoordinator;
   /**
@@ -695,6 +736,23 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
    */
   readonly toolsSyncTtlMs?: number | null;
   /**
+   * How long a tools read WAITS for stale-catalog rebuilds before answering
+   * from the persisted rows. Rebuilds keep running past the deadline (see
+   * `waitUntil`) and land on a later read; the read itself never pays more
+   * than this for upstream listings it did not ask for. Defaults to 2
+   * seconds; pass `null` to block until every rebuild finishes (the strict
+   * mode: a read then always reflects a fully converged catalog).
+   */
+  readonly toolsSyncGraceMs?: number | null;
+  /**
+   * Host keep-alive for background work that outlives a request — the
+   * platform `waitUntil` on Cloudflare Workers, where I/O started inside a
+   * request is cancelled once the response settles unless a host holds the
+   * context open. Long-lived processes (self-host, CLI, tests) omit it;
+   * their detached fibers simply run to completion.
+   */
+  readonly waitUntil?: (promise: Promise<unknown>) => void;
+  /**
    * Notified after a durable integration-catalog change commits (a row
    * created or removed). Best-effort observation only: the notification runs
    * AFTER the transaction, its failures are swallowed, and it cannot affect
@@ -726,6 +784,19 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
 /** Default freshness window for remote-catalog connections (see
  *  `ExecutorConfig.toolsSyncTtlMs`). */
 export const DEFAULT_TOOLS_SYNC_TTL_MS = 15 * 60 * 1000;
+
+/** Default wait budget a tools read spends on stale-catalog rebuilds before
+ *  answering from the persisted rows (see `ExecutorConfig.toolsSyncGraceMs`).
+ *  Sized to cover a healthy upstream re-list (one handshake + one
+ *  `tools/list`) while keeping a read gated on a slow or dead server bounded
+ *  well under any per-connection network timeout. */
+export const DEFAULT_TOOLS_SYNC_GRACE_MS = 2000;
+
+/** How many stale connection catalogs are DISCOVERED at once on a tools read.
+ *  Bounded so a host with a large stale set cannot open an unbounded number of
+ *  upstream listings from a single read. Only the discovery phase runs at this
+ *  width; each rebuild's catalog write is serialized behind a single permit. */
+export const STALE_TOOLS_SYNC_CONCURRENCY = 10;
 
 // ---------------------------------------------------------------------------
 // collectTables — return the executor-owned Fuma table set. Plugins persist
@@ -765,6 +836,23 @@ const storageFailureFromUnknown = (message: string, cause: unknown): StorageFail
 
 const pluginStorageFailure = (pluginId: string, hook: string, cause: unknown): StorageFailure =>
   storageFailureFromUnknown(`${hook} failed for plugin ${pluginId}`, cause);
+
+// oxlint-disable executor/no-instanceof-error, executor/no-unknown-error-message -- boundary: render an arbitrary failure into one readable log field
+/** One-line rendering of a failed rebuild, for the operator-facing warning.
+ *  A `StorageError` carries the actionable detail in its `cause` (the plugin's
+ *  own failure) while its own message only names the hook, and structural
+ *  stringification drops a `cause` that is an `Error` — so unwrap one level and
+ *  keep both halves. */
+const describeSyncFailure = (error: unknown): string => {
+  const base =
+    error instanceof Error && error.message.length > 0
+      ? error.message
+      : Inspectable.toStringUnknown(error, 0);
+  const cause = (error as { readonly cause?: unknown } | null | undefined)?.cause;
+  if (cause instanceof Error && cause.message.length > 0) return `${base}: ${cause.message}`;
+  return base;
+};
+// oxlint-enable executor/no-instanceof-error, executor/no-unknown-error-message
 
 const createDefaultMemoryDb = (tables: FumaTables): ExecutorDb => {
   const version = "1.0.0";
@@ -986,6 +1074,14 @@ type LooseStorageDb = {
     tableName: string,
     rows: readonly Record<string, unknown>[],
   ) => Promise<readonly unknown[]>;
+  readonly upsertMany: (
+    tableName: string,
+    options: {
+      readonly target: readonly string[];
+      readonly update: readonly string[];
+      readonly values: readonly Record<string, unknown>[];
+    },
+  ) => Promise<void>;
   readonly deleteMany: (tableName: string, options?: unknown) => Promise<void>;
   readonly findFirst: (
     tableName: string,
@@ -1001,6 +1097,8 @@ type LooseStorageDb = {
 const asLooseStorageDb = (db: unknown): LooseStorageDb => db as LooseStorageDb;
 
 const makeCoreDb = (fuma: ReturnType<typeof makeFumaClient>) => ({
+  transaction: <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E | StorageFailure> =>
+    fuma.transaction(effect),
   count: <TName extends CoreTableName>(
     tableName: TName,
     options?: { readonly where?: CoreWhere },
@@ -1022,6 +1120,19 @@ const makeCoreDb = (fuma: ReturnType<typeof makeFumaClient>) => ({
       : fuma
           .use(`${tableName}.createMany`, (db) => asLooseStorageDb(db).createMany(tableName, rows))
           .pipe(Effect.asVoid),
+  upsertMany: <TName extends CoreTableName>(
+    tableName: TName,
+    options: {
+      readonly target: readonly string[];
+      readonly update: readonly string[];
+      readonly values: readonly Record<string, unknown>[];
+    },
+  ): Effect.Effect<void, StorageFailure> =>
+    options.values.length === 0
+      ? Effect.void
+      : fuma.use(`${tableName}.upsertMany`, (db) =>
+          asLooseStorageDb(db).upsertMany(tableName, options),
+        ),
   deleteMany: <TName extends CoreTableName>(
     tableName: TName,
     options: { readonly where?: CoreWhere } = {},
@@ -1350,42 +1461,33 @@ const makePluginStorageFacade = (input: {
       readonly data: unknown;
     }[],
   ) =>
-    Effect.gen(function* () {
-      const os = ownerSubject(owner);
-      if (!os) {
-        return yield* new StorageError({
-          message: `Cannot write plugin storage for owner "user": executor has no subject.`,
-          cause: undefined,
-        });
-      }
-      const entriesById = new Map(
-        entries.map((entry) => [
-          pluginStorageId({
-            pluginId: input.pluginId,
-            collection: entry.collection,
-            key: entry.key,
-          }),
-          entry,
-        ]),
-      );
-      const uniqueEntries = [...entriesById.values()];
-      if (uniqueEntries.length === 0) return;
-
-      yield* deleteManyImpl(owner, os.subject, uniqueEntries);
-
-      const now = new Date();
-      for (
-        let offset = 0;
-        offset < uniqueEntries.length;
-        offset += PLUGIN_STORAGE_CREATE_ROW_BATCH_SIZE
-      ) {
-        const batchEntries = uniqueEntries.slice(
-          offset,
-          offset + PLUGIN_STORAGE_CREATE_ROW_BATCH_SIZE,
+    input.core.transaction(
+      Effect.gen(function* () {
+        const os = ownerSubject(owner);
+        if (!os) {
+          return yield* new StorageError({
+            message: `Cannot write plugin storage for owner "user": executor has no subject.`,
+            cause: undefined,
+          });
+        }
+        const entriesById = new Map(
+          entries.map((entry) => [
+            pluginStorageId({
+              pluginId: input.pluginId,
+              collection: entry.collection,
+              key: entry.key,
+            }),
+            entry,
+          ]),
         );
-        yield* input.core.createMany(
-          "plugin_storage",
-          batchEntries.map((entry) => ({
+        const uniqueEntries = [...entriesById.values()];
+        if (uniqueEntries.length === 0) return;
+
+        const now = new Date();
+        yield* input.core.upsertMany("plugin_storage", {
+          target: ["tenant", "owner", "subject", "plugin_id", "collection", "key"],
+          update: ["data", "updated_at"],
+          values: uniqueEntries.map((entry) => ({
             tenant,
             owner: os.owner,
             subject: os.subject,
@@ -1396,9 +1498,9 @@ const makePluginStorageFacade = (input: {
             created_at: now,
             updated_at: now,
           })),
-        );
-      }
-    });
+        });
+      }),
+    );
 
   const removeManyImpl = (
     owner: Owner,
@@ -1586,7 +1688,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
     const tenant = String(config.tenant);
     const subject = config.subject != null ? String(config.subject) : null;
-    const oauthRefreshCoordinator = config.oauthRefreshCoordinator ?? makeOAuthRefreshCoordinator();
+    const oauthRefreshCoordinator = config.oauthRefreshCoordinator;
 
     const ownerBinding: OwnerBinding = {
       tenant: config.tenant,
@@ -1639,6 +1741,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     });
     const rootDbUntyped = "db" in dbInput ? dbInput.db : dbInput;
     const closeDb = "db" in dbInput ? dbInput.close : undefined;
+    // Shared with every other execution stack built over this same handle —
+    // see the gate's definition for what that does and does not cover.
+    const refreshInFlight = refreshGateFor(rootDbUntyped);
     yield* Effect.try({
       try: () => {
         validateExecutorDbTables(tables, rootDbUntyped.internal.tables);
@@ -1862,6 +1967,19 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           ),
       });
 
+    // Key for the shared in-flight refresh gate (`refreshInFlight`, bound at
+    // the top of `createExecutor`). The tenant leads because the gate spans
+    // every execution stack over one DB handle, so it spans tenants too:
+    // without it, two tenants whose rows agree on owner/subject/integration/
+    // name would collide on one entry and one tenant's caller could be handed
+    // the other's access token. JSON.stringify keeps the components
+    // unambiguous: tenant, subject, integration, and name are opaque strings
+    // that may contain any delimiter, so a delimiter-joined key would let
+    // tenant "a" + subject "user:b" collide with tenant "a:user" + subject
+    // "b" — the same cross-tenant bleed by another route.
+    const connectionKey = (row: ConnectionRow): string =>
+      JSON.stringify([tenant, row.owner, row.subject, row.integration, row.name]);
+
     const loadOAuthClientRow = (
       owner: Owner,
       slug: string,
@@ -1885,6 +2003,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       readonly tokenUrl: string;
       readonly grant: string;
       readonly resource: string | null;
+      readonly tokenEndpointAuthMethod?: "body" | "basic";
+      readonly tokenRequestFormat?: "form" | "json";
     }
 
     /** What drove a refresh: the pre-call expiry check (`proactive`), or an
@@ -1952,11 +2072,21 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
      *  re-mints it. Persisting the access token first means a failure in
      *  between drops a single-use credential the authorization server has
      *  already consumed, and every later refresh comes back `invalid_grant` —
-     *  a connection that silently disconnects itself. */
+     *  a connection that silently disconnects itself.
+     *
+     *  `storedRefreshToken` is the value the store already held when the
+     *  caller read it on the way in. Many authorization servers do NOT rotate
+     *  on refresh and hand back the very same refresh token, so writing it
+     *  again is a round trip that can only re-persist what is already there —
+     *  and every write bumps the stored object's version, which is the
+     *  contention this path spends retries fighting. Skip it when the value
+     *  has not changed; a rotated token never matches, so the write that
+     *  actually matters is never skipped. */
     const persistRefreshedToken = (
       row: ConnectionRow,
       provider: CredentialProvider,
       token: OAuth2TokenResponse,
+      storedRefreshToken?: string | undefined,
     ): Effect.Effect<void, StorageFailure> =>
       Effect.gen(function* () {
         if (provider.set) {
@@ -1965,7 +2095,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           const tokenItemId =
             connectionItemIds(row)[PRIMARY_INPUT_VARIABLE] ??
             `connection:${row.owner}:${row.integration}:${row.name}:${PRIMARY_INPUT_VARIABLE}`;
-          if (token.refresh_token && row.refresh_item_id) {
+          if (
+            token.refresh_token &&
+            row.refresh_item_id &&
+            token.refresh_token !== storedRefreshToken
+          ) {
             yield* provider.set(ProviderItemId.make(row.refresh_item_id), token.refresh_token);
           }
           yield* provider.set(ProviderItemId.make(tokenItemId), token.access_token);
@@ -2184,7 +2318,17 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               clientSecret: firstParty.clientSecret,
               tokenUrl: firstParty.tokenUrl,
               grant: "authorization_code",
-              resource: null,
+              // RFC 8707: the SAME resource the authorize/exchange path sent
+              // (`loadedFirstPartyClient`), so the refreshed token keeps the
+              // audience the original grant was bound to. Dropping it here
+              // made refresh asymmetric with authorize for first-party apps.
+              resource: firstParty.resource ?? null,
+              ...(firstParty.tokenEndpointAuthMethod === undefined
+                ? {}
+                : { tokenEndpointAuthMethod: firstParty.tokenEndpointAuthMethod }),
+              ...(firstParty.tokenRequestFormat === undefined
+                ? {}
+                : { tokenRequestFormat: firstParty.tokenRequestFormat }),
             } satisfies RefreshClient;
           }
           const clientOwner = (row.oauth_client_owner ?? row.owner) as Owner;
@@ -2239,6 +2383,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // path below needs a stored refresh token. Branching on grant here is
         // what keeps a client_credentials connection (e.g. DealCloud) from
         // demanding a re-auth on a credential that has no human to re-auth.
+        // What the credential store held for this connection when the grant
+        // below was prepared, so the persist can tell a ROTATED refresh token
+        // from one the authorization server simply handed back unchanged.
+        // Only the authorization_code path has one; client_credentials and
+        // id_jag carry no refresh token at all.
+        let storedRefreshToken: string | undefined;
         const token =
           clientRow.grant === "client_credentials"
             ? yield* exchangeClientCredentials({
@@ -2271,6 +2421,36 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 if (!refreshToken) {
                   return yield* reauth("Stored refresh token could not be resolved.");
                 }
+                // Prove the credential store is WRITABLE before consuming the
+                // single-use refresh token. Ordering the persist correctly
+                // (refresh token first) bounds the damage once a grant has
+                // run, but it cannot help when the store is refusing writes
+                // outright: the grant spends the stored token at the
+                // authorization server, so a store that cannot accept the
+                // rotated successor leaves the connection holding a token the
+                // server has already revoked. Every later refresh then replays
+                // it, gets invalid_grant, and a storage outage that healed in
+                // minutes has cost the user a re-auth. Failing here instead
+                // leaves the stored token valid, so the connection recovers on
+                // its own when the store does.
+                //
+                // The probe writes its OWN item and never the refresh token's.
+                // Rewriting the value just read would be one round trip
+                // cheaper and is the trap: it is a read-then-write with no
+                // compare-and-set, so a peer refresher on another instance
+                // that spent this same token and stored its rotated successor
+                // in between would have that successor overwritten by the
+                // stale value — the exact dead connection this gate exists to
+                // prevent, now caused by the gate. The probe item sits in the
+                // same partition and holds a constant, so it proves what the
+                // store will accept while no credential is ever at risk.
+                if (provider.set) {
+                  yield* provider.set(
+                    ProviderItemId.make(storeWritabilityProbeItemIdFor(row.refresh_item_id)),
+                    STORE_WRITABILITY_PROBE_VALUE,
+                  );
+                }
+                storedRefreshToken = refreshToken;
                 return yield* refreshAccessToken({
                   tokenUrl,
                   clientId: clientRow.clientId,
@@ -2280,6 +2460,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                   // RFC 8707: keep the re-minted token bound to the same resource
                   // (MCP servers require this on refresh).
                   resource: clientRow.resource ?? undefined,
+                  clientAuth: clientRow.tokenEndpointAuthMethod,
+                  requestFormat: clientRow.tokenRequestFormat,
                   endpointUrlPolicy: config.oauthEndpointUrlPolicy,
                   fetch: config.fetch,
                 }).pipe(
@@ -2350,7 +2532,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 );
               });
 
-        yield* persistRefreshedToken(row, provider, token);
+        yield* persistRefreshedToken(row, provider, token, storedRefreshToken);
         return token.access_token;
       }).pipe(
         // The refresh path was previously invisible to telemetry: no span, no
@@ -2407,34 +2589,79 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       provider: CredentialProvider,
       trigger: RefreshTrigger = "proactive",
       rejectedAccessToken?: string,
-    ): Effect.Effect<string | null, StorageFailure | CredentialResolutionError> =>
-      // Joining an in-flight grant is correct for BOTH triggers: whatever that
-      // peer mints is newer than the token this fiber just saw rejected, which
-      // is exactly what a reactive retry wants. The coordinator clears settled
-      // grants so a later expiry can refresh again.
-      oauthRefreshCoordinator.coordinate(
-        {
-          tenant,
-          owner: row.owner,
-          subject: row.subject,
-          integration: row.integration,
-          connection: row.name,
-        },
-        trigger === "reactive" && rejectedAccessToken !== undefined
-          ? Effect.gen(function* () {
-              // The request may receive its 401 just after a peer finished
-              // rotating the grant and left the in-flight gate. Compare the
-              // token this request actually sent with the current stored one;
-              // if they differ, the peer's token is already the correct retry
-              // credential and another single-use refresh would be harmful.
-              const currentAccessToken = yield* provider.get(primaryConnectionItemId(row));
-              if (currentAccessToken != null && currentAccessToken !== rejectedAccessToken) {
-                return currentAccessToken;
-              }
-              return yield* performTokenRefresh(row, provider, trigger);
-            })
-          : performTokenRefresh(row, provider, trigger),
-      );
+    ): Effect.Effect<string | null, StorageFailure | CredentialResolutionError> => {
+      // The root-DB gate is the default because its owner is detached from the
+      // request that happened to register it. A supplied host coordinator may
+      // extend the invariant across differently scoped handles; compose it
+      // around the root gate rather than replacing the cancellation-safe
+      // default.
+      const refreshThroughRootGate = Effect.suspend(() => {
+        const key = connectionKey(row);
+        // Joining an in-flight grant is correct for BOTH triggers: whatever
+        // that peer mints is newer than the token this fiber just saw
+        // rejected, which is exactly what a reactive retry wants. The gate
+        // is cleared on settle, so a 401 arriving after a refresh completed
+        // starts a fresh grant rather than replaying a stale result.
+        const existing = refreshInFlight.get(key);
+        if (existing) return Deferred.await(existing);
+
+        // The request may receive its 401 just after a peer finished
+        // rotating the grant and left the in-flight gate. Compare the token
+        // this request actually sent with the current stored one; if they
+        // differ, the peer's token is already the correct retry credential
+        // and another single-use refresh would be harmful.
+        const refresh =
+          trigger === "reactive" && rejectedAccessToken !== undefined
+            ? Effect.gen(function* () {
+                const currentAccessToken = yield* provider.get(primaryConnectionItemId(row));
+                if (currentAccessToken != null && currentAccessToken !== rejectedAccessToken) {
+                  return currentAccessToken;
+                }
+                return yield* performTokenRefresh(row, provider, trigger);
+              })
+            : performTokenRefresh(row, provider, trigger);
+
+        // The grant runs on a DETACHED fiber and every caller — including
+        // this one — only awaits its deferred. The entry is shared across
+        // execution stacks, so the fiber that registers it is merely the
+        // first arrival, not an owner. Running the grant on that fiber would
+        // hand it that caller's interruption: a disconnected MCP client, an
+        // execution deadline, or a cancelled tool call would fail every peer
+        // awaiting the same entry with an interrupt none of them caused and
+        // none can act on. Awaiting is per-caller, so a cancelled peer
+        // detaches without touching the grant or its siblings, and a grant
+        // nobody is left waiting on still settles and persists the rotated
+        // token. Token requests are bounded by `AbortSignal.timeout`, so the
+        // detached fiber cannot outlive its request.
+        const deferred = Deferred.makeUnsafe<
+          string | null,
+          StorageFailure | CredentialResolutionError
+        >();
+        // Nothing suspends between the lookup above and this registration,
+        // so check-and-set is atomic against peer fibers and cannot
+        // double-fire.
+        refreshInFlight.set(key, deferred);
+        const run = refresh.pipe(
+          Effect.exit,
+          Effect.flatMap((exit) => Deferred.done(deferred, exit)),
+          Effect.ensuring(Effect.sync(() => void refreshInFlight.delete(key))),
+        );
+        return Effect.forkDetach(run).pipe(Effect.andThen(Deferred.await(deferred)));
+      });
+
+      return oauthRefreshCoordinator
+        ? oauthRefreshCoordinator.coordinate(
+            {
+              tenant,
+              owner: row.owner,
+              subject: row.subject,
+              integration: row.integration,
+              connection: row.name,
+            },
+            refreshThroughRootGate,
+          )
+        : refreshThroughRootGate;
+    };
 
     // Resolve every named input of a connection (`variable → value`). A
     // single-secret connection yields `{ token: <value> }`; an apiKey method with
@@ -2878,6 +3105,25 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const syncHealthReason = (result: ResolveToolsResult): string =>
       result.incompleteReason ?? "plugin returned an incomplete tool catalog";
 
+    // Tool production has two phases with very different shapes: DISCOVERY (the
+    // plugin's `resolveTools` — network, slow, independent per connection) and
+    // PERSISTENCE (a short catalog-replacement transaction). Only discovery may
+    // overlap. Self-host runs a single libSQL connection issuing raw
+    // BEGIN/COMMIT, where a second transaction opened while one is live fails
+    // outright with "cannot start a transaction within a transaction" — the
+    // failure #1563 fixed for concurrent refreshes of the SAME connection via
+    // the single-flight map below. Rebuilding several DIFFERENT connections
+    // together (the stale-catalog fan-out) reopens the same hazard from the
+    // other side, so the write phase takes a single permit: the fan-out's
+    // discoveries still run together and their commits form a queue.
+    //
+    // Never take this permit while a transaction is already open on this fiber
+    // — every caller of `persistCatalog` must be outside one, as all of the
+    // `produceConnectionTools` call sites are.
+    const catalogPersistLock = Semaphore.makeUnsafe(1);
+    const persistCatalog = <A, E>(effect: Effect.Effect<A, E>) =>
+      catalogPersistLock.withPermits(1)(transaction(effect));
+
     const produceConnectionToolsUnshared = (
       integrationRow: IntegrationRow,
       ref: ConnectionRef,
@@ -2945,7 +3191,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           existingRow.template !== String(NO_AUTH_TEMPLATE) &&
           Object.keys(connectionItemIds(existingRow)).length === 0
         ) {
-          yield* transaction(
+          yield* persistCatalog(
             Effect.gen(function* () {
               yield* core.deleteMany("tool", { where });
               yield* core.deleteMany("definition", { where });
@@ -2957,7 +3203,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
         if (!runtime?.plugin.resolveTools) {
           // No dynamic tools — clear any existing rows and return empty.
-          yield* transaction(
+          yield* persistCatalog(
             Effect.gen(function* () {
               yield* core.deleteMany("tool", { where });
               yield* core.deleteMany("definition", { where });
@@ -3051,7 +3297,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           created_at: now,
         }));
 
-        yield* transaction(
+        yield* persistCatalog(
           Effect.gen(function* () {
             yield* core.deleteMany("tool", { where });
             yield* core.deleteMany("definition", { where });
@@ -4044,6 +4290,13 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             ? b.isNull("tools_synced_at")
             : b.or(b.isNull("tools_synced_at"), b("tools_synced_at", "<", staleBefore)),
       });
+      // Each rebuild is an independent upstream listing, so they run together
+      // rather than one after another: a host with many stale remote-catalog
+      // connections otherwise pays the sum of every server's latency on the
+      // read that trips the TTL. Only the listings overlap — `persistCatalog`
+      // keeps the catalog writes in a single-file queue, so this fan-out never
+      // opens two transactions on a one-connection database.
+      const rebuilds: Effect.Effect<readonly Tool[]>[] = [];
       for (const connection of connections) {
         const integrationRow = integrationBySlug.get(connection.integration);
         if (!integrationRow) continue;
@@ -4070,29 +4323,83 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           syncedAt < cutoff;
         if (!staleMarked && !configRevised && !expired) continue;
 
-        yield* produceConnectionTools(
-          integrationRow,
-          {
-            owner: connection.owner as Owner,
-            integration: IntegrationSlug.make(connection.integration),
-            name: ConnectionName.make(connection.name),
-          },
-          "background",
-        ).pipe(
-          Effect.catch(() => Effect.succeed([] as readonly Tool[])),
-          Effect.withSpan("executor.tools.sync_stale", {
-            attributes: {
-              "executor.integration": connection.integration,
-              "executor.connection": connection.name,
+        rebuilds.push(
+          produceConnectionTools(
+            integrationRow,
+            {
+              owner: connection.owner as Owner,
+              integration: IntegrationSlug.make(connection.integration),
+              name: ConnectionName.make(connection.name),
             },
-          }),
+            "background",
+          ).pipe(
+            // Best-effort, but never silent: the read still succeeds on the
+            // stale-but-working catalog and the peer rebuilds still finish,
+            // while the operator gets the connection that failed and why.
+            // Without this a connection whose upstream is permanently broken
+            // re-fails on every read and leaves no trace anywhere.
+            Effect.catch((error) =>
+              Effect.logWarning("executor stale tool sync failed", {
+                integration: connection.integration,
+                connection: connection.name,
+                error: describeSyncFailure(error),
+              }).pipe(Effect.as([] as readonly Tool[])),
+            ),
+            Effect.withSpan("executor.tools.sync_stale", {
+              attributes: {
+                "executor.integration": connection.integration,
+                "executor.connection": connection.name,
+              },
+            }),
+          ),
         );
       }
+      yield* Effect.all(rebuilds, { concurrency: STALE_TOOLS_SYNC_CONCURRENCY });
     });
+
+    // How long a tools read waits for the stale sync before answering from
+    // the persisted rows (`ExecutorConfig.toolsSyncGraceMs`; `null` blocks
+    // until convergence).
+    const toolsSyncGraceMs =
+      config.toolsSyncGraceMs === undefined ? DEFAULT_TOOLS_SYNC_GRACE_MS : config.toolsSyncGraceMs;
+
+    // Run the stale sync with a bounded wait: a read pays at most the grace
+    // budget for upstream listings it did not ask for, then serves the
+    // persisted catalog while the rebuilds finish on their detached fibers
+    // (deduplicated per connection by `produceConnectionTools`, so overlapping
+    // reads share one rebuild instead of stacking new ones). One slow or dead
+    // MCP server must never gate every catalog read behind its network
+    // timeout. Past the deadline the sync is best-effort by construction —
+    // failures log and the stale-but-working catalog stays — so the fork
+    // swallows its scan errors the same way each rebuild already swallows its
+    // own.
+    const awaitStaleSyncWithinGrace = (graceMs: number) =>
+      Effect.gen(function* () {
+        const fiber = yield* Effect.forkDetach(
+          syncStaleConnectionTools.pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("executor stale tool sync scan failed", {
+                error: describeSyncFailure(error),
+              }),
+            ),
+          ),
+        );
+        // On hosts that cancel request-scoped I/O once the response settles
+        // (Cloudflare Workers), hand the host the rebuilds' completion so the
+        // catalog still converges after the read stops waiting.
+        config.waitUntil?.(
+          new Promise<void>((resolve) => fiber.addObserver(() => resolve(undefined))),
+        );
+        yield* Fiber.await(fiber).pipe(Effect.timeoutOption(graceMs), Effect.asVoid);
+      });
 
     const toolsList = (filter?: ToolListFilter): Effect.Effect<readonly Tool[], StorageFailure> =>
       Effect.gen(function* () {
-        yield* syncStaleConnectionTools;
+        if (toolsSyncGraceMs === null) {
+          yield* syncStaleConnectionTools;
+        } else {
+          yield* awaitStaleSyncWithinGrace(toolsSyncGraceMs);
+        }
         // Projected: the list surface is metadata (address, description,
         // annotations) — loading every tool's input/output schema JSON made
         // an unbounded list scale with schema bytes, not tool count.
@@ -5346,8 +5653,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             const oauth = selected?.kind === "oauth" ? selected.oauth : undefined;
             // Declared scopes win. Discover only when the selected method
             // declares none but names a source to discover them from (MCP).
+            // The discovery URL rides along so `oauth.start` can discover
+            // scopes even for a client whose RFC 8707 resource was cleared.
             if (oauth?.scopes === undefined && oauth?.discoveryUrl !== undefined) {
-              return { kind: "discover" };
+              return { kind: "discover", discoveryUrl: oauth.discoveryUrl };
             }
             return { kind: "scopes", scopes: oauth?.scopes ?? [] };
           }),
@@ -5465,6 +5774,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         oauth,
         execute: (address, args, options) => execute(address, args, options),
         transaction: <A, E>(effect: Effect.Effect<A, E>) => transaction(effect),
+        afterCommit: (effect: Effect.Effect<void>) => afterCommit(effect),
       };
 
       if (plugin.toolPolicyProvider) {

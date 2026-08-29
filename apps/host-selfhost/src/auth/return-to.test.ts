@@ -2,7 +2,9 @@ import { describe, expect, it } from "@effect/vitest";
 
 import {
   isSafeReturnTo,
+  isMcpAuthorizeTarget,
   loginPath,
+  mcpConsentRedirectTarget,
   mcpAuthorizeResumeTarget,
   postLoginTarget,
   safeReturnTo,
@@ -76,6 +78,34 @@ describe("mcpAuthorizeResumeTarget", () => {
     expect(
       mcpAuthorizeResumeTarget("?response_type=token&client_id=abc&redirect_uri=x"),
     ).toBeNull();
+  });
+});
+
+describe("MCP login transition targets", () => {
+  it("recognizes only the local authorize endpoint", () => {
+    expect(isMcpAuthorizeTarget("/api/auth/mcp/authorize?client_id=abc")).toBe(true);
+    expect(isMcpAuthorizeTarget("/api/auth/mcp/authorize-extra?client_id=abc")).toBe(false);
+    expect(isMcpAuthorizeTarget("/mcp-consent?consent_code=code")).toBe(false);
+  });
+
+  it("accepts only a same-origin consent redirect", () => {
+    const origin = "https://executor.test";
+    expect(
+      mcpConsentRedirectTarget("/mcp-consent?consent_code=code&client_id=client", origin),
+    ).toBe("/mcp-consent?consent_code=code&client_id=client");
+    expect(
+      mcpConsentRedirectTarget("https://executor.test/mcp-consent?consent_code=code", origin),
+    ).toBe("/mcp-consent?consent_code=code");
+  });
+
+  it("rejects cross-origin, look-alike, and malformed redirects", () => {
+    const origin = "https://executor.test";
+    expect(
+      mcpConsentRedirectTarget("https://attacker.test/mcp-consent?consent_code=code", origin),
+    ).toBeNull();
+    expect(mcpConsentRedirectTarget("/mcp-consent/extra?consent_code=code", origin)).toBeNull();
+    expect(mcpConsentRedirectTarget("http://[invalid", origin)).toBeNull();
+    expect(mcpConsentRedirectTarget(null, origin)).toBeNull();
   });
 });
 

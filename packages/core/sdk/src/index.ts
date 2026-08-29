@@ -139,12 +139,15 @@ export {
   HealthCheckCandidateParameter,
   HealthCheckResponseField,
   classifyHttpStatus,
+  classifyProbeResponse,
   extractIdentity,
   compareHealthCheckCandidates,
   candidateIdentityTier,
   sortHealthCheckCandidatesByIdentity,
   projectResponseFields,
   extractResponseFields,
+  pathNamesASecret,
+  REDACTED_SAMPLE_VALUE,
   identityPathTier,
   rankResponseSample,
 } from "./health-check";
@@ -430,6 +433,8 @@ export {
   type ExecutorDbFactory,
   type ExecutorDbInput,
   type ParsedToolAddress,
+  DEFAULT_TOOLS_SYNC_GRACE_MS,
+  STALE_TOOLS_SYNC_CONCURRENCY,
   createExecutor,
   collectTables,
   parseToolAddress,
@@ -498,6 +503,14 @@ export {
   oauthClientGcSqliteMigration,
   runSqliteOAuthClientGcMigration,
 } from "./sqlite-oauth-client-gc-migration";
+// Rewrite `bigint` columns an earlier build left in SQLite's INTEGER storage
+// class, which the bigint row mapper cannot read (issue #1771).
+export {
+  bigintStorageClassSqliteMigration,
+  runSqliteBigintStorageClassMigration,
+  LEGACY_BIGINT_STORAGE_CLASS_COLUMNS,
+  type BigintStorageClassColumn,
+} from "./sqlite-bigint-storage-class-migration";
 export {
   authToolFailure,
   isUnauthorizedToolFailure,

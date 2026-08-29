@@ -7,7 +7,12 @@ import { Label } from "@executor-js/react/components/label";
 import { authClient } from "./auth-client";
 import { AuthLayout } from "./auth-layout";
 import { persistSessionBearer } from "./session-bearer";
-import { postLoginTarget } from "../src/auth/return-to";
+import { MCP_TRANSITION_JSON_HEADER } from "../src/auth/mcp-transition-json";
+import {
+  isMcpAuthorizeTarget,
+  mcpConsentRedirectTarget,
+  postLoginTarget,
+} from "../src/auth/return-to";
 
 // Self-host login: email + password sign-in via Better Auth. On success we
 // reload so the shared AuthProvider re-reads /account/me and the AuthGate swaps
@@ -33,19 +38,71 @@ export const LoginPage = () => {
     event.preventDefault();
     setBusy(true);
     setError(null);
-    const result = await authClient.signIn.email({ email, password });
+    let responseToken: string | null = null;
+    const result = await authClient.signIn.email({
+      email,
+      password,
+      // Better Auth's MCP hook turns the first successful sign-in into a
+      // consent redirect. Browser Fetch hides manual redirects, so ask the
+      // same-origin serving boundary for its JSON representation instead.
+      fetchOptions: {
+        headers: { [MCP_TRANSITION_JSON_HEADER]: "json" },
+        onResponse: ({ response }) => {
+          responseToken = response.headers.get("set-auth-token");
+        },
+      },
+    });
+
     if (result.error) {
       setBusy(false);
       setError(result.error.message ?? "Sign in failed");
       return;
     }
-    const token = result.data?.token;
+    const token = result.data?.token ?? responseToken;
     if (!token) {
       setBusy(false);
       setError("Sign in did not create a session. Please try again.");
       return;
     }
     persistSessionBearer(token);
+
+    const interceptedConsent = mcpConsentRedirectTarget(
+      result.data?.url ?? null,
+      window.location.origin,
+    );
+    if (interceptedConsent) {
+      window.location.href = interceptedConsent;
+      return;
+    }
+
+    // If the embedded browser rejected the login-prompt cookie, sign-in
+    // returns ordinary JSON instead of the intercepted 302 above. Resume the
+    // exact authorize request manually with the tab bearer: a top-level
+    // navigation cannot attach Authorization.
+    if (isMcpAuthorizeTarget(postLogin)) {
+      const authorizeResult = await authClient.$fetch<{ url?: string }>(
+        new URL(postLogin, window.location.origin).toString(),
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${token}`,
+            [MCP_TRANSITION_JSON_HEADER]: "json",
+          },
+        },
+      );
+      const resumedConsent = mcpConsentRedirectTarget(
+        authorizeResult.data?.url ?? null,
+        window.location.origin,
+      );
+      if (!resumedConsent) {
+        setBusy(false);
+        setError("Could not continue authorization. Please retry from your agent.");
+        return;
+      }
+      window.location.href = resumedConsent;
+      return;
+    }
+
     window.location.href = postLogin;
   };
 

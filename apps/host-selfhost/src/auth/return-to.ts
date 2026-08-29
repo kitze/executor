@@ -25,6 +25,25 @@ export const loginPath = (returnTo: string): string =>
 // endpoint, which validates client_id/redirect_uri, so this is not an open
 // redirect.
 const MCP_AUTHORIZE_PATH = "/api/auth/mcp/authorize";
+const MCP_CONSENT_PATH = "/mcp-consent";
+
+export const isMcpAuthorizeTarget = (target: string): boolean =>
+  pathPart(target) === MCP_AUTHORIZE_PATH;
+
+/**
+ * Accept only Better Auth's same-origin MCP consent redirect. The login form
+ * reads this from a manual redirect response that also carries a full session
+ * bearer, so following any other origin or path would risk credential leakage.
+ */
+export const mcpConsentRedirectTarget = (
+  location: string | null,
+  origin: string,
+): string | null => {
+  if (!location || !URL.canParse(location, origin)) return null;
+  const target = new URL(location, origin);
+  if (target.origin !== origin || target.pathname !== MCP_CONSENT_PATH) return null;
+  return `${target.pathname}${target.search}`;
+};
 
 export const mcpAuthorizeResumeTarget = (search: string): string | null => {
   const params = new URLSearchParams(search);

@@ -13,6 +13,7 @@ export interface IntegrationStatusCounts {
   readonly all: number;
   readonly healthy: number;
   readonly degraded: number;
+  readonly misconfigured: number;
   readonly expired: number;
 }
 
@@ -24,6 +25,11 @@ export const INTEGRATION_STATUS_FILTER_OPTIONS: ReadonlyArray<{
   { value: "all", label: "All", description: "All services" },
   { value: "healthy", label: "Green", description: "Healthy services" },
   { value: "degraded", label: "Yellow", description: "Services needing attention" },
+  {
+    value: "misconfigured",
+    label: "Amber",
+    description: "Services with configuration errors",
+  },
   { value: "expired", label: "Red", description: "Expired or unconnected services" },
 ];
 
@@ -85,7 +91,13 @@ export function IntegrationHealthOverviewProvider(props: { readonly children: Re
   }, [connections, integrations, probeFor, ready]);
 
   const counts = useMemo<IntegrationStatusCounts>(() => {
-    const next = { all: integrations.length, healthy: 0, degraded: 0, expired: 0 };
+    const next = {
+      all: integrations.length,
+      healthy: 0,
+      degraded: 0,
+      misconfigured: 0,
+      expired: 0,
+    };
     if (!ready) return next;
     for (const verdict of healthByIntegration.values()) next[verdict.status] += 1;
     return next;

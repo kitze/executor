@@ -2,7 +2,7 @@ import { Link, Outlet, useLocation, useNavigate, useParams } from "@tanstack/rea
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
-import { BookOpen, Command, ExternalLink, RefreshCw } from "lucide-react";
+import { BookOpen, Command, ExternalLink, PlusIcon, RefreshCw } from "lucide-react";
 import type { Integration } from "@executor-js/sdk/shared";
 import { connectionsAllAtom, integrationsOptimisticAtom } from "../api/atoms";
 import { trackEvent } from "../api/analytics";
@@ -31,6 +31,7 @@ import {
   useIntegrationHealthOverview,
 } from "../lib/integration-health-overview";
 import { useRunConnectionHealthCheck } from "../lib/use-connection-health";
+import { ConnectDialog } from "../pages/integrations";
 import { useClientPlugins, useIntegrationPlugins } from "@executor-js/sdk/client";
 import { useAuth } from "./auth-context";
 
@@ -236,7 +237,7 @@ function IntegrationHealthSidebarSummary(props: { readonly onNavigate?: () => vo
           {counts.all} total
         </span>
       </div>
-      <div className="grid grid-cols-4 gap-1" aria-label="Filter services by status">
+      <div className="grid grid-cols-5 gap-1" aria-label="Filter services by status">
         {INTEGRATION_STATUS_FILTER_OPTIONS.map((option) => {
           const active = statusFilter === option.value;
           const disabled = !ready && option.value !== "all";
@@ -467,6 +468,7 @@ function SidebarContent(
     onNavigate?: () => void;
     showBrand?: boolean;
     onOpenCommands: () => void;
+    onOpenIntegrationConnect: () => void;
   },
 ) {
   const plugins = useClientPlugins();
@@ -505,7 +507,20 @@ function SidebarContent(
         <div className="sticky top-0 z-10 -mx-2 mt-5 bg-sidebar px-2 pb-2">
           <div className="mb-1 flex items-center justify-between px-2.5 text-xs font-medium uppercase tracking-widest text-muted-foreground">
             <span>Integrations</span>
-            <RefreshAllIntegrationsButton />
+            <div className="flex items-center gap-1">
+              <RefreshAllIntegrationsButton />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Browse integrations"
+                title="Browse integrations"
+                onClick={props.onOpenIntegrationConnect}
+                className="-my-1 text-muted-foreground hover:bg-sidebar-active/60 hover:text-foreground"
+              >
+                <PlusIcon className="size-3.5" />
+              </Button>
+            </div>
           </div>
           <IntegrationHealthSidebarSummary onNavigate={props.onNavigate} />
         </div>
@@ -539,6 +554,7 @@ export function Shell(props: ShellProps) {
   const lastPathname = useRef(pathname);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [connectIntegrationOpen, setConnectIntegrationOpen] = useState(false);
   if (lastPathname.current !== pathname) {
     lastPathname.current = pathname;
     if (mobileSidebarOpen) setMobileSidebarOpen(false);
@@ -553,16 +569,23 @@ export function Shell(props: ShellProps) {
     };
   }, [mobileSidebarOpen]);
 
+  const openIntegrationConnect = () => {
+    setConnectIntegrationOpen(true);
+    trackEvent("integration_connect_dialog_opened");
+  };
+
   return (
     <IntegrationHealthOverviewProvider>
       <div className="flex h-screen overflow-hidden">
         <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
+        <ConnectDialog open={connectIntegrationOpen} onOpenChange={setConnectIntegrationOpen} />
         {/* Desktop sidebar */}
         <aside className="hidden w-52 shrink-0 border-r border-sidebar-border bg-sidebar md:flex md:flex-col lg:w-56">
           <SidebarContent
             {...props}
             pathname={pathname}
             onOpenCommands={() => setCommandPaletteOpen(true)}
+            onOpenIntegrationConnect={openIntegrationConnect}
           />
         </aside>
 
@@ -605,6 +628,10 @@ export function Shell(props: ShellProps) {
                 onOpenCommands={() => {
                   setMobileSidebarOpen(false);
                   setCommandPaletteOpen(true);
+                }}
+                onOpenIntegrationConnect={() => {
+                  setMobileSidebarOpen(false);
+                  openIntegrationConnect();
                 }}
               />
             </div>
