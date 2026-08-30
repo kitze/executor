@@ -74,6 +74,7 @@ export {
   IntegrationNotFoundError,
   IntegrationAlreadyExistsError,
   IntegrationRemovalNotAllowedError,
+  ConnectionAlreadyExistsError,
   ConnectionNotFoundError,
   CredentialProviderNotRegisteredError,
   CredentialResolutionError,
@@ -132,6 +133,7 @@ export { ToolSchemaView, IntegrationDetectionResult } from "./types";
 // Health-check vocabulary (pure Schema + helpers).
 export {
   HealthStatus,
+  HealthCheckReason,
   HealthCheckSpec,
   HealthCheckResult,
   HealthCheckResponseSample,
@@ -236,6 +238,7 @@ export { sanitizeArtifactPreviewMarkup, ARTIFACT_PREVIEW_MARKUP_LIMIT } from "./
 
 // Elicitation.
 export {
+  ElicitationMeta,
   FormElicitation,
   UrlElicitation,
   ElicitationAction,
@@ -522,3 +525,21 @@ export {
   insufficientScopeFromEmbeddedJson,
   type InsufficientScopeDetection,
 } from "./insufficient-scope";
+
+// Endpoint sanitization for span attributes — plugins stamping a user-supplied
+// endpoint must strip its credential-bearing parts first.
+export { endpointForTelemetry, endpointTelemetryAttributes } from "./telemetry-endpoint";
+
+// URL redaction for exported telemetry — the shared scrub every exporter path
+// (cloud span processors, self-host and browser OTLP serialization, the
+// browser-traces forwarder) consumes.
+export {
+  redactOtlpTraceExport,
+  redactSpanUrlAttributes,
+  redactStringElements,
+  redactUrlForTelemetry,
+  redactUrlsInText,
+  STRIPPED_QUERY_ATTRIBUTE,
+  UrlRedactingOtlpSerializationJson,
+  type RedactedUrl,
+} from "./telemetry-url-redaction";

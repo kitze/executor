@@ -39,8 +39,16 @@ const toServerInput = (
       args?: readonly string[];
       envVars?: readonly string[];
       env?: Record<string, string>;
+      staticEnv?: Record<string, string>;
       cwd?: string;
       versionNegotiation?: "legacy" | "auto";
+      spawnPerCall?: boolean;
+      appServer?: {
+        server: string;
+        surface?: "sky" | "browser";
+        modulePath?: string;
+        presetId?: string;
+      };
       slug?: string;
     };
     return {
@@ -52,8 +60,11 @@ const toServerInput = (
       args: p.args ? [...p.args] : undefined,
       envVars: p.envVars ? [...p.envVars] : undefined,
       env: p.env,
+      staticEnv: p.staticEnv,
       cwd: p.cwd,
       versionNegotiation: p.versionNegotiation,
+      spawnPerCall: p.spawnPerCall,
+      appServer: p.appServer,
       slug: p.slug,
     };
   }
@@ -65,6 +76,7 @@ const toServerInput = (
     description?: string;
     endpoint: string;
     remoteTransport?: "streamable-http" | "sse" | "auto";
+    versionNegotiation?: "auto" | "legacy";
     queryParams?: Record<string, string>;
     headers?: Record<string, string>;
     slug?: string;
@@ -81,6 +93,7 @@ const toServerInput = (
     description: p.description,
     endpoint: p.endpoint,
     remoteTransport: p.remoteTransport,
+    versionNegotiation: p.versionNegotiation,
     queryParams: p.queryParams,
     headers: p.headers,
     slug: p.slug,
@@ -159,6 +172,32 @@ export const McpHandlers = HttpApiBuilder.group(ExecutorApiWithMcp, "mcp", (hand
             mode: payload.mode ?? "merge",
           });
           return { authenticationTemplate: [...authenticationTemplate] };
+        }),
+      ),
+    )
+    .handle("listCodexPlugins", () =>
+      capture(
+        Effect.gen(function* () {
+          const ext = yield* McpExtensionService;
+          const plugins = yield* ext.listCodexPlugins();
+          return { plugins: [...plugins] };
+        }),
+      ),
+    )
+    .handle("checkCodexPluginAccess", ({ params }) =>
+      capture(
+        Effect.gen(function* () {
+          const ext = yield* McpExtensionService;
+          return yield* ext.checkCodexPluginAccess(params.id);
+        }),
+      ),
+    )
+    .handle("getCodexPluginIcon", ({ params }) =>
+      capture(
+        Effect.gen(function* () {
+          const ext = yield* McpExtensionService;
+          const plugins = yield* ext.listCodexPlugins();
+          return { icon: plugins.find((plugin) => plugin.id === params.id)?.icon ?? null };
         }),
       ),
     ),

@@ -24,7 +24,7 @@ const makeStubExtension = (
   configure: () => unused,
   getConfig: () => Effect.succeed(null),
   removeConfig: () => unused,
-  status: () => Effect.succeed({ connected: false, error: "Not configured" }),
+  status: () => Effect.succeed({ connected: false, accounts: [], error: "Not configured" }),
   listVaults: (auth) =>
     Effect.sync(() => {
       onListVaults(auth);

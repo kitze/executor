@@ -1,5 +1,33 @@
 # @executor-js/analytics
 
+## 0.1.14
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/execution@1.6.7
+
+## 0.1.13
+
+### Patch Changes
+
+- Updated dependencies [[`21119da`](https://github.com/UsefulSoftwareCo/executor/commit/21119da662d2d225b033b3532e1f17d97311a39d)]:
+  - @executor-js/execution@1.6.6
+
+## 0.1.12
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/execution@1.6.5
+
+## 0.1.11
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/execution@1.6.4
+
 ## 0.1.10
 
 ### Patch Changes

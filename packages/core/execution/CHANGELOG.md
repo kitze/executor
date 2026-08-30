@@ -1,5 +1,41 @@
 # @executor-js/execution
 
+## 1.6.7
+
+### Patch Changes
+
+- Updated dependencies [[`98d6c6a`](https://github.com/UsefulSoftwareCo/executor/commit/98d6c6ad3272fca371fc2d8b14b2e332100d8322)]:
+  - @executor-js/sdk@1.6.7
+  - @executor-js/codemode-core@1.6.7
+
+## 1.6.6
+
+### Patch Changes
+
+- [#1866](https://github.com/UsefulSoftwareCo/executor/pull/1866) [`21119da`](https://github.com/UsefulSoftwareCo/executor/commit/21119da662d2d225b033b3532e1f17d97311a39d) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Large execute results are measured once, not once per span**
+
+  The result-size telemetry probe serializes the whole returned value to count its characters, and that cost grows with the payload. The same result object was walked again every time it was stamped onto another span: an operator-approved run measured it twice (inner and outer span), and every retried `resume` that replayed a settled outcome measured it again. The measurement is now computed once per result object and reused, so a large result pays one size walk no matter how many spans report it. Response text, structured content, and span attribute values are unchanged.
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.6.6
+  - @executor-js/codemode-core@1.6.6
+
+## 1.6.5
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.6.5
+  - @executor-js/codemode-core@1.6.5
+
+## 1.6.4
+
+### Patch Changes
+
+- Updated dependencies [[`ffcfbc0`](https://github.com/UsefulSoftwareCo/executor/commit/ffcfbc0de27d0ae55215839fb70395b0b7d9a65c), [`10e16a5`](https://github.com/UsefulSoftwareCo/executor/commit/10e16a5baa2648657b70038e7d11429c58e4d242), [`515d6aa`](https://github.com/UsefulSoftwareCo/executor/commit/515d6aa391a04a3579a7b10f974ec316a563cf7a), [`06bf742`](https://github.com/UsefulSoftwareCo/executor/commit/06bf74254f3432e8d75fd8b493ef7a435ea4bc84)]:
+  - @executor-js/sdk@1.6.4
+  - @executor-js/codemode-core@1.6.4
+
 ## 1.6.3
 
 ### Patch Changes

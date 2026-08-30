@@ -1,5 +1,118 @@
 # @executor-js/plugin-mcp
 
+## 1.6.7
+
+### Patch Changes
+
+- [#1876](https://github.com/UsefulSoftwareCo/executor/pull/1876) [`75b3674`](https://github.com/UsefulSoftwareCo/executor/commit/75b3674136b44a2e43fb23eb7a058e7e51528527) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Let macOS ask before denying Codex plugins Automation access. The desktop app
+  and its bundled daemon are hardened-runtime signed without the Apple Events
+  entitlement, so tccd refused to even show the consent prompt: every Messages
+  call was denied silently, no Automation row was ever created in System
+  Settings, and the access check sat on "Checking…" for a full minute before
+  misreporting the hang as a failed start. The app and daemon are now signed
+  with `com.apple.security.automation.apple-events` and carry a usage
+  description, so the first call raises the real consent prompt and the grant
+  becomes visible in Privacy & Security → Automation.
+
+  The access check also stops waiting after 25 seconds and says what a hang
+  means — answer the permission prompt on screen, then check again — instead of
+  blaming the Codex install.
+
+- Updated dependencies [[`98d6c6a`](https://github.com/UsefulSoftwareCo/executor/commit/98d6c6ad3272fca371fc2d8b14b2e332100d8322)]:
+  - @executor-js/sdk@1.6.7
+  - @executor-js/api@1.4.70
+  - @executor-js/config@1.6.7
+  - @executor-js/react@1.4.70
+
+## 1.6.6
+
+### Patch Changes
+
+- [#1869](https://github.com/UsefulSoftwareCo/executor/pull/1869) [`c695970`](https://github.com/UsefulSoftwareCo/executor/commit/c6959702f6459504463fe0e13fa1a576190460ed) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Explain macOS permissions for Codex plugins instead of failing with an opaque
+  error. A refused grant used to surface as `Internal tool error [id]` — the
+  plugin reports "Unknown error" and only a numeric code says what happened, so
+  neither the user nor the model could tell that macOS was the blocker.
+
+  The bridge now recognises those codes and answers with the grant to enable and
+  where to find it. Each plugin's add screen also states what macOS will ask for
+  before anything runs, with a link straight to the right Privacy pane — macOS
+  asks once, and a dismissed prompt never returns.
+
+  The add screen checks that access when it opens, and holds the Add button
+  until the plugin answers. Adding one that macOS is still blocking produced an
+  integration that looked connected and failed on its first call, by which point
+  the screen explaining the fix was gone.
+
+- Updated dependencies [[`9a1fbd5`](https://github.com/UsefulSoftwareCo/executor/commit/9a1fbd5f0de25f622f303c76f998443c1bb72063)]:
+  - @executor-js/react@1.4.69
+  - @executor-js/api@1.4.69
+  - @executor-js/sdk@1.6.6
+  - @executor-js/config@1.6.6
+
+## 1.6.5
+
+### Patch Changes
+
+- [#1863](https://github.com/UsefulSoftwareCo/executor/pull/1863) [`00c2ab7`](https://github.com/UsefulSoftwareCo/executor/commit/00c2ab789eef94efd9c05d389870566bba7111c2) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Adding a Codex plugin no longer asks for anything. `CODEX_HOME` is a path the
+  scanner already resolved, but it was passed on the channel that makes an
+  environment variable a credential — so the integration declared it as one, and
+  a person who reached the connect step was shown a masked field for a value
+  they should never have to know.
+
+  Stdio integrations can now carry non-secret environment as static
+  configuration, separate from declared secrets. The Codex plugins use it: they
+  declare no auth, and their connection is created for them.
+
+- [#1861](https://github.com/UsefulSoftwareCo/executor/pull/1861) [`4d4ad7c`](https://github.com/UsefulSoftwareCo/executor/commit/4d4ad7c1d5690bc13ad37d9cdadf3775e464a3f5) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Stdio MCP servers are kept alive between tool calls**
+
+  Every tool call on a stdio MCP integration used to spawn a fresh child process, run the full MCP handshake, call the one tool, and tear the child down — roughly a second of overhead per call for an `npx`-launched server, on every call. Remote and app-server connections already reused sessions through the connection pool; plain stdio now joins them, with the same five-minute idle window, the same hashed identity key (command, args, cwd, secret env, credential values, owner and connection all separate identities), and the same drop-on-transport-failure semantics. This matches how MCP clients drive stdio servers generally: one long-lived child per session, not one per call.
+
+  A server that genuinely depends on fresh-process semantics can opt out with `spawnPerCall: true` in its stdio config (also accepted by the add-server API). The Codex app-server bridge ignores the opt-out — its approvals are session state, so it must pool.
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.6.5
+  - @executor-js/config@1.6.5
+  - @executor-js/api@1.4.68
+  - @executor-js/react@1.4.68
+
+## 1.6.4
+
+### Patch Changes
+
+- [#1858](https://github.com/UsefulSoftwareCo/executor/pull/1858) [`ffcfbc0`](https://github.com/UsefulSoftwareCo/executor/commit/ffcfbc0de27d0ae55215839fb70395b0b7d9a65c) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Add locally installed OpenAI Codex plugins as one-click integrations: Messages
+  (iMessage/SMS), Chrome, Computer Use, Computer History, and OpenAI Developer
+  Docs. They appear in the connect dialog with their own icons, and a card that
+  cannot run yet says what to install and links to it.
+
+  Tool calls reach the plugins through `codex app-server` rather than a plugin's
+  own MCP server, because their services only honour calls from a Codex host
+  session. Computer Use and Chrome ship no MCP server at all, so their APIs are
+  projected as typed tools — `list_apps`, `click`, `read_page`, `navigate` — that
+  compile to a single call each. No model turn is involved; nothing is bundled or
+  downloaded, and a machine without Codex simply sees the setup steps.
+
+  A plugin's own approval prompt now reaches the caller, and states the terms it
+  carries: a browser prompt that persists for a site says so. Approvals are asked
+  once per session rather than per call.
+
+  Elicitation requests can carry implementation-defined metadata through
+  `FormElicitation` / `UrlElicitation`, and a paused execution reports it. Both
+  fields are optional and additive.
+
+- [#1818](https://github.com/UsefulSoftwareCo/executor/pull/1818) [`06bf742`](https://github.com/UsefulSoftwareCo/executor/commit/06bf74254f3432e8d75fd8b493ef7a435ea4bc84) Thanks [@ramarivera](https://github.com/ramarivera)! - **Rejected MCP OAuth grants now request reconnect without registering a disposable client**
+
+  Remote MCP catalog discovery used the MCP SDK's interactive OAuth fallback when an upstream rejected Executor's stored bearer with `401`. A background refresh cannot finish that browser authorization, but the SDK first fetched OAuth metadata and dynamically registered another client. Executor then preserved the old catalog under a generic degraded health verdict, so clients saw zero or stale tools without a reliable reconnect signal.
+
+  Executor now stops at the authenticated HTTP boundary for OAuth-backed MCP transports. A rejected stored bearer becomes a structured reauthorization result before OAuth discovery or Dynamic Client Registration runs. Catalog refresh still preserves the last authoritative tools, but records the connection as expired with a reconnect-required detail so the UI and API can direct the user through authorization again.
+
+  API-key and unauthenticated MCP transports keep their existing `401` behavior, and ordinary incomplete discovery results remain degraded.
+
+- Updated dependencies [[`ffcfbc0`](https://github.com/UsefulSoftwareCo/executor/commit/ffcfbc0de27d0ae55215839fb70395b0b7d9a65c), [`10e16a5`](https://github.com/UsefulSoftwareCo/executor/commit/10e16a5baa2648657b70038e7d11429c58e4d242), [`9dcfaa5`](https://github.com/UsefulSoftwareCo/executor/commit/9dcfaa5ee8ad2ebc17407caf94d8d4dcf55e3562), [`515d6aa`](https://github.com/UsefulSoftwareCo/executor/commit/515d6aa391a04a3579a7b10f974ec316a563cf7a), [`06bf742`](https://github.com/UsefulSoftwareCo/executor/commit/06bf74254f3432e8d75fd8b493ef7a435ea4bc84)]:
+  - @executor-js/sdk@1.6.4
+  - @executor-js/react@1.4.67
+  - @executor-js/api@1.4.67
+  - @executor-js/config@1.6.4
+
 ## 1.6.3
 
 ### Patch Changes

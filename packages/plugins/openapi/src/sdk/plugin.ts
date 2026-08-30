@@ -100,6 +100,10 @@ export interface OpenApiSpecConfig {
    *  then the title). */
   readonly description?: string;
   readonly baseUrl?: string;
+  /** The product's domain, when the caller knows it (a registry row names
+   *  notion.com); display identity for guidance/favicons when the spec's
+   *  own host is a code host. */
+  readonly displayDomain?: string;
   /** Static headers applied to every request (no secret material). */
   readonly headers?: Record<string, string>;
   /** Static query params applied to every request. */
@@ -309,6 +313,7 @@ const AddIntegrationInputSchema = Schema.Struct({
   name: Schema.optional(Schema.String),
   description: Schema.optional(Schema.String),
   baseUrl: Schema.optional(Schema.String),
+  displayDomain: Schema.optional(Schema.String),
   headers: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   queryParams: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   specFormat: Schema.optional(Schema.String),
@@ -623,7 +628,9 @@ export const describeOpenApiIntegrationDisplay = (
 ): { readonly url?: string; readonly family?: string } => {
   const config = decodeOpenApiIntegrationConfig(record.config);
   return {
-    url: config?.baseUrl ?? config?.specUrl,
+    url:
+      config?.baseUrl ??
+      (config?.displayDomain ? `https://${config.displayDomain}` : config?.specUrl),
     ...(config?.family ? { family: config.family } : {}),
   };
 };
@@ -681,6 +688,7 @@ export const openApiPlugin = definePlugin<
       const adapter = yield* resolveSpecFormatAdapter(
         options?.specFormats ?? [],
         config.specFormat,
+        config.spec.kind === "url" ? config.spec.url : undefined,
       );
       if (adapter) {
         if (config.spec.kind !== "url") {
@@ -802,6 +810,7 @@ export const openApiPlugin = definePlugin<
           const adapter = yield* resolveSpecFormatAdapter(
             options?.specFormats ?? [],
             config.specFormat,
+            config.spec.kind === "url" ? config.spec.url : undefined,
           );
           const derivedIdentity =
             adapter?.deriveIdentity && resolved.document
@@ -885,6 +894,7 @@ export const openApiPlugin = definePlugin<
             // resolved per call from the operation's `servers` (extracted from
             // the spec), so we never bake a derived base URL into the config.
             ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
+            ...(config.displayDomain ? { displayDomain: config.displayDomain } : {}),
             ...(config.headers ? { headers: config.headers } : {}),
             ...(config.queryParams ? { queryParams: config.queryParams } : {}),
             ...(config.specFormat ? { specFormat: config.specFormat } : {}),

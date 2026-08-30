@@ -37,13 +37,20 @@ import {
 import { integrationWriteKeys } from "@executor-js/react/api/reactivity-keys";
 import type { McpAuthMethodInput } from "../sdk/types";
 import { probeMcpEndpoint, addMcpServer } from "./atoms";
+import { placementFromHeaderPattern } from "@executor-js/react/lib/auth-placements";
 import { McpRemoteIntegrationFields } from "./McpRemoteIntegrationFields";
 import { McpRequestHeadersEditor } from "./McpRequestHeadersEditor";
 import { mcpHeadersFromRows, type McpHeaderRow } from "./request-headers";
-import { mcpAuthMethodInputFromEditorValue, mcpWireAuthInput } from "./auth-method-config";
+import {
+  mcpAuthMethodInputFromEditorValue,
+  mcpDetectedAuthSeeds,
+  mcpWireAuthInput,
+} from "./auth-method-config";
+import CodexPluginAdd from "./CodexPluginAdd";
 import { parseStdioArgs } from "./stdio-fields";
 import { isProbableMcpEndpoint } from "./probe-url";
 import { cloudflareNeedsCodemodeOptOut } from "../sdk/cloudflare-codemode";
+import { isCodexPresetId } from "../sdk/codex-plugin-presets";
 import { mcpPresets, type McpPreset } from "../sdk/presets";
 
 // The remote add flow REGISTERS the server's declared auth methods through the
@@ -77,6 +84,8 @@ type ProbeResult = {
   toolCount: number | null;
   serverName: string | null;
   instructions: string | null;
+  /** "legacy" when only the legacy handshake worked (version-echoing server). */
+  versionNegotiation?: "auto" | "legacy";
 };
 
 type State =
@@ -159,6 +168,9 @@ export default function AddMcpIntegration(props: {
   onCancel: () => void;
   initialUrl?: string;
   initialPreset?: string;
+  initialAuthHeader?: string;
+  initialAuthNote?: string;
+  initialAuthKind?: string;
   /** Whether the stdio transport is enabled on the server. */
   allowStdio?: boolean;
 }) {
@@ -167,7 +179,11 @@ export default function AddMcpIntegration(props: {
   // Drop stdio presets when stdio is disabled — the caller should have
   // already filtered these out, but defence-in-depth.
   const preset = rawPreset?.transport === "stdio" && !allowStdio ? undefined : rawPreset;
-  const isStdioPreset = preset?.transport === "stdio";
+  // A Codex plugin preset is a catalog pointer, not a spawn recipe: it gets
+  // its own focused add screen (rendered below, before the generic form),
+  // fed by the server-side scanner.
+  const isCodexPreset = isCodexPresetId(preset?.id);
+  const isStdioPreset = preset?.transport === "stdio" && !isCodexPreset;
 
   const [transport, setTransport] = useState<"remote" | "stdio">(
     isStdioPreset && allowStdio ? "stdio" : "remote",
@@ -213,29 +229,16 @@ export default function AddMcpIntegration(props: {
   // The probe seeds the method list: detected OAuth → an OAuth row; a 401
   // without OAuth metadata → a bearer-header row; an open server → a no-auth
   // row. The user can edit any row or add alternate methods alongside.
-  const authMethodSeeds: readonly AuthMethodSeed[] = useMemo(() => {
-    if (!probe) return [];
-    if (probe.requiresOAuth) {
-      return [
-        {
-          value: { kind: "oauth", authorizationUrl: "", tokenUrl: "", scopes: [] },
-          label: "Detected",
-        },
-      ];
-    }
-    if (probe.requiresAuthentication) {
-      return [
-        {
-          value: {
-            kind: "apikey",
-            placements: [{ carrier: "header", name: "Authorization", prefix: "Bearer " }],
-          },
-          label: "Detected",
-        },
-      ];
-    }
-    return [{ value: { kind: "none" }, label: "Detected" }];
-  }, [probe]);
+  const authMethodSeeds: readonly AuthMethodSeed[] = useMemo(
+    () =>
+      mcpDetectedAuthSeeds(probe, {
+        placement: props.initialAuthHeader
+          ? placementFromHeaderPattern(props.initialAuthHeader)
+          : null,
+        kind: props.initialAuthKind,
+      }),
+    [probe, props.initialAuthHeader, props.initialAuthKind],
+  );
   const authMethodList = useAuthMethodList(authMethodSeeds);
 
   const remoteIdentity = useIntegrationIdentity({
@@ -331,6 +334,12 @@ export default function AddMcpIntegration(props: {
           ...(slug ? { slug } : {}),
           ...(headers ? { headers } : {}),
           authenticationTemplate,
+          // The probe reports when only legacy negotiation worked (a server
+          // that echoes the modern revision but breaks its contract); pin it
+          // so refreshes and tool calls use the same handshake.
+          ...(probe?.versionNegotiation === "legacy"
+            ? { versionNegotiation: "legacy" as const }
+            : {}),
         },
         reactivityKeys: integrationWriteKeys,
       });
@@ -390,6 +399,18 @@ export default function AddMcpIntegration(props: {
   }, [stdioCommand, stdioArgs, stdioEnvVars, stdioIdentity, doAddServer, props]);
 
   // ---- Render ----
+
+  // Placed after every hook so the hook order is identical on all renders;
+  // `isCodexPreset` is fixed for the component's lifetime (route search param).
+  if (isCodexPreset && preset) {
+    return (
+      <CodexPluginAdd
+        presetId={preset.id}
+        onComplete={props.onComplete}
+        onCancel={props.onCancel}
+      />
+    );
+  }
 
   return (
     <div className="flex flex-1 flex-col gap-6">
@@ -478,9 +499,13 @@ export default function AddMcpIntegration(props: {
               title="How does this server authenticate?"
               oauthMetadata="discovered"
               emptyHint="No methods declared. Add a method, or add the server without auth and connect from the integration page later."
-              footerHint="Every method here is registered with the server. Connect an account from the integration page after adding."
+              footerHint="Nothing here takes your credential. Add the integration first, then connect an account on its page."
             />
           )}
+
+          {probe && props.initialAuthNote ? (
+            <p className="text-xs leading-relaxed text-muted-foreground">{props.initialAuthNote}</p>
+          ) : null}
 
           {/* Error (add server). Probe errors show inline on the field. */}
           {otherError && (

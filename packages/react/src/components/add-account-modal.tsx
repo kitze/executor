@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAtomRefresh, useAtomSet, useAtomValue } from "@effect/atom-react";
 import * as Exit from "effect/Exit";
+import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
 import {
   ConnectionName,
@@ -25,6 +27,7 @@ import {
   checkConnectionHealth,
   connectionsAllAtom,
   createOAuthClientOptimistic,
+  integrationAtom,
   integrationHealthCheckAtom,
   integrationHealthCheckCandidatesAtom,
   oauthClientsOptimisticAtom,
@@ -83,6 +86,7 @@ import {
 } from "./oauth-client-form";
 import { RemoveOAuthAppDialog } from "./remove-oauth-app-dialog";
 import { AddCustomMethodForm, type CreateCustomMethod } from "./add-custom-method-modal";
+import { CredentialGuidancePanel } from "./credential-guidance";
 import { PlacementLine, type AuthMethod } from "../lib/auth-placements";
 import { connectionIdentifier } from "../lib/connection-name";
 import { Badge } from "./badge";
@@ -606,9 +610,30 @@ export const connectionLabelForHost = (
   organizationId: string | null,
 ): string => label.trim() || `${ownerLabelForHost(owner, organizationId)} ${integrationName}`;
 
+/** The create endpoint rejected the name as taken (409). Like
+ *  `isIntegrationAlreadyExistsExit`: the error's `message` is a getter derived
+ *  from its fields, so it doesn't survive the wire — match the tag and rebuild
+ *  the message client-side. */
+export const isConnectionAlreadyExistsExit = (exit: Exit.Exit<unknown, unknown>): boolean =>
+  Option.match(Exit.findErrorOption(exit), {
+    onNone: () => false,
+    onSome: Predicate.isTagged("ConnectionAlreadyExistsError"),
+  });
+
+export const connectionExistsMessage = (label: string): string =>
+  `A connection named "${label}" already exists. Pick a different name, or remove the existing connection first.`;
+
 /** The default owner a new connection is saved under when the user makes no
  *  explicit choice. Personal: a connection is most often a personal credential. */
 export const DEFAULT_CONNECTION_OWNER: Owner = "user";
+
+/** The method the modal opens on. OAuth needs a registered app (or a DCR
+ *  round-trip) before "Connect" does anything; a key is one paste. When an
+ *  integration declares both, starting on OAuth greets most users with
+ *  "Register app" — a dead end — while the working method sits one tab over.
+ *  Prefer the first non-OAuth method; OAuth stays one click away. */
+export const preferredMethodId = (methods: readonly AuthMethod[]): string =>
+  (methods.find((method) => method.kind !== "oauth") ?? methods[0])?.id ?? "";
 
 const authMethodKey = (method: AuthMethod): string =>
   method.source === "custom" ? `custom:${String(method.template)}` : `declared:${method.id}`;
@@ -841,6 +866,10 @@ type DcrStartArgs = {
 type AutomaticOAuthOutcome =
   | { readonly kind: "started"; readonly flow: "cimd" | "dcr" }
   | { readonly kind: "popup-blocked" }
+  /** The owning surface went away mid-flight (`isActive` turned false): the
+   *  sequence stopped before its next side effect and released the window.
+   *  Nothing to report — the modal that would show it is gone. */
+  | { readonly kind: "aborted" }
   | { readonly kind: "fallback"; readonly reason: "probe-failed" }
   | {
       readonly kind: "fallback";
@@ -873,6 +902,10 @@ type RunAutomaticOAuthConnectDeps = {
   readonly reserve: () => OAuthPopupReservation;
   /** Close a claimed window this flow turned out not to need. */
   readonly release: () => void;
+  /** Whether the surface that started this connect still exists. Checked
+   *  after every awaited round trip: closing the modal mid-flight must not
+   *  register a client or launch the popup afterwards. */
+  readonly isActive: () => boolean;
 };
 
 type RunAutomaticOAuthConnectInput = {
@@ -897,6 +930,15 @@ type RunAutomaticOAuthConnectInput = {
     RunCimdConnectInput,
     "integrationName" | "clientIdMetadataDocumentUrl" | "existingClients"
   >;
+  /** A reconnect carries the STORED client's RFC 8707 resource — including an
+   *  EXPLICIT null for a client registered WITHOUT a resource indicator
+   *  (#1822: some servers reject any `resource` parameter). The flow
+   *  RECONCILES it with the probe: an explicit null always wins (the
+   *  deliberate absence is preserved), a probed resource beats a stored one
+   *  (the server migrated), and the stored one stands when the probe
+   *  advertises none. Undefined (a fresh connect, or the stored row is gone)
+   *  keeps the probed behavior. */
+  readonly storedResource?: string | null;
 };
 
 /** RFC 7591 `client_name` sent for every dynamic registration. Deliberately
@@ -918,6 +960,11 @@ const DCR_CLIENT_NAME = "Executor";
  * - Register rejected with a message → `{ kind: "fallback", reason: "registration-failed", probe, message }`
  *   so the caller can show why (e.g. a redirect-URI rejection) over the generic copy.
  * - Register failed without detail (null) → `{ kind: "fallback", reason: "registration-failed", probe }`.
+ * - Surface gone after any await (`isActive` false) → `{ kind: "aborted" }`,
+ *   window released, popup never launched. Checked BEFORE inspecting that
+ *   await's result, so aborted wins even when the round trip failed — a
+ *   failure outcome would have the caller write fallback state for a modal
+ *   that no longer exists.
  * - Success → calls `start` and reports which automatic flow was used.
  */
 export async function runAutomaticOAuthConnect(
@@ -932,10 +979,31 @@ export async function runAutomaticOAuthConnect(
   if (reservation.kind === "blocked") return { kind: "popup-blocked" };
 
   const probe = await deps.probe(input.discoveryUrl);
+  // The modal may have closed while the probe was in flight. Stop BEFORE the
+  // next side effect (registration persists a client; start launches the
+  // popup) and give the claimed window back.
+  if (!deps.isActive()) {
+    deps.release();
+    return { kind: "aborted" };
+  }
   if (probe === null) {
     deps.release();
     return { kind: "fallback", reason: "probe-failed" };
   }
+  // The flow's RFC 8707 resource indicator. A reconnect RECONCILES the stored
+  // value with the probe rather than pinning it: a stored EXPLICIT null always
+  // wins (#1822 — the deliberate absence some servers require), a probed
+  // resource beats a stored one (the server migrated its protected resource,
+  // and the probe is the fresh truth), and a stored resource stands when the
+  // probe advertises none — including over the discovery-URL fallback, which
+  // is our own guess. A fresh connect keeps the probed value with the
+  // discovery-URL fallback.
+  const resource =
+    input.storedResource !== undefined
+      ? input.storedResource === null
+        ? null
+        : (probe.resource ?? input.storedResource)
+      : (probe.resource ?? input.resourceFallback ?? null);
   if (probe.clientIdMetadataDocumentSupported === true) {
     const resolved = await resolveCimdClient(
       { createClient: deps.createCimdClient },
@@ -944,11 +1012,17 @@ export async function runAutomaticOAuthConnect(
         integrationName: input.cimd.integrationName,
         authorizationUrl: probe.authorizationUrl,
         tokenUrl: probe.tokenUrl,
-        resource: probe.resource ?? input.resourceFallback ?? null,
+        resource,
         clientIdMetadataDocumentUrl: input.cimd.clientIdMetadataDocumentUrl,
         existingClients: input.cimd.existingClients,
       },
     );
+    // Aborted wins over failure: a "fallback" outcome makes the caller write
+    // recovery state, and the modal that would render it is gone.
+    if (!deps.isActive()) {
+      deps.release();
+      return { kind: "aborted" };
+    }
     if (resolved.kind === "failed") {
       deps.release();
       return { kind: "fallback", reason: "client-metadata-failed", probe };
@@ -971,13 +1045,21 @@ export async function runAutomaticOAuthConnect(
     registrationEndpoint,
     authorizationUrl: probe.authorizationUrl,
     tokenUrl: probe.tokenUrl,
-    resource: probe.resource ?? input.resourceFallback ?? null,
+    resource,
     scopes,
     tokenEndpointAuthMethodsSupported: probe.tokenEndpointAuthMethodsSupported,
     clientName: DCR_CLIENT_NAME,
     redirectUri: input.redirectUri,
     originIntegration: input.integration,
   });
+  // A close that raced the registration itself cannot unmint the client (there
+  // is no server-side cancel) — the row is inert, reusable DCR plumbing — but
+  // nothing may land on the closed surface afterwards: not the sign-in popup,
+  // and not a failure fallback either, so aborted wins over the mint result.
+  if (!deps.isActive()) {
+    deps.release();
+    return { kind: "aborted" };
+  }
   if (minted === null) {
     deps.release();
     return { kind: "fallback", reason: "registration-failed", probe };
@@ -991,6 +1073,39 @@ export async function runAutomaticOAuthConnect(
   deps.start({ client: minted, owner: input.owner, reservation });
   return { kind: "started", flow: "dcr" };
 }
+
+/**
+ * Can this method go through {@link runAutomaticOAuthConnect} at all?
+ *
+ * True when the integration advertises dynamic registration (MCP oauth2) OR
+ * carries a discovery URL we can probe at connect time — the probe decides
+ * between CIMD and DCR from there. This is a METHOD capability only: a
+ * reconnect routes by the STORED client binding instead (`reconnectRoute`),
+ * so a static/BYO or first-party binding is never silently rebound, and an
+ * auto-minted DCR binding re-registers even when the method declares no
+ * capability (the probe falls back to the token URL).
+ */
+export const hasDcr = (method: AuthMethod | undefined | null): boolean =>
+  method?.kind === "oauth" &&
+  (method.oauth?.supportsDynamicRegistration === true || method.oauth?.discoveryUrl != null);
+
+/** What a caller of the modal's `startAutomaticOAuthConnect` decides for itself. */
+type AutomaticOAuthConnectRequest = {
+  readonly method: AuthMethod;
+  readonly owner: Owner;
+  readonly connectionName: ConnectionName;
+  /** Stored on the connection; undefined leaves it untouched. */
+  readonly identityLabel: string | undefined;
+  /** What the user typed, used to auto-name a NEW connection after connect. */
+  readonly typedLabel: string;
+  /** A reconnect re-authorizes a connection that already exists; a connect
+   *  creates one. The only behavioral difference between the two paths. */
+  readonly mode: "connect" | "reconnect";
+  /** Reconnect only: the stored client's RFC 8707 resource, an EXPLICIT null
+   *  when it was registered WITHOUT one. See
+   *  `RunAutomaticOAuthConnectInput.storedResource`. */
+  readonly storedResource?: string | null;
+};
 
 // ---------------------------------------------------------------------------
 // One row in the OAuth app picker: a radio-select Label plus an actions menu
@@ -1318,7 +1433,7 @@ function AddAccountModalView(props: AddAccountModalProps) {
   );
   const [addingMethod, setAddingMethod] = useState(false);
 
-  const [methodId, setMethodId] = useState<string>(methods[0]?.id ?? "");
+  const [methodId, setMethodId] = useState<string>(preferredMethodId(methods));
   // One value per distinct credential input (`variable → pasted value`). A
   // single-secret method has just `{ token }`; a method with two distinct inputs
   // (e.g. Datadog's two keys) collects one value per variable.
@@ -1396,6 +1511,12 @@ function AddAccountModalView(props: AddAccountModalProps) {
   // The integration's declared health check + its candidate operations. When a
   // check is configured we probe against it; when not, the user picks one of the
   // candidates inline to test the key (and we save it).
+  // The integration's display URL is how the registry's credential guidance is
+  // located — it names the provider this key belongs to.
+  const integrationRecord = useAtomValue(integrationAtom(integration));
+  const integrationDisplayUrl = AsyncResult.isSuccess(integrationRecord)
+    ? integrationRecord.value?.displayUrl
+    : undefined;
   const healthCheckResult = useAtomValue(integrationHealthCheckAtom(integration));
   const configuredHealthCheck = AsyncResult.isSuccess(healthCheckResult)
     ? healthCheckResult.value
@@ -1500,7 +1621,7 @@ function AddAccountModalView(props: AddAccountModalProps) {
             m.id === initialState.template || String(m.template) === initialState.template,
         )
       : undefined;
-    setMethodId(initialMethod?.id ?? allMethods[0]!.id);
+    setMethodId(initialMethod?.id ?? preferredMethodId(allMethods));
   }, [allMethods, initialState?.template, methodId]);
 
   // Non-secret prefill carried by an `oauth.clients.createHandoff` deep link.
@@ -1639,13 +1760,9 @@ function AddAccountModalView(props: AddAccountModalProps) {
         : `?${placement.name || "api_key"}=`;
     return `${lead}${placement.prefix ?? ""}`;
   }, [method, singleInput, isEnvMethod]);
-  // DCR-capable: the integration advertises dynamic registration (MCP oauth2),
-  // OR carries a discovery URL we can probe at connect time. When DCR-capable
-  // and not yet fallen back, we skip the app picker entirely (Option A).
-  const isDcr =
-    !cimdActive &&
-    isOAuth &&
-    (method?.oauth?.supportsDynamicRegistration === true || method?.oauth?.discoveryUrl != null);
+  // DCR-capable (see `hasDcr`). When DCR-capable and not yet fallen back, we
+  // skip the app picker entirely (Option A).
+  const isDcr = !cimdActive && hasDcr(method);
   const dcrActive = isDcr && !dcrFailed;
   const automaticOAuthActive = cimdActive || dcrActive;
 
@@ -1747,7 +1864,8 @@ function AddAccountModalView(props: AddAccountModalProps) {
   const showSavedToPicker = !oauthRegistering && savedToOptions.length > 1;
   // OAuth mints a NEW connection per connect, so its preview shows the
   // uniquified name (`personalGmail2`); credential saves keep the plain
-  // derivation (they surface an explicit overwrite through the same name).
+  // derivation, because a save under a taken name is a conflict the server
+  // rejects rather than something the client silently renames around.
   const callableName = isOAuth
     ? previewConnectionName(label, savedToOwner)
     : connectionNameFrom(label, savedToOwner, integrationName, organizationId);
@@ -1845,90 +1963,42 @@ function AddAccountModalView(props: AddAccountModalProps) {
   // OAuth popup flow's busy state die with this instance.
   const close = useCallback(() => onOpenChange(false), [onOpenChange]);
 
-  useEffect(() => {
-    const handoff = initialState;
-    const oauthClient = handoff?.oauthClient;
-    if (!handoff || oauthClient?.action !== "reconnect") return;
-    if (oauthReconnectOpenedKey.current === handoff.key) return;
-    const client = oauthClient.slug;
-    const clientOwner = oauthClient.owner ?? handoff.owner;
-    const connectionOwner = handoff.owner;
-    const connectionName = handoff.label;
-    const oauthMethod = handoff.template
-      ? allMethods.find(
-          (m: AuthMethod) =>
-            m.kind === "oauth" &&
-            (m.id === handoff.template || String(m.template) === handoff.template),
-        )
-      : allMethods.find((m: AuthMethod) => m.kind === "oauth");
-    if (!client || !clientOwner || !connectionOwner || !connectionName || !oauthMethod) return;
-
-    oauthReconnectOpenedKey.current = handoff.key;
-    setMethodId(oauthMethod.id);
-    void oauthPopup.start({
-      payload: {
-        client: OAuthClientSlug.make(client),
-        clientOwner,
-        owner: connectionOwner,
-        name: ConnectionName.make(connectionName),
-        integration,
-        template: oauthMethod.template,
-        ...(handoff.identityLabel !== undefined ? { identityLabel: handoff.identityLabel } : {}),
-      },
-      onAuthorizationStarted: () => {
-        trackEvent("connection_reconnected", {
-          integration_slug: String(integration),
-          owner: connectionOwner,
-          success: true,
-        });
-      },
-      onError: () => {
-        trackEvent("connection_reconnected", {
-          integration_slug: String(integration),
-          owner: connectionOwner,
-          success: false,
-        });
-      },
-      onSuccess: () => {
-        toast.success("Reconnected");
-        close();
-      },
-    });
-  }, [initialState, allMethods, integration, oauthPopup, close]);
-
-  const probeAndAutoNameOAuthConnection = async (
-    connection: OAuthCompletionPayload,
-    typedLabel: string,
-  ): Promise<void> => {
-    const check = await doCheckConnectionHealth({
-      params: {
-        owner: connection.owner,
-        integration: connection.integration,
-        name: connection.name,
-      },
-      query: {},
-      reactivityKeys: connectionCheckKeys,
-    });
-    if (Exit.isFailure(check)) return;
-    const nextIdentityLabel = oauthIdentityLabelFromHealth({
-      result: check.value,
-      typedLabel,
-      storedIdentityLabel: connection.identityLabel,
-    });
-    if (nextIdentityLabel === null) return;
-    const updated = await doUpdateConnection({
-      params: {
-        owner: connection.owner,
-        integration: connection.integration,
-        name: connection.name,
-      },
-      payload: { identityLabel: nextIdentityLabel },
-      reactivityKeys: connectionWriteKeys,
-    });
-    if (Exit.isFailure(updated)) {
-      toast.error(messageFromExit(updated, "Couldn't update connection name"));
-    }
-  };
+  // Stable identity: the reconnect effect below reaches this through
+  // `startAutomaticOAuthConnect`, so an identity that changed every render
+  // would re-run that effect on every keystroke.
+  const probeAndAutoNameOAuthConnection = useCallback(
+    async (connection: OAuthCompletionPayload, typedLabel: string): Promise<void> => {
+      const check = await doCheckConnectionHealth({
+        params: {
+          owner: connection.owner,
+          integration: connection.integration,
+          name: connection.name,
+        },
+        query: {},
+        reactivityKeys: connectionCheckKeys,
+      });
+      if (Exit.isFailure(check)) return;
+      const nextIdentityLabel = oauthIdentityLabelFromHealth({
+        result: check.value,
+        typedLabel,
+        storedIdentityLabel: connection.identityLabel,
+      });
+      if (nextIdentityLabel === null) return;
+      const updated = await doUpdateConnection({
+        params: {
+          owner: connection.owner,
+          integration: connection.integration,
+          name: connection.name,
+        },
+        payload: { identityLabel: nextIdentityLabel },
+        reactivityKeys: connectionWriteKeys,
+      });
+      if (Exit.isFailure(updated)) {
+        toast.error(messageFromExit(updated, "Couldn't update connection name"));
+      }
+    },
+    [doCheckConnectionHealth, doUpdateConnection],
+  );
 
   const credentialPayloadOrigin = createCredentialPayloadOrigin({
     origin: credentialOrigin,
@@ -1982,7 +2052,16 @@ function AddAccountModalView(props: AddAccountModalProps) {
     });
     if (Exit.isFailure(exit)) {
       setSubmitting(false);
-      toast.error(messageFromExit(exit, "Failed to add connection"));
+      // The conflict error's message is a getter derived from its fields, so
+      // it doesn't survive the wire — rebuild it from the tag (the same
+      // pattern as isIntegrationAlreadyExistsExit).
+      toast.error(
+        isConnectionAlreadyExistsExit(exit)
+          ? connectionExistsMessage(
+              connectionLabelForHost(label, owner, integrationName, organizationId),
+            )
+          : messageFromExit(exit, "Failed to add connection"),
+      );
       return;
     }
     toast.success("Connection added");
@@ -2220,23 +2299,27 @@ function AddAccountModalView(props: AddAccountModalProps) {
     });
   };
 
-  const createCimdClient = async (args: CimdCreateClientArgs): Promise<OAuthClientSlug | null> => {
-    const exit = await doCreateOAuthClient({
-      payload: {
-        owner: args.owner,
-        slug: args.slug,
-        authorizationUrl: args.authorizationUrl,
-        tokenUrl: args.tokenUrl,
-        resource: args.resource ?? null,
-        grant: args.grant,
-        clientId: args.clientId,
-        clientSecret: args.clientSecret,
-      },
-      reactivityKeys: oauthClientWriteKeys,
-    });
-    if (Exit.isFailure(exit)) return null;
-    return exit.value.client;
-  };
+  // Stable identity for the same reason as probeAndAutoNameOAuthConnection.
+  const createCimdClient = useCallback(
+    async (args: CimdCreateClientArgs): Promise<OAuthClientSlug | null> => {
+      const exit = await doCreateOAuthClient({
+        payload: {
+          owner: args.owner,
+          slug: args.slug,
+          authorizationUrl: args.authorizationUrl,
+          tokenUrl: args.tokenUrl,
+          resource: args.resource ?? null,
+          grant: args.grant,
+          clientId: args.clientId,
+          clientSecret: args.clientSecret,
+        },
+        reactivityKeys: oauthClientWriteKeys,
+      });
+      if (Exit.isFailure(exit)) return null;
+      return exit.value.client;
+    },
+    [doCreateOAuthClient],
+  );
 
   const handleCimdConnect = async () => {
     const authorizationUrl = method?.oauth?.authorizationUrl;
@@ -2299,124 +2382,295 @@ function AddAccountModalView(props: AddAccountModalProps) {
     }
   };
 
-  // Automatic discovered OAuth connect: probe once, then prefer CIMD or use DCR
+  // Whether this view is still mounted. Closing the modal unmounts it (see
+  // `AddAccountModal`), and the automatic connect sequence below polls this
+  // between its awaited round trips so a close mid-flight aborts instead of
+  // registering a client / launching the popup into a dead surface. The ref is
+  // re-armed in the effect body so a StrictMode remount stays active.
+  const viewMountedRef = useRef(true);
+  useEffect(() => {
+    viewMountedRef.current = true;
+    return () => {
+      viewMountedRef.current = false;
+    };
+  }, []);
+
+  // Automatic discovered OAuth: probe once, then prefer CIMD or use DCR
   // according to the authorization server's advertised metadata. On failure we
   // flip `dcrFailed` so the bring-your-own-app picker remains the recovery path.
+  //
+  // Reconnect runs through here too, and must (issue #1542): a DCR client is
+  // bound to the redirect URI it registered with, so once the app's callback
+  // origin moves (127.0.0.1 -> localhost) re-authorizing against the STORED
+  // client fails at the authorization server. Re-probing and re-registering is
+  // what replaces that stranded client, and it is exactly what the connect path
+  // already does — so both take one route rather than two that drift.
+  const startAutomaticOAuthConnect = useCallback(
+    async (request: AutomaticOAuthConnectRequest): Promise<void> => {
+      const { method: requestMethod, owner: dcrOwner, mode } = request;
+      const reconnect = mode === "reconnect";
+      const discoveryUrl = requestMethod.oauth?.discoveryUrl ?? requestMethod.oauth?.tokenUrl;
+      if (!discoveryUrl) {
+        setDcrFailed(true);
+        return;
+      }
+      setDcrBusy(true);
+      const outcome = await runAutomaticOAuthConnect(
+        {
+          reserve: oauthPopup.reserve,
+          release: oauthPopup.releaseReservation,
+          // Closing the modal genuinely unmounts this view (see
+          // `AddAccountModal`), so "still mounted" is exactly "still open".
+          // The sequence checks it between round trips: a close mid-flight
+          // must not register a client or launch the popup afterwards.
+          isActive: () => viewMountedRef.current,
+          probe: async (url: string): Promise<OAuthProbeResult | null> => {
+            const exit = await doProbe({ payload: { url }, reactivityKeys: [] });
+            if (Exit.isFailure(exit)) return null;
+            return exit.value;
+          },
+          createCimdClient,
+          register: async (
+            args: DcrRegisterArgs,
+          ): Promise<OAuthClientSlug | { readonly error: string } | null> => {
+            const exit = await doRegisterDynamic({
+              payload: {
+                owner: args.owner,
+                slug: args.slug,
+                issuer: args.issuer ?? null,
+                registrationEndpoint: args.registrationEndpoint,
+                authorizationUrl: args.authorizationUrl,
+                tokenUrl: args.tokenUrl,
+                resource: args.resource ?? null,
+                scopes: args.scopes,
+                tokenEndpointAuthMethodsSupported: args.tokenEndpointAuthMethodsSupported,
+                clientName: args.clientName,
+                redirectUri: args.redirectUri,
+                originIntegration: args.originIntegration,
+              },
+              reactivityKeys: oauthClientWriteKeys,
+            });
+            if (Exit.isFailure(exit)) {
+              return {
+                error: messageFromExit(
+                  exit,
+                  "Automatic setup unavailable. Register an app instead.",
+                ),
+              };
+            }
+            return exit.value.client;
+          },
+          start: (args: DcrStartArgs): void => {
+            void oauthPopup.start({
+              reservation: args.reservation,
+              payload: {
+                client: args.client,
+                // DCR/CIMD mints the client under the connection owner, so the
+                // app and connection share one owner.
+                clientOwner: args.owner,
+                owner: dcrOwner,
+                name: request.connectionName,
+                integration,
+                template: requestMethod.template,
+                ...(reconnect ? {} : { newConnection: true }),
+                ...(request.identityLabel !== undefined
+                  ? { identityLabel: request.identityLabel }
+                  : {}),
+              },
+              ...(reconnect
+                ? {
+                    onAuthorizationStarted: () => {
+                      trackEvent("connection_reconnected", {
+                        integration_slug: String(integration),
+                        owner: dcrOwner,
+                        success: true,
+                      });
+                    },
+                    onError: () => {
+                      trackEvent("connection_reconnected", {
+                        integration_slug: String(integration),
+                        owner: dcrOwner,
+                        success: false,
+                      });
+                    },
+                  }
+                : {}),
+              onSuccess: async (connection: OAuthCompletionPayload) => {
+                // A reconnect keeps the connection's existing name; only a new
+                // connection gets auto-named from what was probed.
+                if (!reconnect) {
+                  await probeAndAutoNameOAuthConnection(connection, request.typedLabel);
+                }
+                toast.success(reconnect ? "Reconnected" : "Connection added");
+                close();
+              },
+            });
+          },
+        },
+        {
+          discoveryUrl,
+          // Only a genuine discovery URL (MCP) seeds the RFC 8707 resource
+          // indicator; the token-endpoint fallback baked into `discoveryUrl` must
+          // not, so pass the un-collapsed method value here.
+          resourceFallback: requestMethod.oauth?.discoveryUrl,
+          owner: dcrOwner,
+          // DCR slugs are server-keyed (Part A): the connect path no longer depends
+          // on the picker's app list, so it need not be threaded here.
+          declaredScopes: requestMethod.oauth?.scopes,
+          redirectUri: oauthCallbackUrl(),
+          integration,
+          cimd: {
+            integrationName,
+            clientIdMetadataDocumentUrl: oauthClientIdMetadataDocumentUrl(),
+            existingClients: clientSummaries,
+          },
+          ...(request.storedResource !== undefined
+            ? { storedResource: request.storedResource }
+            : {}),
+        },
+      );
+      // The modal closed mid-flight: this view is unmounted, so no state may
+      // be written at all — not the fallback below, and not even the busy
+      // flag, which belongs to the surface that is gone.
+      if (outcome.kind === "aborted") return;
+      setDcrBusy(false);
+      // `connection_oauth_started` measures the connect funnel; a reconnect
+      // reports through `connection_reconnected` on the popup callbacks above,
+      // so it must not also land here.
+      if (!reconnect) {
+        trackEvent("connection_oauth_started", {
+          integration_slug: String(integration),
+          owner: dcrOwner,
+          flow:
+            outcome.kind === "started"
+              ? outcome.flow
+              : "probe" in outcome && outcome.probe.clientIdMetadataDocumentSupported === true
+                ? "cimd"
+                : "dcr",
+          success: outcome.kind === "started",
+          ...(outcome.kind === "fallback" ? { dcr_fallback: true } : {}),
+        });
+      }
+      // Deliberately absent: a "popup-blocked" branch. Registering an app by hand
+      // does not make the browser open a window, so dropping to the BYO picker
+      // would send the user down a path that cannot succeed either. `reserve`
+      // already put the reason in `oauthPopup.error`, which the footer renders.
+      if (outcome.kind === "fallback") {
+        setOAuthFallbackProbe("probe" in outcome ? outcome.probe : null);
+        setDcrFailed(true);
+        // Surface the server's actionable rejection reason on the recovery view as
+        // an inline error card. Generic fallbacks (no message) fall through to the
+        // "register an app" empty state, which already guides the user.
+        setDcrFallbackMessage("message" in outcome ? (outcome.message ?? null) : null);
+      }
+    },
+    [
+      close,
+      clientSummaries,
+      createCimdClient,
+      doProbe,
+      doRegisterDynamic,
+      integration,
+      integrationName,
+      oauthPopup,
+      probeAndAutoNameOAuthConnection,
+    ],
+  );
+
   const handleAutomaticOAuthConnect = async () => {
-    const discoveryUrl = method?.oauth?.discoveryUrl ?? method?.oauth?.tokenUrl;
-    if (!method || !discoveryUrl) {
+    if (!method) {
       setDcrFailed(true);
       return;
     }
-    const dcrOwner = owner;
-    const connectionName = previewConnectionName(label, dcrOwner);
-    const identityLabel = typedIdentityLabel(label);
-    setDcrBusy(true);
-    const outcome = await runAutomaticOAuthConnect(
-      {
-        reserve: oauthPopup.reserve,
-        release: oauthPopup.releaseReservation,
-        probe: async (url: string): Promise<OAuthProbeResult | null> => {
-          const exit = await doProbe({ payload: { url }, reactivityKeys: [] });
-          if (Exit.isFailure(exit)) return null;
-          return exit.value;
-        },
-        createCimdClient,
-        register: async (
-          args: DcrRegisterArgs,
-        ): Promise<OAuthClientSlug | { readonly error: string } | null> => {
-          const exit = await doRegisterDynamic({
-            payload: {
-              owner: args.owner,
-              slug: args.slug,
-              issuer: args.issuer ?? null,
-              registrationEndpoint: args.registrationEndpoint,
-              authorizationUrl: args.authorizationUrl,
-              tokenUrl: args.tokenUrl,
-              resource: args.resource ?? null,
-              scopes: args.scopes,
-              tokenEndpointAuthMethodsSupported: args.tokenEndpointAuthMethodsSupported,
-              clientName: args.clientName,
-              redirectUri: args.redirectUri,
-              originIntegration: args.originIntegration,
-            },
-            reactivityKeys: oauthClientWriteKeys,
-          });
-          if (Exit.isFailure(exit)) {
-            return {
-              error: messageFromExit(exit, "Automatic setup unavailable. Register an app instead."),
-            };
-          }
-          return exit.value.client;
-        },
-        start: (args: DcrStartArgs): void => {
-          void oauthPopup.start({
-            reservation: args.reservation,
-            payload: {
-              client: args.client,
-              // DCR registers the client under the connection owner, so the app
-              // and connection share one owner.
-              clientOwner: args.owner,
-              owner: args.owner,
-              name: connectionName,
-              integration,
-              template: method.template,
-              newConnection: true,
-              ...(identityLabel !== undefined ? { identityLabel } : {}),
-            },
-            onSuccess: async (connection: OAuthCompletionPayload) => {
-              await probeAndAutoNameOAuthConnection(connection, label);
-              toast.success("Connection added");
-              close();
-            },
-          });
-        },
-      },
-      {
-        discoveryUrl,
-        // Only a genuine discovery URL (MCP) seeds the RFC 8707 resource
-        // indicator; the token-endpoint fallback baked into `discoveryUrl` must
-        // not, so pass the un-collapsed method value here.
-        resourceFallback: method.oauth?.discoveryUrl,
-        owner: dcrOwner,
-        // DCR slugs are server-keyed (Part A): the connect path no longer depends
-        // on the picker's app list, so it need not be threaded here.
-        declaredScopes: method.oauth?.scopes,
-        redirectUri: oauthCallbackUrl(),
-        integration,
-        cimd: {
-          integrationName,
-          clientIdMetadataDocumentUrl: oauthClientIdMetadataDocumentUrl(),
-          existingClients: clientSummaries,
-        },
-      },
-    );
-    setDcrBusy(false);
-    trackEvent("connection_oauth_started", {
-      integration_slug: String(integration),
-      owner: dcrOwner,
-      flow:
-        outcome.kind === "started"
-          ? outcome.flow
-          : "probe" in outcome && outcome.probe.clientIdMetadataDocumentSupported === true
-            ? "cimd"
-            : "dcr",
-      success: outcome.kind === "started",
-      ...(outcome.kind === "fallback" ? { dcr_fallback: true } : {}),
+    await startAutomaticOAuthConnect({
+      method,
+      owner,
+      connectionName: previewConnectionName(label, owner),
+      identityLabel: typedIdentityLabel(label),
+      typedLabel: label,
+      mode: "connect",
     });
-    // Deliberately absent: a "popup-blocked" branch. Registering an app by hand
-    // does not make the browser open a window, so dropping to the BYO picker
-    // would send the user down a path that cannot succeed either. `reserve`
-    // already put the reason in `oauthPopup.error`, which the footer renders.
-    if (outcome.kind === "fallback") {
-      setOAuthFallbackProbe("probe" in outcome ? outcome.probe : null);
-      setDcrFailed(true);
-      // Surface the server's actionable rejection reason on the recovery view as
-      // an inline error card. Generic fallbacks (no message) fall through to the
-      // "register an app" empty state, which already guides the user.
-      setDcrFallbackMessage("message" in outcome ? (outcome.message ?? null) : null);
-    }
   };
+
+  // The reconnect handoff: a connection asked to be re-authorized, so open its
+  // OAuth flow immediately. Fires once per handoff key (tracked by ref), which
+  // is also what makes a re-render mid-flight harmless.
+  //
+  // Routing follows the STORED binding, not just the method: only a handoff
+  // whose stored client is auto-minted DCR (vetted by the accounts section,
+  // `dynamicRegistration: true`) re-runs the automatic path — see
+  // `startAutomaticOAuthConnect`. Everything else (static/BYO, first-party)
+  // has a fixed, registered app, so it starts the popup against that client
+  // directly and is never rebound to an automatic one.
+  useEffect(() => {
+    const handoff = initialState;
+    const oauthClient = handoff?.oauthClient;
+    if (!handoff || oauthClient?.action !== "reconnect") return;
+    if (oauthReconnectOpenedKey.current === handoff.key) return;
+    const client = oauthClient.slug;
+    const clientOwner = oauthClient.owner ?? handoff.owner;
+    const connectionOwner = handoff.owner;
+    const connectionName = handoff.label;
+    const oauthMethod = handoff.template
+      ? allMethods.find(
+          (m: AuthMethod) =>
+            m.kind === "oauth" &&
+            (m.id === handoff.template || String(m.template) === handoff.template),
+        )
+      : allMethods.find((m: AuthMethod) => m.kind === "oauth");
+    if (!client || !clientOwner || !connectionOwner || !connectionName || !oauthMethod) return;
+
+    oauthReconnectOpenedKey.current = handoff.key;
+    setMethodId(oauthMethod.id);
+
+    // The accounts section vetted the STORED binding as auto-minted DCR
+    // (`dynamicRegistration: true`), and that alone routes: the automatic
+    // flow probes the method's token URL even when it declares no
+    // discovery/DCR capability, whereas the direct path below would dead-end
+    // an origin-drifted DCR client (#1542).
+    if (oauthClient.dynamicRegistration === true) {
+      void startAutomaticOAuthConnect({
+        method: oauthMethod,
+        owner: connectionOwner,
+        connectionName: ConnectionName.make(connectionName),
+        identityLabel: handoff.identityLabel,
+        typedLabel: connectionName,
+        mode: "reconnect",
+        ...(oauthClient.resource !== undefined ? { storedResource: oauthClient.resource } : {}),
+      });
+      return;
+    }
+
+    void oauthPopup.start({
+      payload: {
+        client: OAuthClientSlug.make(client),
+        clientOwner,
+        owner: connectionOwner,
+        name: ConnectionName.make(connectionName),
+        integration,
+        template: oauthMethod.template,
+        ...(handoff.identityLabel !== undefined ? { identityLabel: handoff.identityLabel } : {}),
+      },
+      onAuthorizationStarted: () => {
+        trackEvent("connection_reconnected", {
+          integration_slug: String(integration),
+          owner: connectionOwner,
+          success: true,
+        });
+      },
+      onError: () => {
+        trackEvent("connection_reconnected", {
+          integration_slug: String(integration),
+          owner: connectionOwner,
+          success: false,
+        });
+      },
+      onSuccess: () => {
+        toast.success("Reconnected");
+        close();
+      },
+    });
+  }, [initialState, allMethods, integration, oauthPopup, close, startAutomaticOAuthConnect]);
 
   return (
     // Non-modal for the same reason as the health-check editor sheet: a modal
@@ -2655,6 +2909,15 @@ function AddAccountModalView(props: AddAccountModalProps) {
                       {!isNoAuth && (
                         <div className="space-y-2">
                           <StepHeader index={1} label={authStepLabel} />
+
+                          {/* What this key is called at the provider, the page
+                              that mints it, and their own setup steps. The
+                              question this dialog used to ask without
+                              answering. */}
+                          <CredentialGuidancePanel
+                            displayUrl={integrationDisplayUrl}
+                            methodKind={method?.kind}
+                          />
 
                           {isOAuth && method ? (
                             cimdActive ? (

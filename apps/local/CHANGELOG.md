@@ -1,5 +1,119 @@
 # @executor-js/local
 
+## 1.6.7
+
+### Patch Changes
+
+- Updated dependencies [[`75b3674`](https://github.com/UsefulSoftwareCo/executor/commit/75b3674136b44a2e43fb23eb7a058e7e51528527), [`98d6c6a`](https://github.com/UsefulSoftwareCo/executor/commit/98d6c6ad3272fca371fc2d8b14b2e332100d8322)]:
+  - @executor-js/plugin-mcp@1.6.7
+  - @executor-js/sdk@1.6.7
+  - @executor-js/app@1.4.4
+  - @executor-js/analytics@0.1.14
+  - @executor-js/api@1.4.70
+  - @executor-js/config@1.6.7
+  - @executor-js/execution@1.6.7
+  - @executor-js/vite-plugin@0.0.67
+  - @executor-js/host-mcp@1.4.4
+  - @executor-js/mcp-apps-shell@1.4.18
+  - @executor-js/plugin-desktop-settings@1.6.7
+  - @executor-js/plugin-example@1.6.7
+  - @executor-js/plugin-file-secrets@1.6.7
+  - @executor-js/plugin-graphql@1.6.7
+  - @executor-js/plugin-keychain@1.6.7
+  - @executor-js/plugin-onepassword@1.6.7
+  - @executor-js/plugin-openapi@1.6.7
+  - @executor-js/plugin-provider-service-split@0.0.21
+  - @executor-js/plugin-toolkits@1.5.42
+  - @executor-js/react@1.4.70
+  - @executor-js/runtime-quickjs@1.6.7
+
+## 1.6.6
+
+### Patch Changes
+
+- [#1865](https://github.com/UsefulSoftwareCo/executor/pull/1865) [`9a1fbd5`](https://github.com/UsefulSoftwareCo/executor/commit/9a1fbd5f0de25f622f303c76f998443c1bb72063) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Desktop OAuth connects finish the moment the provider redirects**
+
+  When the desktop app runs an OAuth flow in the system browser, the app learned about completion by polling the local server once a second. The completed result sat in memory while the user watched the "Connecting…" spinner for up to a second more — about half a second wasted on average, on every connect.
+
+  The await endpoint now long-polls: the server holds the request open (up to 25 seconds per hold) and answers the instant the flow completes. The client polls one request at a time and reconnects after each answer, so requests never stack. Mixed versions stay compatible in both directions: an old client still gets its answer within one poll of a new server, and a new client against an old server behaves exactly as before.
+
+- Updated dependencies [[`c695970`](https://github.com/UsefulSoftwareCo/executor/commit/c6959702f6459504463fe0e13fa1a576190460ed), [`21119da`](https://github.com/UsefulSoftwareCo/executor/commit/21119da662d2d225b033b3532e1f17d97311a39d), [`9a1fbd5`](https://github.com/UsefulSoftwareCo/executor/commit/9a1fbd5f0de25f622f303c76f998443c1bb72063)]:
+  - @executor-js/plugin-mcp@1.6.6
+  - @executor-js/execution@1.6.6
+  - @executor-js/react@1.4.69
+  - @executor-js/analytics@0.1.13
+  - @executor-js/api@1.4.69
+  - @executor-js/host-mcp@1.4.4
+  - @executor-js/mcp-apps-shell@1.4.17
+  - @executor-js/app@1.4.4
+  - @executor-js/plugin-graphql@1.6.6
+  - @executor-js/plugin-onepassword@1.6.6
+  - @executor-js/plugin-openapi@1.6.6
+  - @executor-js/plugin-toolkits@1.5.41
+  - @executor-js/plugin-provider-service-split@0.0.20
+  - @executor-js/sdk@1.6.6
+  - @executor-js/runtime-quickjs@1.6.6
+  - @executor-js/config@1.6.6
+  - @executor-js/plugin-file-secrets@1.6.6
+  - @executor-js/plugin-keychain@1.6.6
+  - @executor-js/plugin-example@1.6.6
+  - @executor-js/plugin-desktop-settings@1.6.6
+  - @executor-js/vite-plugin@0.0.66
+
+## 1.6.5
+
+### Patch Changes
+
+- Updated dependencies [[`00c2ab7`](https://github.com/UsefulSoftwareCo/executor/commit/00c2ab789eef94efd9c05d389870566bba7111c2), [`4d4ad7c`](https://github.com/UsefulSoftwareCo/executor/commit/4d4ad7c1d5690bc13ad37d9cdadf3775e464a3f5)]:
+  - @executor-js/plugin-mcp@1.6.5
+  - @executor-js/sdk@1.6.5
+  - @executor-js/runtime-quickjs@1.6.5
+  - @executor-js/execution@1.6.5
+  - @executor-js/config@1.6.5
+  - @executor-js/plugin-file-secrets@1.6.5
+  - @executor-js/plugin-graphql@1.6.5
+  - @executor-js/plugin-keychain@1.6.5
+  - @executor-js/plugin-onepassword@1.6.5
+  - @executor-js/plugin-openapi@1.6.5
+  - @executor-js/plugin-example@1.6.5
+  - @executor-js/plugin-desktop-settings@1.6.5
+  - @executor-js/app@1.4.4
+  - @executor-js/analytics@0.1.12
+  - @executor-js/api@1.4.68
+  - @executor-js/vite-plugin@0.0.65
+  - @executor-js/host-mcp@1.4.4
+  - @executor-js/mcp-apps-shell@1.4.16
+  - @executor-js/plugin-provider-service-split@0.0.19
+  - @executor-js/plugin-toolkits@1.5.40
+  - @executor-js/react@1.4.68
+
+## 1.6.4
+
+### Patch Changes
+
+- Updated dependencies [[`ffcfbc0`](https://github.com/UsefulSoftwareCo/executor/commit/ffcfbc0de27d0ae55215839fb70395b0b7d9a65c), [`10e16a5`](https://github.com/UsefulSoftwareCo/executor/commit/10e16a5baa2648657b70038e7d11429c58e4d242), [`9dcfaa5`](https://github.com/UsefulSoftwareCo/executor/commit/9dcfaa5ee8ad2ebc17407caf94d8d4dcf55e3562), [`939b96f`](https://github.com/UsefulSoftwareCo/executor/commit/939b96f694a420cd6151c4e402cff7f1ab4b327a), [`515d6aa`](https://github.com/UsefulSoftwareCo/executor/commit/515d6aa391a04a3579a7b10f974ec316a563cf7a), [`06bf742`](https://github.com/UsefulSoftwareCo/executor/commit/06bf74254f3432e8d75fd8b493ef7a435ea4bc84), [`2cad774`](https://github.com/UsefulSoftwareCo/executor/commit/2cad7745dea1afb9282c3888f4e9c59ce6fe4332)]:
+  - @executor-js/plugin-mcp@1.6.4
+  - @executor-js/sdk@1.6.4
+  - @executor-js/react@1.4.67
+  - @executor-js/plugin-file-secrets@1.6.4
+  - @executor-js/plugin-keychain@1.6.4
+  - @executor-js/plugin-onepassword@1.6.4
+  - @executor-js/app@1.4.4
+  - @executor-js/analytics@0.1.11
+  - @executor-js/api@1.4.67
+  - @executor-js/config@1.6.4
+  - @executor-js/execution@1.6.4
+  - @executor-js/vite-plugin@0.0.64
+  - @executor-js/host-mcp@1.4.4
+  - @executor-js/mcp-apps-shell@1.4.15
+  - @executor-js/plugin-desktop-settings@1.6.4
+  - @executor-js/plugin-example@1.6.4
+  - @executor-js/plugin-graphql@1.6.4
+  - @executor-js/plugin-openapi@1.6.4
+  - @executor-js/plugin-provider-service-split@0.0.18
+  - @executor-js/plugin-toolkits@1.5.39
+  - @executor-js/runtime-quickjs@1.6.4
+
 ## 1.6.3
 
 ### Patch Changes

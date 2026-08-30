@@ -41,6 +41,7 @@ import type {
   InvokeOptions,
 } from "./elicitation";
 import type {
+  ConnectionAlreadyExistsError,
   ExecuteError,
   ConnectionNotFoundError,
   CredentialProviderNotRegisteredError,
@@ -208,6 +209,7 @@ export interface PluginCtx<TStore = unknown> {
     ) => Effect.Effect<
       Connection,
       | IntegrationNotFoundError
+      | ConnectionAlreadyExistsError
       | CredentialProviderNotRegisteredError
       | InvalidConnectionInputError
       | StorageFailure
@@ -229,6 +231,17 @@ export interface PluginCtx<TStore = unknown> {
       ref: ConnectionRef,
     ) => Effect.Effect<
       readonly Tool[],
+      ConnectionNotFoundError | IntegrationNotFoundError | StorageFailure
+    >;
+    /** Run the integration's declared health check against a saved connection
+     *  and persist the verdict. `ifStaleMs` serves the persisted verdict when
+     *  younger than that window, so concurrent readers collapse to one probe;
+     *  omit it to always probe. */
+    readonly checkHealth: (
+      ref: ConnectionRef,
+      options?: { readonly ifStaleMs?: number },
+    ) => Effect.Effect<
+      HealthCheckResult,
       ConnectionNotFoundError | IntegrationNotFoundError | StorageFailure
     >;
     /** Mark a connection's persisted tool catalog stale (clears its sync
@@ -354,6 +367,10 @@ export interface ResolveToolsResult {
   /** Human-readable reason for an incomplete listing. Persisted by core when it
    *  preserves the prior catalog so operators can see why data is stale. */
   readonly incompleteReason?: string;
+  /** An actionable connection-health outcome discovered while enumerating the
+   *  catalog. Core persists it while preserving the prior non-authoritative
+   *  catalog. Omit for ordinary transient discovery failures. */
+  readonly health?: HealthCheckResult;
 }
 
 export interface ProjectToolSchemaInput<TStore = unknown> {
@@ -583,6 +600,10 @@ export interface IntegrationPreset {
   readonly url?: string;
   readonly endpoint?: string;
   readonly icon?: string;
+  /** Image to show when `icon` cannot be resolved on this machine — a preset
+   *  whose icon is read from a local install has none until that install
+   *  exists, which is exactly when the card most needs to identify itself. */
+  readonly fallbackIcon?: string;
   readonly featured?: boolean;
   readonly family?: string;
   readonly specFormat?: string;
@@ -591,6 +612,10 @@ export interface IntegrationPreset {
   readonly specOverrides?: readonly unknown[];
   readonly authTemplate?: readonly IntegrationPresetAuthentication[];
   readonly healthCheck?: HealthCheckSpec;
+  /** The public registry lists this product: the picker shows the registry's
+   *  card, and the preset's knowledge rides quick add instead. A custom
+   *  deployment preset leaves this unset and keeps its own card. */
+  readonly registryListed?: boolean;
   readonly transport?: "remote" | "stdio";
   readonly command?: string;
   readonly args?: readonly string[];

@@ -1307,6 +1307,7 @@ export const checkHealthOpenApi = (input: {
           status: "expired",
           checkedAt,
           detail: `Connection "${input.credential.connection}" has no resolvable credential value.`,
+          reason: "credential_missing",
         } satisfies HealthCheckResult;
       }
       const rendered = renderAuthTemplate(template, input.credential.values);
@@ -1347,6 +1348,7 @@ export const checkHealthOpenApi = (input: {
         status: "degraded",
         checkedAt,
         detail: scrubSecrets(`Health check request failed: ${probe.failure.message}`),
+        reason: "probe_failed",
       } satisfies HealthCheckResult;
     }
 
@@ -1392,6 +1394,9 @@ export const checkHealthOpenApi = (input: {
             detail: scrubSecrets(
               extractOpenApiUpstreamMessage(probe.result.error, probe.result.status),
             ),
+            // Any non-healthy classification here came from the upstream's own
+            // HTTP verdict (2xx/401/403/other → classifyProbeResponse).
+            reason: "upstream_status" as const,
           }),
     } satisfies HealthCheckResult;
   });
