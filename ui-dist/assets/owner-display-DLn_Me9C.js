@@ -1,0 +1,1 @@
+import{n as e}from"./organization-context-HXSQ1tM-.js";function t(e){return e===`user`?`Personal`:`Workspace`}function n(e,n){return n===null?e===`org`?`Local`:`Personal`:t(e)}function r(){let t=e(),r=t===null;return{isSinglePlayerHost:r,showOwnerLabels:!r,label:e=>n(e,t)}}export{n,r,t};

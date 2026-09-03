@@ -1,0 +1,1 @@
+import{gt as e}from"./reactivity-keys-2r9UdIeO.js";import{U as t}from"./AtomHttpApi-CEizCWwo.js";import{i as n}from"./account-atoms-DwliK_3x.js";var r=new Set([`admin`,`owner`]),i=e=>e.some(e=>e.isCurrentUser&&e.status===`active`&&r.has(e.role)),a=()=>t(e(n),{onInitial:()=>!1,onFailure:()=>!1,onSuccess:({value:e})=>i(e.members)}),o=(e,t)=>a()?[...e,...t]:e;export{o as t};

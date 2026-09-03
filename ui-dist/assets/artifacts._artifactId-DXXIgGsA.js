@@ -1,0 +1,1 @@
+import{t as e}from"./jsx-runtime-DS8q4l0i.js";import{t}from"./artifacts._artifactId-BkHaPzk8.js";import{t as n}from"./artifacts-route-CSyfZisX.js";var r=e();function i(){let{artifactId:e}=t.useParams();return(0,r.jsx)(n,{artifactId:e})}export{i as component};

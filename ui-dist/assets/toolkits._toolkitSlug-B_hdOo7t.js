@@ -1,0 +1,2 @@
+const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/toolkits._toolkitSlug-sGN0XgVe.js","assets/jsx-runtime-DS8q4l0i.js","assets/toolkits-route-B5ZYhJaA.js","assets/not-found-DbQDZCxp.js","assets/client-BzkytbfC.js","assets/AtomHttpApi-CEizCWwo.js"])))=>i.map(i=>d[i]);
+import{n as e,t}from"./lazyRouteComponent-BiAKPjRi.js";import{t as n}from"./preload-helper-DmQB9LBU.js";var r=e(`/{-$orgSlug}/toolkits/$toolkitSlug`)({component:t(()=>n(()=>import(`./toolkits._toolkitSlug-sGN0XgVe.js`),__vite__mapDeps([0,1,2,3,4,5])),`component`)});export{r as t};

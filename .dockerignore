@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!serve.js
+!ui-dist/
+!ui-dist/**

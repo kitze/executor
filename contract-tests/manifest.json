@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "defaults": {
+    "timeoutMs": 30000,
+    "maxBytes": 2000000
+  },
+  "tests": [
+    {
+      "id": "executor.connection-inventory",
+      "description": "The saved-connection verdicts must agree with reality; expired, degraded, unknown, or unchecked is not green.",
+      "tool": "executor.coreTools.connections.list",
+      "args": {},
+      "readOnly": true,
+      "expect": {
+        "dataType": "object",
+        "requiredPaths": ["/connections"],
+        "connectionHealth": {
+          "failStatuses": ["expired", "degraded", "unknown"],
+          "warnStatuses": [],
+          "missing": "fail"
+        }
+      }
+    },
+    {
+      "id": "coolify.projects.list",
+      "description": "Public Coolify project metadata must remain consumable rather than becoming an opaque whole response.",
+      "tool": "coolify.user.personalcoolify.projects.listProjects",
+      "args": {},
+      "readOnly": true,
+      "expect": {
+        "dataType": "array",
+        "allowedOpaquePaths": [],
+        "maxItems": 500
+      }
+    },
+    {
+      "id": "coolify.services.list",
+      "description": "Public Coolify service inventory is the primary regression probe for the local safe projection.",
+      "tool": "coolify.user.personalcoolify.services.listServices",
+      "args": {},
+      "readOnly": true,
+      "expect": {
+        "dataType": "array",
+        "allowedOpaquePaths": [],
+        "maxItems": 500
+      }
+    },
+    {
+      "id": "cloudflare.zones.list",
+      "description": "Cloudflare is a known stale-OpenAPI catalog; this must either return a normal zone response or fail loudly.",
+      "tool": "cloudflare.user.personalcloudflare.zone.zonesGet",
+      "args": {"per_page": 1, "page": 1},
+      "readOnly": true,
+      "expect": {
+        "dataType": "object",
+        "requiredPaths": ["/result"],
+        "allowedOpaquePaths": []
+      }
+    },
+    {
+      "id": "home-assistant.states.list",
+      "description": "Home Assistant state reads must not be swallowed by stale OpenAPI sensitivity metadata.",
+      "tool": "home_assistant.user.personalHomeAssistant.states.listStates",
+      "args": {},
+      "readOnly": true,
+      "expect": {
+        "dataType": "array",
+        "allowedOpaquePaths": [],
+        "maxItems": 10000
+      }
+    },
+    {
+      "id": "namecheap.domains.list",
+      "description": "The host-local Namecheap adapter must be reachable through its saved Executor integration.",
+      "tool": "namecheap_official_api.user.namecheap.domains.domainsGetList",
+      "args": {"params": {"Page": 1, "PageSize": 1}},
+      "readOnly": true,
+      "expect": {
+        "dataType": "object",
+        "allowedOpaquePaths": []
+      }
+    },
+    {
+      "id": "sotto.status",
+      "description": "Sotto's status endpoint is a cheap read-only upstream availability check.",
+      "tool": "sotto.user.personalsotto.status.get",
+      "args": {},
+      "readOnly": true,
+      "expect": {
+        "dataType": "object",
+        "allowedOpaquePaths": [],
+        "maxLatencyMs": 10000
+      }
+    },
+    {
+      "id": "google-calendar.events.list",
+      "description": "Google Calendar should return a typed response through the refreshed v2 OpenAPI metadata.",
+      "tool": "google_calendar.user.personalgooglecalendar.calendar.events.list",
+      "args": {
+        "calendarId": "primary",
+        "maxResults": 1,
+        "singleEvents": true,
+        "timeMin": "2026-01-01T00:00:00Z",
+        "timeMax": "2027-01-01T00:00:00Z"
+      },
+      "readOnly": true,
+      "expect": {
+        "dataType": "object",
+        "requiredPaths": ["/items"],
+        "allowedOpaquePaths": []
+      }
+    },
+    {
+      "id": "google-drive.files.list",
+      "description": "Drive list is bounded and requests only non-sensitive file metadata.",
+      "tool": "google_drive.user.googleDrive.drive.files.list",
+      "args": {
+        "pageSize": 1,
+        "q": "trashed = false",
+        "fields": "files(id,name,mimeType,modifiedTime),nextPageToken"
+      },
+      "readOnly": true,
+      "expect": {
+        "dataType": "object",
+        "requiredPaths": ["/files"],
+        "allowedOpaquePaths": []
+      }
+    },
+    {
+      "id": "google-gmail.messages.list",
+      "description": "Gmail list is a bounded read-only probe for one currently healthy connection.",
+      "tool": "google_gmail.user.hiKitzeIo.gmail.users.messages.list",
+      "args": {
+        "userId": "me",
+        "maxResults": 1,
+        "q": "in:anywhere"
+      },
+      "readOnly": true,
+      "expect": {
+        "dataType": "object",
+        "allowedOpaquePaths": []
+      }
+    },
+    {
+      "id": "withings-fixed.measurements",
+      "description": "Withings compatibility probe: action=requesttoken handling and a read-only measurements call.",
+      "tool": "withings_fixed.user.kitze.measure.measureGetmeas",
+      "args": {"body": {"action": "getmeas"}},
+      "readOnly": true,
+      "expect": {
+        "dataType": "object",
+        "allowedOpaquePaths": []
+      }
+    },
+    {
+      "id": "dayfold.todos",
+      "description": "Native MCP results must contain consumable content, not merely a green connection check.",
+      "tool": "dayfold_mcp.user.personaldayfold.list_todos",
+      "args": {"status": "open", "limit": 1},
+      "readOnly": true,
+      "expect": {
+        "dataType": "object",
+        "requiredPaths": ["/content"],
+        "contentMinItems": 1,
+        "allowedOpaquePaths": []
+      }
+    }
+  ]
+}

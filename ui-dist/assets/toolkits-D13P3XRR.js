@@ -1,0 +1,1 @@
+import{t as e}from"./jsx-runtime-DS8q4l0i.js";import{t}from"./useParams-sHngmwbA.js";import{t as n}from"./document-title-DhynsLMy.js";import{t as r}from"./toolkits-route-B5ZYhJaA.js";var i=e();function a(){n(`Toolkits`);let{toolkitSlug:e}=t({strict:!1});return(0,i.jsx)(r,{toolkitSlug:e})}export{a as component};

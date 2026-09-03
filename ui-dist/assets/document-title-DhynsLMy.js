@@ -1,0 +1,1 @@
+import{n as e,o as t}from"./jsx-runtime-DS8q4l0i.js";var n=t(e(),1),r=`Executor`;function i(e){return`${e} · ${r}`}function a(e){(0,n.useEffect)(()=>{!e||typeof document>`u`||(document.title=i(e))},[e])}export{a as t};
