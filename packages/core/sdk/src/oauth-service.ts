@@ -337,6 +337,28 @@ const OAUTH_SCOPE_ALIASES: Readonly<Record<string, string>> = {
 
 const informationalOAuthScopes = new Set(["openid", "email", "profile", "offline_access"]);
 
+const OFFLINE_ACCESS_SCOPE = "offline_access";
+
+/** Append `offline_access` to resource-discovered scopes when the authorization
+ *  server advertises it and supports the `refresh_token` grant (or is silent on
+ *  grants — RFC 8414 defaults `grant_types_supported` to include it). Without
+ *  it, OIDC-provider style servers issue no refresh token and the connection
+ *  cannot outlive its first access token. Pure so it can be unit-tested. */
+export const withOfflineAccessIfAdvertised = (
+  scopes: readonly string[],
+  authServer: {
+    readonly scopes_supported?: readonly string[];
+    readonly grant_types_supported?: readonly string[];
+  } | null,
+): readonly string[] => {
+  if (authServer == null) return scopes;
+  if (scopes.includes(OFFLINE_ACCESS_SCOPE)) return scopes;
+  if (authServer.scopes_supported?.includes(OFFLINE_ACCESS_SCOPE) !== true) return scopes;
+  const grants = authServer.grant_types_supported;
+  if (grants !== undefined && !grants.includes("refresh_token")) return scopes;
+  return [...scopes, OFFLINE_ACCESS_SCOPE];
+};
+
 /** Canonicalize a scope for granted-vs-requested comparison. Microsoft's token
  *  endpoint returns Graph scopes fully qualified
  *  (`https://graph.microsoft.com/Mail.ReadWrite`) even when the request used
@@ -785,7 +807,22 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         discoveryOptions,
       );
       const resourceScopes = protectedResource?.metadata.scopes_supported;
-      if (resourceScopes !== undefined) return capScopes(resourceScopes);
+      if (resourceScopes !== undefined) {
+        // RFC 9728 scopes are RESOURCE scopes; `offline_access` is an
+        // authorization-server lifecycle scope that resource metadata never
+        // lists. Servers built on better-auth's OIDC provider (Glink, ...) only
+        // issue a refresh token when `offline_access` is requested, so a client
+        // that requests exactly the PRM list gets a one-hour access token and
+        // no way to renew it — every connection dies at first expiry. When the
+        // AS the resource names explicitly advertises `offline_access` (and the
+        // `refresh_token` grant), ask for it; that is the AS telling us how to
+        // stay signed in, not us expanding the resource's least-privilege set.
+        const authServer = yield* firstReadableAuthorizationServer(
+          authorizationServerIssuersFor(protectedResource),
+          (metadata) => metadata.scopes_supported?.includes(OFFLINE_ACCESS_SCOPE) === true,
+        );
+        return capScopes(withOfflineAccessIfAdvertised(resourceScopes, authServer));
+      }
 
       // The resource is silent on scopes — read them from the authorization
       // servers it names, in order. An advertised list is authoritative even
