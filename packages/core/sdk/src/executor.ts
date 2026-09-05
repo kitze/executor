@@ -2251,6 +2251,31 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           updated_at: new Date(),
         };
         if (token.scope !== undefined) set.oauth_scope = token.scope;
+        // A peer may have rejected the token we just rotated and recorded its
+        // verdict before this successful grant finished. That verdict belongs
+        // to the spent token, not its persisted successor. Read current state
+        // so unrelated provider metadata survives the repair.
+        const current = yield* findConnectionRow({
+          owner: row.owner as Owner,
+          integration: IntegrationSlug.make(row.integration),
+          name: ConnectionName.make(row.name),
+        });
+        const dead = oauthReauthRequiredFromProviderState(current?.provider_state);
+        if (
+          dead !== null &&
+          recordedDeadGrantReason(dead) !== "blocked_by_admin" &&
+          current?.oauth_client === row.oauth_client &&
+          current?.refresh_item_id === row.refresh_item_id
+        ) {
+          const state = {
+            ...(decodeJsonColumn(current.provider_state) as Record<string, unknown>),
+          };
+          delete state.oauthReauthRequiredAt;
+          delete state.oauthReauthRequiredDetail;
+          delete state.oauthReauthRequiredReason;
+          set.provider_state = Object.keys(state).length === 0 ? null : state;
+          set.last_health = null;
+        }
         yield* core.updateMany("connection", {
           where: (b: AnyCb) =>
             b.and(
@@ -2688,6 +2713,26 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                       cause,
                     });
                   }),
+                  // Another host may already have rotated this token. A
+                  // rejection of the spent value must not permanently disable
+                  // the replacement grant. Report a retryable failure instead;
+                  // the next call resolves the token the peer persisted.
+                  Effect.catchTag("CredentialResolutionError", (error) =>
+                    Effect.gen(function* () {
+                      if (error.reauthRequired === true) {
+                        const current = yield* provider.get(
+                          ProviderItemId.make(row.refresh_item_id!),
+                        );
+                        if (current != null && current !== refreshToken) {
+                          return yield* new StorageError({
+                            message: "OAuth credentials changed during refresh; retry the request.",
+                            cause: undefined,
+                          });
+                        }
+                      }
+                      return yield* error;
+                    }),
+                  ),
                   // Persist the definitive verdict so the NEXT refresh skips
                   // the doomed grant (see the known-dead gate above) and the
                   // connection shows `expired` without waiting for a probe.

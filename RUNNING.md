@@ -126,6 +126,17 @@ instance with `E2E_<TARGET>_URL`.
 
 ## Environment gotchas (learned the hard way)
 
+- For recurring OAuth failures, inspect `connections.list({ verbose: true })`
+  before asking for another login. `oauth_refresh_failed` can mean client or
+  request configuration; `oauth_reauth_required` means the provider rejected
+  the grant. Check for a stored refresh token and compare its write time with
+  the rejection and access-token expiry. A successful rotation can race a
+  rejection, so a stored "expired" verdict alone does not prove token loss.
+- Self-host OAuth callbacks come from `EXECUTOR_WEB_BASE_URL`. Keep that value
+  aligned with the working HTTPS proxy route, and re-register dynamic OAuth
+  clients when their callback origin changes. A local health check does not
+  verify the public callback route.
+
 - The shell is fish, and the working directory resets between Bash calls.
   Use absolute paths rooted at THIS worktree; don't rely on a prior `cd`.
 - Don't write probe scripts to `/tmp` — they can't resolve workspace

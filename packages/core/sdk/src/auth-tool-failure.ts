@@ -39,6 +39,19 @@ export type AuthToolFailureInput = {
 // the OAuth start flow. These strings are read by the agent resolving the
 // failure, so they must name tools that actually exist on the executor.
 const authRecovery = (code: AuthToolFailureCode, input?: AuthToolFailureInput["recovery"]) => {
+  // A failed refresh is not proof that the user's grant was revoked. Invalid
+  // client credentials or a malformed token request need configuration repair;
+  // telling an agent to start OAuth here creates repeated, ineffective logins.
+  if (code === "oauth_refresh_failed") {
+    return {
+      listConnectionsTool: "executor.coreTools.connections.list",
+      ...(input?.configureIntegrationTool
+        ? { configureIntegrationTool: input.configureIntegrationTool }
+        : {}),
+      refreshInstructions:
+        "The token refresh failed without establishing that the user's grant is invalid. Inspect the upstream OAuth error and call listConnectionsTool with verbose: true. Check the token endpoint, client authentication, request parameters, and provider availability. Do not recommend reconnecting solely for this error; a revoked grant is reported separately as oauth_reauth_required.",
+    };
+  }
   // A scope-insufficient rejection cannot be fixed by re-running the same
   // grant, so this branch deliberately omits startOAuthTool/oauthInstructions:
   // an agent following the hints would loop through an identical consent and

@@ -415,6 +415,9 @@ const connectionToListItem = (connection: Connection, verbose: boolean) => ({
             ? { identity: connection.lastHealth.identity }
             : {}),
           checkedAt: connection.lastHealth.checkedAt,
+          ...(connection.lastHealth.reason !== undefined
+            ? { reason: connection.lastHealth.reason }
+            : {}),
         },
   ...(verbose ? { oauthScope: connection.oauthScope ?? null } : {}),
 });
@@ -620,7 +623,7 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
         tool({
           name: "connections.list",
           description:
-            "List saved connections and their last health verdict. Never returns credential values. Optionally filter by integration or owner. OAuth scopes are summarized as `oauthScopeCount` by default; pass `verbose: true` to include the full `oauthScope` grant string per connection.",
+            "List saved connections and their last health verdict, including the failure reason when available. Never returns credential values. Optionally filter by integration or owner. OAuth scopes are summarized as `oauthScopeCount` by default; pass `verbose: true` for the full grant string and diagnostic detail. Inspect verbose diagnostics before recommending a reconnect: expired, missing credentials, provider rejection, and temporary upstream failures require different recovery actions.",
           inputSchema: ConnectionsListInputStd,
           outputSchema: ConnectionsListOutputStd,
           execute: (input: typeof ConnectionsListInput.Type, { ctx }) =>
