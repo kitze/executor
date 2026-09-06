@@ -217,10 +217,13 @@ export const buildAuthorizationUrl = (input: BuildAuthorizationUrlInput): string
       input.endpointUrlPolicy,
     ),
   );
-  // Benign default kept by design: a single space is the RFC 6749 scope
-  // separator. Callers targeting a legacy comma-separated provider pass
-  // `scopeSeparator` explicitly (see the field's JSDoc).
-  const separator = input.scopeSeparator ?? " ";
+  // Withings' authorization endpoint requires comma-separated scopes. Manual
+  // clients must receive the same provider behavior as built-in registrations.
+  const separator =
+    input.scopeSeparator ??
+    (url.hostname === "account.withings.com" && url.pathname === "/oauth2_user/authorize2"
+      ? ","
+      : " ");
   url.searchParams.set("client_id", input.clientId);
   url.searchParams.set("redirect_uri", input.redirectUrl);
   url.searchParams.set("response_type", "code");
@@ -964,7 +967,9 @@ const normalizedTokenScope = (
     tokenEndpoint?.hostname.toLowerCase() === "slack.com" &&
     (tokenEndpoint.pathname === "/api/oauth.v2.access" ||
       tokenEndpoint.pathname === "/api/oauth.v2.user.access");
-  if (!isSlackTokenEndpoint) return scope;
+  const isWithings =
+    typeof as.token_endpoint === "string" && isWithingsTokenEndpoint(as.token_endpoint);
+  if (!isSlackTokenEndpoint && !isWithings) return scope;
 
   const normalized = scope
     .split(/[\s,]+/)

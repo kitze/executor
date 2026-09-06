@@ -254,6 +254,20 @@ describe("buildAuthorizationUrl", () => {
     expect(url.searchParams.get("scope")).toBe("read,write");
   });
 
+  it("requests Withings scopes using its required comma separator", () => {
+    const input = {
+      ...baseInput,
+      authorizationUrl: "https://account.withings.com/oauth2_user/authorize2",
+      scopes: ["user.info", "user.metrics", "user.activity"],
+    };
+    expect(new URL(buildAuthorizationUrl(input)).searchParams.get("scope")).toBe(
+      "user.info,user.metrics,user.activity",
+    );
+    expect(
+      new URL(buildAuthorizationUrl({ ...input, scopeSeparator: " " })).searchParams.get("scope"),
+    ).toBe("user.info user.metrics user.activity");
+  });
+
   it("omits scope when no scopes are requested", () => {
     const url = new URL(buildAuthorizationUrl({ ...baseInput, scopes: [] }));
     expect(url.searchParams.has("scope")).toBe(false);
@@ -672,7 +686,7 @@ describe("exchangeAuthorizationCode", () => {
   it.effect("adds Withings's required action to authorization-code token requests", () =>
     Effect.gen(function* () {
       let sent: URLSearchParams | undefined;
-      yield* exchangeAuthorizationCode({
+      const result = yield* exchangeAuthorizationCode({
         tokenUrl: "https://wbsapi.withings.net/v2/oauth2",
         clientId: "cid",
         clientSecret: "csecret",
@@ -687,6 +701,7 @@ describe("exchangeAuthorizationCode", () => {
               refresh_token: "withings-refresh",
               token_type: "Bearer",
               expires_in: 10_800,
+              scope: "user.info,user.metrics,user.activity",
             },
           },
           (params) => {
@@ -696,6 +711,7 @@ describe("exchangeAuthorizationCode", () => {
       });
       expect(sent?.get("action")).toBe("requesttoken");
       expect(sent?.get("grant_type")).toBe("authorization_code");
+      expect(result.scope).toBe("user.info user.metrics user.activity");
     }),
   );
 
