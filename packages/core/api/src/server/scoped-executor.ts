@@ -86,6 +86,7 @@ export interface HostConfigShape {
    * so the host-provided value is the only valid source of truth.
    */
   readonly oauthCallbackPath: string;
+  readonly oauthEndpointUrlPolicy?: ExecutorConfig["oauthEndpointUrlPolicy"];
   /**
    * Whether Executor's built-in agent tools should expose credential provider
    * discovery. Local/self-host can use this for 1Password/keychain style
@@ -321,6 +322,7 @@ export const makeScopedExecutor = <
       ...(config.waitUntil !== undefined ? { waitUntil: config.waitUntil } : {}),
       onElicitation: "accept-all",
       redirectUri,
+      oauthEndpointUrlPolicy: config.oauthEndpointUrlPolicy,
       oauthCallbackStateOrgSlug: orgSlug,
       oauthRefreshCoordinator: config.oauthRefreshCoordinator,
       firstPartyOAuthClients: config.firstPartyOAuthClients,

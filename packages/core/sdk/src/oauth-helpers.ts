@@ -129,6 +129,8 @@ export const ID_JAG_TOKEN_TYPE_SENTINEL = "N_A";
 
 export interface OAuthEndpointUrlPolicy {
   readonly allowHttp?: boolean;
+  /** Exact HTTP origins explicitly trusted by the host (for private transports). */
+  readonly allowedHttpOrigins?: readonly string[];
 }
 
 export const isLoopbackHttpUrl = (value: string): boolean => {
@@ -154,7 +156,8 @@ export const isSupportedOAuthEndpointUrl = (
   return (
     url.protocol === "https:" ||
     isLoopbackHttpUrl(value) ||
-    (url.protocol === "http:" && policy.allowHttp === true)
+    (url.protocol === "http:" &&
+      (policy.allowHttp === true || policy.allowedHttpOrigins?.includes(url.origin) === true))
   );
 };
 
@@ -927,7 +930,7 @@ const oauth4webapiRequestOptions = (
     isLoopbackHttpUrl(targetUrl) ||
     (URL.canParse(targetUrl) &&
       new URL(targetUrl).protocol === "http:" &&
-      endpointUrlPolicy.allowHttp === true)
+      isSupportedOAuthEndpointUrl(targetUrl, endpointUrlPolicy))
   ) {
     (options as { [oauth.allowInsecureRequests]?: boolean })[oauth.allowInsecureRequests] = true;
   }

@@ -192,6 +192,45 @@ const routeTokenEndpointToLoopback = (
 };
 
 describe("oauth.start / oauth.complete", () => {
+  it.effect("keeps a manual client's registered callback after the dashboard origin changes", () =>
+    Effect.gen(function* () {
+      const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+      const { executor } = yield* makeTestWorkspaceHarness({ plugins });
+      yield* executor.acme.seed();
+      const registered = "https://original.example.com/api/oauth/callback";
+      yield* executor.oauth.createClient({
+        owner: "org",
+        slug: CLIENT,
+        authorizationUrl: server.authorizationEndpoint,
+        tokenUrl: server.tokenEndpoint,
+        grant: "authorization_code",
+        clientId: "test-client",
+        clientSecret: "test-secret",
+        origin: { kind: "manual" },
+        originRedirectUri: registered,
+      });
+      const started = yield* executor.oauth.start({
+        owner: "org",
+        client: CLIENT,
+        clientOwner: "org",
+        name: ConnectionName.make("registered-callback"),
+        integration: INTEG,
+        template: TEMPLATE,
+        redirectUri: "https://dashboard-alias.example.com/api/oauth/callback",
+      });
+      expect(started.status).toBe("redirect");
+      if (started.status !== "redirect") return;
+      expect(new URL(started.authorizationUrl).searchParams.get("redirect_uri")).toBe(registered);
+      const callback = yield* server.completeAuthorizationCodeFlow({
+        authorizationUrl: started.authorizationUrl,
+      });
+      const connection = yield* executor.oauth.complete({
+        state: started.state,
+        code: callback.code,
+      });
+      expect(connection.name).toBe("registeredCallback");
+    }),
+  );
   it.effect(
     "binds an org callback state to the member who started it",
     () =>

@@ -533,6 +533,7 @@ interface LoadedOAuthClient {
   /** Resolved literal secret (read from the provider via the stored item id). */
   readonly clientSecret: string;
   readonly resource: string | null;
+  readonly registeredRedirectUri?: string | null;
   readonly tokenEndpointAuthMethod?: "body" | "basic";
   readonly tokenRequestFormat?: "form" | "json";
 }
@@ -947,10 +948,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             input.origin?.kind === "dynamic_client_registration"
               ? (canonicalIssuerUrl(input.originIssuer) ?? null)
               : null,
-          origin_redirect_uri:
-            input.origin?.kind === "dynamic_client_registration"
-              ? (input.originRedirectUri ?? null)
-              : null,
+          origin_redirect_uri: input.originRedirectUri ?? null,
           created_at: now,
         }),
       );
@@ -1422,6 +1420,8 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               clientId: String(row.client_id),
               clientSecret,
               resource: row.resource == null ? null : String(row.resource),
+              registeredRedirectUri:
+                row.origin_redirect_uri == null ? null : String(row.origin_redirect_uri),
             } satisfies LoadedOAuthClient;
           });
         }),
@@ -1736,7 +1736,10 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       // authorization_code requires our callback to receive the code — fail
       // loudly if the executor was constructed without a redirectUri rather
       // than persisting a session pointed at a wrong localhost callback.
-      const flowRedirectUri = input.redirectUri ?? redirectUri;
+      // A dashboard alias is not a new provider registration. Keep the callback
+      // registered with this client, including manually registered clients.
+      // DCR onboarding registers a new client when its callback changes.
+      const flowRedirectUri = client.registeredRedirectUri ?? input.redirectUri ?? redirectUri;
       if (flowRedirectUri == null) {
         return yield* new OAuthStartError({
           message: REDIRECT_URI_REQUIRED_MESSAGE,

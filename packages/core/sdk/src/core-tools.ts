@@ -758,6 +758,15 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
               };
             }),
         }),
+        tool({
+          name: "connections.checkHealth",
+          description:
+            "Run the saved connection's configured health check now. Returns a fresh verdict, not the cached status or a tool-catalog refresh. May renew an OAuth access token.",
+          inputSchema: ConnectionRefInputStd,
+          outputSchema: schemaToStandard(HealthCheckResult),
+          execute: (input: typeof ConnectionRefInput.Type, { ctx }) =>
+            ctx.connections.checkHealth(connectionRefFromInput(input)),
+        }),
         // removed: tools.list — the cross-connection tool catalog is an
         // executor-surface read, not exposed on PluginCtx.
         ...(options.includeProviders === false

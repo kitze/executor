@@ -243,10 +243,9 @@ export type CreateOAuthClientInput = OAuthClient & {
    *  through this surface (the service also rejects the slug namespace). */
   readonly origin?: Exclude<OAuthClientOrigin, { kind: "first_party" }>;
   readonly originIssuer?: string | null;
-  /** The redirect URI a DCR registration sent as the client's `redirect_uris`
-   *  entry. Persisted so reuse can detect a changed callback (strict servers
-   *  reject an authorize request whose redirect_uri differs from the
-   *  registration). Ignored for manual clients. */
+  /** The callback registered with the provider, for dynamic or manual clients.
+   * Used for authorization even when the dashboard's origin changes. Dynamic
+   * registration also uses it to distinguish clients with different callbacks. */
   readonly originRedirectUri?: string | null;
 };
 

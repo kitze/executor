@@ -132,10 +132,17 @@ instance with `E2E_<TARGET>_URL`.
   the grant. Check for a stored refresh token and compare its write time with
   the rejection and access-token expiry. A successful rotation can race a
   rejection, so a stored "expired" verdict alone does not prove token loss.
-- Self-host OAuth callbacks come from `EXECUTOR_WEB_BASE_URL`. Keep that value
-  aligned with the working HTTPS proxy route, and re-register dynamic OAuth
-  clients when their callback origin changes. A local health check does not
-  verify the public callback route.
+- Saved clients with `originRedirectUri` retain that registered callback when
+  the dashboard origin changes. Record it for manual clients too. Clients
+  without one default to the requested callback or `EXECUTOR_WEB_BASE_URL`.
+  Dynamic onboarding registers a new client when the desired callback changes.
+  Verify the registered callback's HTTPS route before reconnecting.
+- For an explicitly trusted private HTTP OAuth provider, self-host supports
+  `EXECUTOR_OAUTH_HTTP_ORIGINS` as a comma-separated list of exact origins.
+  This does not enable HTTP for other origins, and does not override the
+  host's network access policy. Prefer HTTPS wherever supported.
+- `connections.checkHealth` runs a fresh declared probe. `connections.refresh`
+  refreshes the tool catalog; its returned health may still be an older verdict.
 
 - The shell is fish, and the working directory resets between Bash calls.
   Use absolute paths rooted at THIS worktree; don't rely on a prior `cd`.

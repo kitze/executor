@@ -61,6 +61,12 @@ export const SelfHostHostConfig: Layer.Layer<HostConfig> = Layer.sync(HostConfig
     allowLocalNetwork: config.allowLocalNetwork,
     webBaseUrl: config.webBaseUrl,
     oauthCallbackPath: "/api/oauth/callback",
+    oauthEndpointUrlPolicy: {
+      allowedHttpOrigins: (process.env.EXECUTOR_OAUTH_HTTP_ORIGINS ?? "")
+        .split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean),
+    },
     oauthRefreshCoordinator: selfHostOAuthRefreshCoordinator,
     toolsSyncTtlMs: config.toolsSyncTtlMs,
     onIntegrationChange: (event) =>

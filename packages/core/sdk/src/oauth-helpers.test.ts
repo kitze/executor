@@ -24,6 +24,7 @@ import {
   exchangeClientCredentials,
   idTokenIdentityLabel,
   isPermanentTokenRejection,
+  isSupportedOAuthEndpointUrl,
   isUnusableSuccessTokenResponse,
   refreshAccessToken,
   shouldRefreshToken,
@@ -173,6 +174,17 @@ const tokenResponseFetchRecordingBody =
 // ---------------------------------------------------------------------------
 
 describe("PKCE", () => {
+  it("limits private HTTP OAuth opt-in to the exact configured origin", () => {
+    const policy = { allowedHttpOrigins: ["http://100.64.0.10:23373"] };
+    expect(isSupportedOAuthEndpointUrl("http://100.64.0.10:23373/oauth/token", policy)).toBe(true);
+    expect(isSupportedOAuthEndpointUrl("http://100.64.0.10:23374/oauth/token", policy)).toBe(false);
+    expect(isSupportedOAuthEndpointUrl("http://100.64.0.11:23373/oauth/token", policy)).toBe(false);
+    expect(isSupportedOAuthEndpointUrl("http://100.64.0.10.evil.test:23373/token", policy)).toBe(
+      false,
+    );
+    expect(isSupportedOAuthEndpointUrl("http://100.64.0.10:23373/token")).toBe(false);
+    expect(isSupportedOAuthEndpointUrl("https://provider.example/token", policy)).toBe(true);
+  });
   it("createPkceCodeVerifier returns a base64url string in the RFC 7636 length range", () => {
     for (let i = 0; i < 25; i++) {
       const verifier = createPkceCodeVerifier();
@@ -317,6 +329,26 @@ describe("buildAuthorizationUrl", () => {
 });
 
 describe("exchangeAuthorizationCode", () => {
+  it.effect("exchanges a code only at an explicitly allowed private HTTP origin", () =>
+    withTokenEndpoint(tokenResponse(validCodeBody), ({ tokenUrl, calls }) =>
+      Effect.gen(function* () {
+        const privateTokenUrl = "http://100.64.0.10:23373/oauth/token";
+        const result = yield* exchangeAuthorizationCode({
+          tokenUrl: privateTokenUrl,
+          clientId: "cid",
+          clientSecret: "",
+          redirectUrl: "https://app.example.com/cb",
+          codeVerifier: "verifier",
+          code: "abc",
+          endpointUrlPolicy: { allowedHttpOrigins: ["http://100.64.0.10:23373"] },
+          // oxlint-disable-next-line executor/no-raw-fetch -- boundary: test adapter routes the private origin to the local token server
+          fetch: (_input, init) => globalThis.fetch(tokenUrl, init),
+        });
+        expect(result.access_token).toBe("tok");
+        expect((yield* calls)[0]?.body.get("code")).toBe("abc");
+      }),
+    ),
+  );
   it.effect("supports JSON token exchange with HTTP Basic client authentication", () =>
     withTokenEndpoint(tokenResponse(validCodeBody), ({ tokenUrl, calls }) =>
       Effect.gen(function* () {
