@@ -135,6 +135,10 @@ export type TestConfigOptions<TPlugins extends readonly AnyPlugin[] = readonly [
   readonly firstPartyOAuthClients?: ExecutorConfig<TPlugins>["firstPartyOAuthClients"];
   readonly oauthRefreshCoordinator?: ExecutorConfig<TPlugins>["oauthRefreshCoordinator"];
   readonly enterpriseManagedRollout?: ExecutorConfig<TPlugins>["enterpriseManagedRollout"];
+  /** Workspace-settings permission for the test binding (see
+   *  `ExecutorConfig.orgWrites`). Defaults to allowed, like production hosts
+   *  with no role model. */
+  readonly orgWrites?: ExecutorConfig<TPlugins>["orgWrites"];
 };
 
 export const makeTestConfig = <const TPlugins extends readonly AnyPlugin[] = readonly []>(
@@ -174,6 +178,7 @@ export const makeTestConfig = <const TPlugins extends readonly AnyPlugin[] = rea
     onElicitation: "accept-all",
     onIntegrationChange: options?.onIntegrationChange,
     ...(redirectUri != null ? { redirectUri } : {}),
+    ...(options?.orgWrites === undefined ? {} : { orgWrites: options.orgWrites }),
     oauthCallbackStateOrgSlug: options?.oauthCallbackStateOrgSlug,
     firstPartyOAuthClients: options?.firstPartyOAuthClients,
     oauthRefreshCoordinator: options?.oauthRefreshCoordinator,

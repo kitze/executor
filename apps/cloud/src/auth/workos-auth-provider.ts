@@ -155,6 +155,8 @@ const resolveJwtPrincipal = (token: string, jwt: JwtBearerConfig) =>
       avatarUrl: null,
       roles: [],
       liveApprovalProvenance: "session",
+      orgRoleModel: "organization",
+      orgRole: org.memberRole,
     } satisfies Principal;
   });
 
@@ -254,6 +256,8 @@ export const resolveBearerAuth = (
       name: null,
       avatarUrl: null,
       roles: [],
+      orgRoleModel: "organization",
+      orgRole: org.memberRole,
     } satisfies Principal;
   });
 
@@ -328,6 +332,8 @@ export const resolveSessionPrincipal = (request: Request) =>
       avatarUrl: session.avatarUrl ?? null,
       roles: [],
       liveApprovalProvenance: "session",
+      orgRoleModel: "organization",
+      orgRole: org.memberRole,
     } satisfies Principal;
   });
 

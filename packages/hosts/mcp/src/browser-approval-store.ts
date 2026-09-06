@@ -14,9 +14,7 @@
 
 import { Deferred, Effect } from "effect";
 
-import type { ResumeResponse } from "@executor-js/execution";
-
-import type { BrowserApprovalStore } from "./tool-server";
+import type { BrowserApprovalDecision, BrowserApprovalStore } from "./tool-server";
 
 export interface InProcessBrowserApprovalStore {
   /** The store the MCP server awaits a decision on (browser elicitation mode). */
@@ -25,8 +23,8 @@ export interface InProcessBrowserApprovalStore {
    * Later duplicate/conflicting posts return that original decision. */
   readonly recordResponse: (
     executionId: string,
-    response: ResumeResponse,
-  ) => Effect.Effect<ResumeResponse>;
+    response: BrowserApprovalDecision,
+  ) => Effect.Effect<BrowserApprovalDecision>;
   /** Drop a pending decision/waiter (e.g. when its session is torn down). */
   readonly forget: (executionId: string) => void;
 }
@@ -35,18 +33,18 @@ export const makeInProcessBrowserApprovalStore = (): InProcessBrowserApprovalSto
   // Keep an immutable terminal decision until the owning live pause settles.
   // A response is not a queue item: concurrent model retries must observe the
   // same first decision, then the engine's resume cache makes execution safe.
-  const decisions = new Map<string, ResumeResponse>();
-  const waiters = new Map<string, Deferred.Deferred<ResumeResponse>>();
+  const decisions = new Map<string, BrowserApprovalDecision>();
+  const waiters = new Map<string, Deferred.Deferred<BrowserApprovalDecision>>();
 
-  const take = (executionId: string): Effect.Effect<ResumeResponse | null> =>
+  const take = (executionId: string): Effect.Effect<BrowserApprovalDecision | null> =>
     Effect.sync(() => decisions.get(executionId) ?? null);
 
-  const waitFor = (executionId: string): Effect.Effect<ResumeResponse | null> =>
+  const waitFor = (executionId: string): Effect.Effect<BrowserApprovalDecision | null> =>
     Effect.gen(function* () {
       const existing = yield* take(executionId);
       if (existing) return existing;
 
-      const waiter = waiters.get(executionId) ?? (yield* Deferred.make<ResumeResponse>());
+      const waiter = waiters.get(executionId) ?? (yield* Deferred.make<BrowserApprovalDecision>());
       waiters.set(executionId, waiter);
       // `take` and waiter registration are separate steps. Recheck after the
       // waiter is visible so a browser post that lands in that tiny interval

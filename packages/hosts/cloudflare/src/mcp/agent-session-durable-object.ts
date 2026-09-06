@@ -15,10 +15,15 @@ import {
 import {
   PAUSED_APPROVAL_TIMEOUT_MS,
   formatMcpExecutionOutcome,
+  type BrowserApprovalDecision,
   type PausedExecutionHooks,
   type ResumeFallbackOutcome,
 } from "@executor-js/host-mcp/tool-server";
 import { defaultMcpResource, type McpResource } from "@executor-js/host-mcp";
+import {
+  ResumeResponsePayload,
+  decodeResumeResponse,
+} from "@executor-js/host-mcp/browser-approval";
 
 import type { IncomingPropagationHeaders, McpElicitationMode } from "./do-headers";
 import { classifyDurableObjectError, type DurableObjectFailure } from "./durable-object-errors";
@@ -50,10 +55,11 @@ import {
   RESIDENT_RUNTIME_SOFT_CAP,
   touchResidentSession,
 } from "./session-runtime-residency";
+import type { OrgRoleMetadata } from "./role-metadata";
 
 export type IncomingTraceHeaders = IncomingPropagationHeaders;
 
-export interface McpSessionInit {
+interface McpSessionInitBase {
   readonly organizationId: string;
   /** The organization's display name, as the worker resolved it while
    *  authorizing this very request. Carried so the session DO never has to
@@ -77,6 +83,9 @@ export interface McpSessionInit {
   readonly webOrigin?: string;
 }
 
+/** Live session initialization metadata from an authenticated principal. */
+export type McpSessionInit = McpSessionInitBase & OrgRoleMetadata;
+
 export interface McpSessionProps extends Record<string, unknown> {
   readonly session: McpSessionInit;
   readonly propagation?: IncomingTraceHeaders;
@@ -85,6 +94,11 @@ export interface McpSessionProps extends Record<string, unknown> {
 export type McpApprovalOwner = {
   readonly accountId: string;
   readonly organizationId: string;
+};
+
+/** Authenticated browser approver with a freshly resolved organization role. */
+export type McpApprovalPrincipal = McpApprovalOwner & {
+  readonly orgRole: "admin" | "member";
 };
 
 type McpSessionApprovalErrorResult =
@@ -121,7 +135,7 @@ export interface SessionDbHandle {
   readonly end: () => Promise<void> | void;
 }
 
-export interface SessionMeta {
+interface SessionMetaBase {
   readonly organizationId: string;
   readonly organizationName: string;
   /** The org's URL slug, when the host's `resolveSessionMeta` carried one.
@@ -154,14 +168,25 @@ export interface SessionMeta {
   readonly appsEnabled?: boolean;
 }
 
+/** Durable session metadata, including the pre-role-model persisted shape. */
+export type SessionMeta = SessionMetaBase &
+  (
+    | OrgRoleMetadata
+    | {
+        /** Missing only on records written before role models were persisted. */
+        readonly orgRoleModel?: undefined;
+        readonly orgRole?: "admin" | "member";
+      }
+  );
+
 export interface BuiltMcpServer {
   readonly mcpServer: McpServer;
   readonly engine: ExecutionEngine<Cause.YieldableError>;
 }
 
 export interface BrowserApprovalStore {
-  readonly takeResponse: (executionId: string) => Effect.Effect<ResumeResponse | null>;
-  readonly waitForResponse: (executionId: string) => Effect.Effect<ResumeResponse | null>;
+  readonly takeResponse: (executionId: string) => Effect.Effect<BrowserApprovalDecision | null>;
+  readonly waitForResponse: (executionId: string) => Effect.Effect<BrowserApprovalDecision | null>;
 }
 
 const SESSION_META_KEY = "session-meta";
@@ -183,6 +208,11 @@ const approvalResponseKey = (executionId: string) => `approval-response:${execut
 /** Kept after the response queue is consumed so a later browser POST cannot
  * overwrite the first terminal decision before the paused execution settles. */
 const approvalDecisionKey = (executionId: string) => `approval-decision:${executionId}`;
+const BrowserApprovalDecisionStorage = Schema.Struct({
+  response: ResumeResponsePayload,
+  orgWriteAccess: Schema.Literals(["allowed", "denied"]),
+});
+const decodeBrowserApprovalDecision = Schema.decodeUnknownOption(BrowserApprovalDecisionStorage);
 
 type JsonRpcRequestId = string | number;
 const JsonRpcRequestWithId = Schema.Struct({
@@ -315,8 +345,8 @@ export abstract class McpAgentSessionDOBase<
   private onStartPromise: Promise<void> | null = null;
   private lastActivityMs = 0;
   private resolvedSessionName: string | undefined = undefined;
-  private approvalResponses = new Map<string, ResumeResponse>();
-  private approvalWaiters = new Map<string, Deferred.Deferred<ResumeResponse>>();
+  private approvalResponses = new Map<string, BrowserApprovalDecision>();
+  private approvalWaiters = new Map<string, Deferred.Deferred<BrowserApprovalDecision>>();
   private pendingApprovalLeases = new Map<string, PendingApprovalLease>();
 
   protected abstract openSessionDb(): TDbHandle | Promise<TDbHandle>;
@@ -612,9 +642,29 @@ export abstract class McpAgentSessionDOBase<
       // the field. Their stored meta has no `resource`, and every such session
       // was minted against the default `/mcp` endpoint, so default it here
       // rather than let owner validation read `.kind` off undefined.
-      this.sessionMeta = stored
-        ? { ...stored, resource: stored.resource ?? defaultMcpResource }
-        : null;
+      if (!stored) {
+        this.sessionMeta = null;
+        return this.sessionMeta;
+      }
+
+      if (stored.orgRoleModel === undefined) {
+        // Records written before the role-model field existed cannot prove
+        // that their optional role was derived under an enforcing host. Treat
+        // them as an organization-role session with no role, which denies
+        // workspace writes until a live request refreshes the metadata.
+        const { orgRole: _untrustedLegacyRole, ...legacy } = stored;
+        this.sessionMeta = {
+          ...legacy,
+          orgRoleModel: "organization",
+          resource: stored.resource ?? defaultMcpResource,
+        };
+        return this.sessionMeta;
+      }
+
+      this.sessionMeta = {
+        ...stored,
+        resource: stored.resource ?? defaultMcpResource,
+      };
       return this.sessionMeta;
     }).pipe(Effect.withSpan("mcp.session.load_meta"));
   }
@@ -1365,11 +1415,13 @@ export abstract class McpAgentSessionDOBase<
       // of starting one against half-torn-down state.
       await this.disposingRuntime;
     }
-    if (this.initialized) return;
     const props = isSessionProps(this.props) ? this.props : null;
     if (!props) {
       // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: McpAgent.init is a Promise-only framework hook and props are required before any Effect runtime exists.
       throw new Error("MCP session props are required");
+    }
+    if (this.initialized) {
+      return;
     }
     const self = this;
     const program = Effect.gen(function* () {
@@ -1392,8 +1444,8 @@ export abstract class McpAgentSessionDOBase<
       // acquisition instead.
       const { dbHandle, mcpServer, engine } = yield* Effect.gen(function* () {
         const dbHandle = yield* self.openSessionDbHandle();
-        const { mcpServer, engine } = yield* self.buildRuntime(sessionMeta, dbHandle);
-        return { dbHandle, mcpServer, engine };
+        const built = yield* self.buildRuntime(sessionMeta, dbHandle);
+        return { dbHandle, ...built };
       });
       self.dbHandle = dbHandle;
       self.server = mcpServer;
@@ -1673,7 +1725,7 @@ export abstract class McpAgentSessionDOBase<
 
   async resumeExecutionForApproval(
     executionId: string,
-    identity: McpApprovalOwner,
+    identity: McpApprovalPrincipal,
     response: ResumeResponse,
     incoming?: IncomingTraceHeaders,
   ): Promise<McpSessionResumeApprovalResult> {
@@ -1692,8 +1744,11 @@ export abstract class McpAgentSessionDOBase<
 
         const granted = yield* self.engine.grantLiveApproval(executionId, response);
         if (!granted) return { status: "not_found" } as const;
-        const terminalResponse = yield* self.recordApprovalResponse(executionId, granted);
-        return resumeApprovalResult(executionId, terminalResponse);
+        const terminalResponse = yield* self.recordApprovalResponse(executionId, {
+          response: granted,
+          orgWriteAccess: identity.orgRole === "admin" ? "allowed" : "denied",
+        });
+        return resumeApprovalResult(executionId, terminalResponse.response);
       }).pipe(
         Effect.withSpan("McpSessionDO.resumeExecutionForApproval", {
           attributes: { "mcp.execution.id": executionId },
@@ -2101,8 +2156,8 @@ export abstract class McpAgentSessionDOBase<
 
   private recordApprovalResponse(
     executionId: string,
-    response: ResumeResponse,
-  ): Effect.Effect<ResumeResponse> {
+    response: BrowserApprovalDecision,
+  ): Effect.Effect<BrowserApprovalDecision> {
     const self = this;
     return Effect.gen(function* () {
       const inMemory = self.approvalResponses.get(executionId);
@@ -2110,10 +2165,22 @@ export abstract class McpAgentSessionDOBase<
       const terminalResponse = yield* Effect.promise(() =>
         self.ctx.storage.transaction(async (transaction) => {
           const key = approvalDecisionKey(executionId);
-          const existing = await transaction.get<ResumeResponse>(key);
-          if (existing) return existing;
+          const existing = await transaction.get<unknown>(key);
+          if (existing) {
+            // A storage round-trip strips the process-local live grant. The
+            // first committing transaction retains its original object here.
+            const live = self.approvalResponses.get(executionId);
+            if (live) return live;
+            const stored = Option.getOrNull(decodeBrowserApprovalDecision(existing));
+            if (stored) return stored;
+            return {
+              response: decodeResumeResponse(existing) ?? { action: "decline" as const },
+              orgWriteAccess: "denied" as const,
+            };
+          }
           await transaction.put(key, response);
           await transaction.put(approvalResponseKey(executionId), response);
+          self.approvalResponses.set(executionId, response);
           return response;
         }),
       );
@@ -2142,9 +2209,12 @@ export abstract class McpAgentSessionDOBase<
       yield* Effect.sync(() => {
         console.info(JSON.stringify({ event: "mcp_pending_approval_lease_expire", executionId }));
       });
-      const terminalResponse = yield* self.recordApprovalResponse(executionId, response);
+      const terminalResponse = yield* self.recordApprovalResponse(executionId, {
+        response,
+        orgWriteAccess: "denied",
+      });
       if (self.engine && !self.approvalWaiters.has(executionId)) {
-        yield* self.engine.resume(executionId, terminalResponse).pipe(Effect.ignore);
+        yield* self.engine.resume(executionId, terminalResponse.response).pipe(Effect.ignore);
       }
     }).pipe(
       Effect.ensuring(self.releasePendingApprovalLease(executionId)),
@@ -2154,29 +2224,35 @@ export abstract class McpAgentSessionDOBase<
     );
   }
 
-  private takeApprovalResponse(executionId: string): Effect.Effect<ResumeResponse | null> {
+  private takeApprovalResponse(executionId: string): Effect.Effect<BrowserApprovalDecision | null> {
     const self = this;
     return Effect.promise(async () => {
       const memoryResponse = self.approvalResponses.get(executionId);
       if (memoryResponse) return memoryResponse;
-      // A terminal decision remains readable until the pause settles. It is
-      // not a consumable queue entry: concurrent long-polling retries must
-      // all receive the first decision, while engine resume is idempotent.
-      const stored = await self.ctx.storage.get<ResumeResponse>(approvalDecisionKey(executionId));
+      const stored =
+        (await self.ctx.storage.get<unknown>(approvalDecisionKey(executionId))) ??
+        (await self.ctx.storage.get<unknown>(approvalResponseKey(executionId)));
       if (!stored) return null;
-      self.approvalResponses.set(executionId, stored);
-      return stored;
+      const decision = Option.getOrNull(decodeBrowserApprovalDecision(stored));
+      const legacyResponse = decision ? null : decodeResumeResponse(stored);
+      const terminal =
+        decision ??
+        (legacyResponse ? { response: legacyResponse, orgWriteAccess: "denied" as const } : null);
+      if (terminal) self.approvalResponses.set(executionId, terminal);
+      return terminal;
     });
   }
 
-  private waitForApprovalResponse(executionId: string): Effect.Effect<ResumeResponse | null> {
+  private waitForApprovalResponse(
+    executionId: string,
+  ): Effect.Effect<BrowserApprovalDecision | null> {
     const self = this;
     return Effect.gen(function* () {
       const existing = yield* self.takeApprovalResponse(executionId);
       if (existing) return existing;
 
       const waiter =
-        self.approvalWaiters.get(executionId) ?? (yield* Deferred.make<ResumeResponse>());
+        self.approvalWaiters.get(executionId) ?? (yield* Deferred.make<BrowserApprovalDecision>());
       self.approvalWaiters.set(executionId, waiter);
       // The storage read above yields to the event loop. Recheck once the
       // waiter is registered so a browser decision committed between that

@@ -4,6 +4,7 @@ import { type Principal } from "@executor-js/api/server";
 import { withQueryContext } from "@executor-js/fumadb/query";
 import { decodeOAuthCallbackState, ORG_SUBJECT } from "@executor-js/sdk";
 
+import { isPrivileged } from "../admin/require-admin";
 import type { SelfHostDbHandle } from "../db/self-host-db";
 import type { BetterAuthHandle } from "./better-auth";
 import { OAUTH_CALLBACK_PATH } from "./oauth-callback-login";
@@ -35,6 +36,14 @@ const BetterAuthCallbackUser = Schema.Struct({
   role: Schema.optional(Schema.NullOr(Schema.String)),
 });
 const decodeBetterAuthCallbackUser = Schema.decodeUnknownOption(BetterAuthCallbackUser);
+
+const decodeCallbackMembership = Schema.decodeUnknownOption(
+  Schema.Struct({
+    userId: Schema.String,
+    organizationId: Schema.String,
+    role: Schema.String,
+  }),
+);
 
 const parseRoles = (role: string | null | undefined): ReadonlyArray<string> =>
   (role ?? "user")
@@ -126,6 +135,20 @@ export const makeOAuthCallbackPrincipalResolver =
         // The adapter lookup must return the very subject selected above. This
         // guards against a malformed adapter response becoming a principal.
         if (user === null || user.id !== subject) return null;
+        const rawMember = await context.adapter.findOne<unknown>({
+          model: "member",
+          where: [
+            { field: "userId", value: subject },
+            { field: "organizationId", value: options.betterAuth.organizationId },
+          ],
+        });
+        const member = Option.getOrNull(decodeCallbackMembership(rawMember));
+        if (
+          !member ||
+          member.userId !== subject ||
+          member.organizationId !== options.betterAuth.organizationId
+        )
+          return null;
 
         return {
           kind: "member",
@@ -137,6 +160,8 @@ export const makeOAuthCallbackPrincipalResolver =
           name: user.name ?? null,
           avatarUrl: user.image ?? null,
           roles: parseRoles(user.role),
+          orgRoleModel: "organization",
+          orgRole: isPrivileged(member.role) ? "admin" : "member",
         } satisfies Principal;
       },
       // OAuth state is an authentication capability. A storage or adapter

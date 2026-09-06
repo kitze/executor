@@ -40,6 +40,7 @@ export const LOCAL_PRINCIPAL: Principal = {
   avatarUrl: null,
   roles: [],
   liveApprovalProvenance: "session",
+  orgRoleModel: "none",
 };
 
 const bearerToken = (headers: Headers): string | undefined => {

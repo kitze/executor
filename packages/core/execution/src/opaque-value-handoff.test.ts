@@ -3,6 +3,8 @@ import { Cause, Effect, Exit, Logger } from "effect";
 import type * as Tracer from "effect/Tracer";
 
 import {
+  CurrentOrgWriteAccess,
+  makeOrgWriteAccessState,
   ElicitationResponse,
   ElicitationId,
   FormElicitation,
@@ -367,6 +369,57 @@ return { source, written };
 `;
 
 describe("opaque sensitive value execution", () => {
+  for (const access of ["allowed", "denied"] as const) {
+    it.effect(
+      `keeps live secret approval and the resumer's ${access} workspace access independent`,
+      () =>
+        Effect.gen(function* () {
+          const ledger: Ledger = { writes: [], reviews: [] };
+          const executor = yield* createExecutor(
+            makeTestConfig({
+              coreTools: {},
+              orgWrites: "request",
+              plugins: [makePlugin(ledger)] as const,
+            }),
+          );
+          const engine = createExecutionEngine({ executor, codeExecutor: makeQuickJsExecutor() });
+          yield* Effect.addFinalizer(() =>
+            engine.shutdown.pipe(Effect.andThen(executor.close()), Effect.ignore),
+          );
+          const paused = yield* engine
+            .executeWithPause(
+              `
+          const source = await tools.opaque.read({});
+          await tools.opaque.write({ body: { value: source.data.envs[0].value } });
+          return await tools.executor.coreTools.policies.create({
+            owner: "org", pattern: "composed-approval.*", action: "block"
+          });
+        `,
+              { autoApprove: true },
+            )
+            .pipe(Effect.provideService(CurrentOrgWriteAccess, makeOrgWriteAccessState("allowed")));
+          expect(paused.status).toBe("paused");
+          if (paused.status !== "paused") return;
+          expect(paused.execution.requiresLiveApproval).toBe(true);
+          const raw = yield* engine
+            .resume(paused.execution.id, { action: "accept" })
+            .pipe(Effect.provideService(CurrentOrgWriteAccess, makeOrgWriteAccessState("allowed")));
+          expect(raw?.status).toBe("paused");
+          expect(ledger.writes).toEqual([]);
+          const grant = yield* engine.grantLiveApproval(paused.execution.id, { action: "accept" });
+          expect(grant).not.toBeNull();
+          if (!grant) return;
+          const outcome = yield* engine
+            .resume(paused.execution.id, grant)
+            .pipe(Effect.provideService(CurrentOrgWriteAccess, makeOrgWriteAccessState(access)));
+          expect(outcome?.status).toBe("completed");
+          expect(ledger.writes).toHaveLength(1);
+          expect(yield* executor.policies.list()).toHaveLength(access === "allowed" ? 1 : 0);
+          expect(JSON.stringify(outcome)).not.toContain(MARKER);
+        }).pipe(Effect.scoped),
+    );
+  }
+
   it.effect(
     "keeps a source value out of the sandbox and resolves it at the approved sink only",
     () =>

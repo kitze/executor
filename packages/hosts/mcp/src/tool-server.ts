@@ -20,7 +20,14 @@ import type {
 import { Validator } from "@cfworker/json-schema";
 import * as z from "zod/v4";
 
-import { FormElicitation, isToolFile, sanitizeArtifactPreviewMarkup } from "@executor-js/sdk";
+import {
+  CurrentOrgWriteAccess,
+  FormElicitation,
+  isToolFile,
+  makeOrgWriteAccessState,
+  sanitizeArtifactPreviewMarkup,
+  type OrgWriteAccess,
+} from "@executor-js/sdk";
 import type {
   Artifact,
   ArtifactBinding,
@@ -67,6 +74,7 @@ import {
   resolveArtifactBindings,
   type BindableConnection,
 } from "./artifact-bindings";
+import { MCP_ORG_WRITE_ACCESS_HEADER } from "./seams";
 
 // ---------------------------------------------------------------------------
 // Workers-compatible JSON Schema validator (replaces Ajv which uses new Function())
@@ -272,11 +280,17 @@ export type ExecutorMcpServerConfig<E extends Cause.YieldableError = Cause.Yield
   | ({ readonly engine: ExecutionEngine<E>; readonly stateless: true } & SharedMcpServerConfig);
 
 export type BrowserApprovalStore = {
-  readonly takeResponse: (executionId: string) => Effect.Effect<ResumeResponse | null>;
-  readonly waitForResponse?: (executionId: string) => Effect.Effect<ResumeResponse | null>;
+  readonly takeResponse: (executionId: string) => Effect.Effect<BrowserApprovalDecision | null>;
+  readonly waitForResponse?: (executionId: string) => Effect.Effect<BrowserApprovalDecision | null>;
   /** Remove a terminal browser decision after its owning live pause settles. */
   readonly forget?: (executionId: string) => void;
 };
+
+/** Browser response paired with authorization derived from the deciding user. */
+export interface BrowserApprovalDecision {
+  readonly response: ResumeResponse;
+  readonly orgWriteAccess: OrgWriteAccess;
+}
 
 export const PAUSED_APPROVAL_TIMEOUT_MS = 4 * 60 * 1000;
 const BROWSER_APPROVAL_WAIT_TIMEOUT_MS = PAUSED_APPROVAL_TIMEOUT_MS + 1000;
@@ -878,7 +892,13 @@ const extractInventory = (description: string): string => {
 type McpRequestJoinKeys = {
   readonly requestId: string | number;
   readonly sessionId?: string | undefined;
+  readonly requestInfo?: {
+    readonly headers: Readonly<Record<string, string | readonly string[] | undefined>>;
+  };
 };
+
+const requestOrgWriteAccess = (extra: McpRequestJoinKeys): OrgWriteAccess =>
+  extra.requestInfo?.headers[MCP_ORG_WRITE_ACCESS_HEADER] === "allowed" ? "allowed" : "denied";
 
 // `mcp.request.session_id` is emitted unconditionally (empty string when the
 // transport carries none) to match the worker-side `annotateMcpRequest`
@@ -1246,9 +1266,16 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
       const parent = resolveParentSpan();
       return parent ? Effect.withParentSpan(effect, parent) : effect;
     };
-    const runToolEffect = <EffE>(effect: Effect.Effect<McpToolResult, EffE>) =>
+    const runToolEffect = <EffE>(
+      effect: Effect.Effect<McpToolResult, EffE>,
+      extra: McpRequestJoinKeys,
+    ) =>
       Effect.runPromiseWith(context)(
         anchor(effect).pipe(
+          Effect.provideService(
+            CurrentOrgWriteAccess,
+            makeOrgWriteAccessState(requestOrgWriteAccess(extra)),
+          ),
           Effect.catchCause((cause) => Effect.succeed(toMcpFailureResult(cause))),
         ),
       );
@@ -1521,13 +1548,13 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
 
     const takeBrowserApprovalResponse = (
       executionId: string,
-    ): Effect.Effect<ResumeResponse | null> => {
+    ): Effect.Effect<BrowserApprovalDecision | null> => {
       return config.browserApprovalStore?.takeResponse(executionId) ?? Effect.succeed(null);
     };
 
     const waitForBrowserApprovalResponse = (
       executionId: string,
-    ): Effect.Effect<ResumeResponse | null> => {
+    ): Effect.Effect<BrowserApprovalDecision | null> => {
       const waitForResponse = config.browserApprovalStore?.waitForResponse;
       if (!waitForResponse) return takeBrowserApprovalResponse(executionId);
 
@@ -1548,12 +1575,17 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           "mcp.tool.name": "resume",
           "mcp.execute.execution_id": executionId,
         });
-        const response = yield* waitForBrowserApprovalResponse(executionId);
-        if (!response) return yield* requireUserResumeApproval(executionId);
+        const decision = yield* waitForBrowserApprovalResponse(executionId);
+        if (!decision) return yield* requireUserResumeApproval(executionId);
 
-        const outcome = yield* resumeWithLifecycle(executionId, response, {
+        const outcome = yield* resumeWithLifecycle(executionId, decision.response, {
           browserApproval: true,
-        });
+        }).pipe(
+          Effect.provideService(
+            CurrentOrgWriteAccess,
+            makeOrgWriteAccessState(decision.orgWriteAccess),
+          ),
+        );
         if (!outcome) {
           return missingExecutionResult(executionId);
         }
@@ -1588,7 +1620,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           description,
           inputSchema: { code: z.string().trim().min(1) },
         },
-        ({ code }, extra) => runToolEffect(executeCode(code, extra)),
+        ({ code }, extra) => runToolEffect(executeCode(code, extra), extra),
       ),
     ).pipe(
       Effect.withSpan("mcp.host.register_tool", {
@@ -1615,8 +1647,8 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
               ),
           },
         },
-        ({ name }) =>
-          runToolEffect(Effect.succeed(skillsResult(name, executeInventory, skillCatalog))),
+        ({ name }, extra) =>
+          runToolEffect(Effect.succeed(skillsResult(name, executeInventory, skillCatalog)), extra),
       ),
     ).pipe(
       Effect.withSpan("mcp.host.register_tool", {
@@ -1651,6 +1683,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           ({ executionId, action, content: rawContent }, extra) =>
             runToolEffect(
               resumeExecution(executionId, action, parseJsonContent(rawContent), extra),
+              extra,
             ),
         );
       }
@@ -1667,7 +1700,8 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             executionId: z.string().describe("The execution ID from the paused result"),
           },
         },
-        ({ executionId }, extra) => runToolEffect(resumeAfterBrowserApproval(executionId, extra)),
+        ({ executionId }, extra) =>
+          runToolEffect(resumeAfterBrowserApproval(executionId, extra), extra),
       );
     }).pipe(
       Effect.withSpan("mcp.host.register_tool", {
@@ -1718,6 +1752,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
                     },
                   }),
                 ),
+                extra,
               ),
           );
         }
@@ -2169,8 +2204,11 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
               ui: { resourceUri: MCP_APPS_SHELL_RESOURCE_URI, visibility: ["model"] },
             },
           },
-          ({ code, title, description, connections, artifactId }) =>
-            runToolEffect(createArtifact({ code, title, description, connections, artifactId })),
+          ({ code, title, description, connections, artifactId }, extra) =>
+            runToolEffect(
+              createArtifact({ code, title, description, connections, artifactId }),
+              extra,
+            ),
         ),
       ).pipe(
         Effect.withSpan("mcp.host.register_tool", {
@@ -2235,8 +2273,11 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
               ui: { resourceUri: MCP_APPS_SHELL_RESOURCE_URI, visibility: ["model"] },
             },
           },
-          ({ artifactId, edits, connections, title, description }) =>
-            runToolEffect(editArtifact({ artifactId, edits, connections, title, description })),
+          ({ artifactId, edits, connections, title, description }, extra) =>
+            runToolEffect(
+              editArtifact({ artifactId, edits, connections, title, description }),
+              extra,
+            ),
         ),
       ).pipe(
         Effect.withSpan("mcp.host.register_tool", {
@@ -2254,7 +2295,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             ].join("\n"),
             inputSchema: {},
           },
-          () => runToolEffect(listArtifacts()),
+          (_args, extra) => runToolEffect(listArtifacts(), extra),
         ),
       ).pipe(
         Effect.withSpan("mcp.host.register_tool", {
@@ -2279,7 +2320,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
               ui: { resourceUri: MCP_APPS_SHELL_RESOURCE_URI, visibility: ["model"] },
             },
           },
-          ({ id }) => runToolEffect(showArtifact(id)),
+          ({ id }, extra) => runToolEffect(showArtifact(id), extra),
         ),
       ).pipe(
         Effect.withSpan("mcp.host.register_tool", {
@@ -2310,7 +2351,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             },
           },
           ({ code, artifactId }, extra) =>
-            runToolEffect(executeCodeFromApp(code, artifactId, extra)),
+            runToolEffect(executeCodeFromApp(code, artifactId, extra), extra),
         );
 
         executeActionResumeTool = registerAppTool(
@@ -2335,6 +2376,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           ({ executionId, action, content: rawContent }, extra) =>
             runToolEffect(
               resumeExecution(executionId, action, parseJsonContent(rawContent), extra),
+              extra,
             ),
         );
       }).pipe(

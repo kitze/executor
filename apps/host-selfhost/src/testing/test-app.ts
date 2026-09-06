@@ -94,6 +94,8 @@ export const singleAdminIdentityLayer = (
           avatarUrl: null,
           roles: ["admin"],
           liveApprovalProvenance: "session",
+          orgRoleModel: "organization",
+          orgRole: "admin",
         }),
     }),
   );
@@ -132,6 +134,8 @@ export const headerIdentityLayer: Layer.Layer<IdentityProvider> = Layer.succeed(
         avatarUrl: null,
         roles: ["admin"],
         liveApprovalProvenance: "session",
+        orgRoleModel: "organization",
+        orgRole: "admin",
       });
     },
   }),

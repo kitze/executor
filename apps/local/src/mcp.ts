@@ -291,8 +291,10 @@ export const createMcpRequestHandler = (
       if (!engine) return json({ error: "MCP session not found" }, 404);
       const granted = await Effect.runPromise(engine.grantLiveApproval(executionId, response));
       if (!granted) return json({ error: "MCP session not found" }, 404);
-      await Effect.runPromise(approvals.recordResponse(executionId, granted));
-      return json(resumeApprovalResult(executionId, granted));
+      const terminal = await Effect.runPromise(
+        approvals.recordResponse(executionId, { response: granted, orgWriteAccess: "allowed" }),
+      );
+      return json(resumeApprovalResult(executionId, terminal.response));
     },
 
     close: async () => {

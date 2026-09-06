@@ -87,6 +87,8 @@ test("a cookie-free wrapped callback state restores the original org actor", asy
 
   expect(principal).toMatchObject({
     kind: "member",
+    orgRoleModel: "organization",
+    orgRole: "admin",
     accountId: CALLBACK_USER_ID,
     organizationId: auth.betterAuth.organizationId,
   });
@@ -148,4 +150,31 @@ test("expired, foreign-org, and incomplete state capabilities never authenticate
       auth.oauthCallbackPrincipalResolver(callbackRequest("missing-subject-state")),
     ),
   ).resolves.toBeNull();
+});
+
+test("callback state uses current membership after the original actor is demoted", async () => {
+  await seedSession({
+    state: "demoted-state",
+    owner: "org",
+    subject: ORG_SUBJECT,
+    payload: { callbackSubject: CALLBACK_USER_ID },
+    expiresAt: Date.now() + 60_000,
+  });
+  const where = [
+    { field: "userId", value: CALLBACK_USER_ID },
+    { field: "organizationId", value: auth.betterAuth.organizationId },
+  ];
+  const member = await adapter.findOne<{ role: string }>({ model: "member", where });
+  expect(member).not.toBeNull();
+  await adapter.update({ model: "member", where, update: { role: "member" } });
+  await Effect.runPromise(auth.oauthCallbackPrincipalResolver(callbackRequest("demoted-state")))
+    .then((principal) => {
+      expect(principal).toMatchObject({
+        accountId: CALLBACK_USER_ID,
+        orgRoleModel: "organization",
+        orgRole: "member",
+      });
+      expect(principal?.liveApprovalProvenance).toBeUndefined();
+    })
+    .finally(() => adapter.update({ model: "member", where, update: { role: member!.role } }));
 });

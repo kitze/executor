@@ -1,4 +1,4 @@
-import { Deferred, Effect, Fiber, Predicate, Queue, References } from "effect";
+import { Deferred, Effect, Fiber, Predicate, Queue, Ref, References } from "effect";
 import type * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
 
@@ -15,6 +15,7 @@ import {
   UrlElicitation,
   makeOpaqueValueHandoff,
 } from "@executor-js/sdk/core";
+import { CurrentOrgWriteAccess, type OrgWriteAccessState } from "@executor-js/sdk/core";
 import { CodeExecutionError } from "@executor-js/codemode-core";
 import type { CodeExecutor, ExecuteResult, SandboxToolInvoker } from "@executor-js/codemode-core";
 
@@ -61,6 +62,7 @@ export type PausedExecutionDeadline = {
 /** Internal representation with Effect runtime state for pause/resume. */
 type InternalPausedExecution<E> = PausedExecution & {
   readonly response: Deferred.Deferred<typeof ElicitationResponse.Type>;
+  readonly orgWriteAccess: OrgWriteAccessState;
   readonly fiber: Fiber.Fiber<ExecuteResult, E>;
   readonly pauseQueue: Queue.Queue<InternalPausedExecution<E>>;
 };
@@ -107,7 +109,10 @@ const executeOutcomeAttributes = (result: ExecuteResult): Record<string, unknown
     "mcp.execute.log_chars": result.logs?.reduce((total, line) => total + line.length, 0) ?? 0,
     "mcp.execute.emitted": result.output?.length ?? 0,
     ...(result.error
-      ? { "mcp.execute.outcome": "fail", "mcp.execute.error_kind": result.errorKind ?? "unknown" }
+      ? {
+          "mcp.execute.outcome": "fail",
+          "mcp.execute.error_kind": result.errorKind ?? "unknown",
+        }
       : { "mcp.execute.outcome": "ok" }),
   };
   executeOutcomeAttributesCache.set(result, attributes);
@@ -461,7 +466,10 @@ const makeFullInvoker = (
           })
           .pipe(
             Effect.withSpan("mcp.tool.dispatch", {
-              attributes: { "mcp.tool.name": path, "executor.tool.builtin": true },
+              attributes: {
+                "mcp.tool.name": path,
+                "executor.tool.builtin": true,
+              },
             }),
           );
       }
@@ -505,7 +513,10 @@ const makeFullInvoker = (
           offset,
         }).pipe(
           Effect.withSpan("mcp.tool.dispatch", {
-            attributes: { "mcp.tool.name": path, "executor.tool.builtin": true },
+            attributes: {
+              "mcp.tool.name": path,
+              "executor.tool.builtin": true,
+            },
           }),
         );
       }
@@ -519,7 +530,11 @@ const makeFullInvoker = (
         }
 
         if (typeof args.path !== "string" || args.path.trim().length === 0) {
-          return Effect.fail(new ExecutionToolError({ message: "describe.tool requires a path" }));
+          return Effect.fail(
+            new ExecutionToolError({
+              message: "describe.tool requires a path",
+            }),
+          );
         }
 
         if ("includeSchemas" in args) {
@@ -661,7 +676,13 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
   const SETTLED_EXECUTION_ID_LIMIT = 1024;
   // Resumes whose outcome is still being computed, so a concurrent duplicate
   // awaits the same result instead of missing the (already-consumed) pause.
-  const pendingResumes = new Map<string, Deferred.Deferred<ExecutionResult, E>>();
+  const pendingResumes = new Map<
+    string,
+    {
+      readonly outcome: Deferred.Deferred<ExecutionResult, E>;
+      readonly orgWriteAccess: OrgWriteAccessState;
+    }
+  >();
   // A browser/native approval endpoint gets an object from `grantLiveApproval`
   // only after authenticating a human. A model can serialize a matching action
   // but cannot reconstruct this process-local WeakMap membership.
@@ -704,7 +725,12 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
   ): Effect.Effect<ExecutionResult, E> =>
     Effect.raceFirst(
       Fiber.join(fiber).pipe(
-        Effect.map((result): ExecutionResult => ({ status: "completed", result })),
+        Effect.map(
+          (result): ExecutionResult => ({
+            status: "completed",
+            result,
+          }),
+        ),
       ),
       Queue.take(pauseQueue).pipe(
         Effect.map(
@@ -742,6 +768,7 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
     const opaqueValueHandoff = makeOpaqueValueHandoff({
       executionId: `opaque_${crypto.randomUUID()}`,
     });
+    const orgWriteAccess = yield* CurrentOrgWriteAccess;
 
     // Will be set once the fiber is forked.
     let fiber: Fiber.Fiber<ExecuteResult, E>;
@@ -768,6 +795,7 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
           ...(publicContext.requiresLiveApproval ? { requiresLiveApproval: true } : {}),
           ...(opaqueValueHandoff.hasOpaqueValues() ? { hasOpaqueValues: true } : {}),
           response: responseDeferred,
+          orgWriteAccess,
           fiber: fiber!,
           pauseQueue,
         };
@@ -808,7 +836,10 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
             liveSandboxFibers.delete(sandboxFiber);
             const outcome = Exit.map(
               exit,
-              (result): ExecutionResult => ({ status: "completed", result }),
+              (result): ExecutionResult => ({
+                status: "completed",
+                result,
+              }),
             );
             // The fiber has already mapped its public result through redact,
             // so no later caller needs the raw source values. Clear both
@@ -849,7 +880,9 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
 
     const settled = settledOutcomes.get(executionId);
     if (settled) {
-      yield* Effect.annotateCurrentSpan({ "mcp.execute.resume.replayed": true });
+      yield* Effect.annotateCurrentSpan({
+        "mcp.execute.resume.replayed": true,
+      });
       const replayed = (yield* settled) as ExecutionResult;
       yield* annotateExecutionOutcome(replayed);
       return replayed;
@@ -857,8 +890,12 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
 
     const pending = pendingResumes.get(executionId);
     if (pending) {
-      yield* Effect.annotateCurrentSpan({ "mcp.execute.resume.joined_inflight": true });
-      const joined = (yield* Deferred.await(pending)) as ExecutionResult;
+      yield* Effect.annotateCurrentSpan({
+        "mcp.execute.resume.joined_inflight": true,
+      });
+      const joiningOrgWriteAccess = yield* CurrentOrgWriteAccess;
+      yield* Ref.set(pending.orgWriteAccess.current, yield* Ref.get(joiningOrgWriteAccess.current));
+      const joined = (yield* Deferred.await(pending.outcome)) as ExecutionResult;
       yield* annotateExecutionOutcome(joined);
       return joined;
     }
@@ -881,7 +918,17 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
     if (response.action === "accept") liveApprovalResponses.delete(response);
 
     const inflight = yield* Deferred.make<ExecutionResult, E>();
-    pendingResumes.set(executionId, inflight);
+    pendingResumes.set(executionId, {
+      outcome: inflight,
+      orgWriteAccess: paused.orgWriteAccess,
+    });
+
+    // The detached sandbox inherited the starter's request context. Replace
+    // its per-execution authorization before waking any continuation so every
+    // accepted form/confirmation, decline, and cancellation is governed by
+    // the principal making this resume request rather than by the starter.
+    const resumeOrgWriteAccess = yield* CurrentOrgWriteAccess;
+    yield* Ref.set(paused.orgWriteAccess.current, yield* Ref.get(resumeOrgWriteAccess.current));
 
     yield* Deferred.succeed(paused.response, {
       action: response.action as typeof ElicitationResponse.Type.action,
