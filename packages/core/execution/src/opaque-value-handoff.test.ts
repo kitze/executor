@@ -709,7 +709,13 @@ describe("opaque sensitive value execution", () => {
           };
           expect(latestWrite.body?.value).toBe(scenario.marker);
           const expectedCompleted = scenario.direct
-            ? { result: null }
+            ? {
+                result: {
+                  status: "sealed",
+                  reason: expect.stringContaining("Output sealed"),
+                },
+                logs: [],
+              }
             : {
                 result: scenario.fail
                   ? {

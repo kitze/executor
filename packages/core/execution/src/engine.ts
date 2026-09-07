@@ -148,9 +148,25 @@ const publicTerminalResult = (
   opaqueValueHandoff.hasDirectSensitiveInputValues()
     ? // A sandbox can derive unbounded transforms after materializing its own
       // secret. Exact-value redaction cannot prove any terminal result, log,
-      // error, or emitted item safe, so discard the whole surface.
-      { result: null }
+      // error, or emitted item safe, so discard the whole surface. Replace it
+      // with a fixed, sandbox-independent marker (plus the error flag, which is
+      // a boolean the sandbox cannot encode a secret into) so callers can tell
+      // "ran, output sealed" apart from "returned nothing" or "hung".
+      sealedTerminalResult(result)
     : (opaqueValueHandoff.redact(result) as ExecuteResult);
+
+const SEALED_TERMINAL_RESULT_REASON =
+  "Output sealed: this execution passed a sensitive value directly to a tool input, so its result, logs, and emitted items are withheld. The tool call itself ran; verify its effect with a separate read.";
+
+const sealedTerminalResult = (result: ExecuteResult): ExecuteResult =>
+  result.error === undefined
+    ? { result: { status: "sealed", reason: SEALED_TERMINAL_RESULT_REASON }, logs: [] }
+    : {
+        result: null,
+        error: SEALED_TERMINAL_RESULT_REASON,
+        ...(result.errorKind === undefined ? {} : { errorKind: result.errorKind }),
+        logs: [],
+      };
 
 /** Sandbox code can derive an unbounded transform before its first sensitive
  * tool await. At that point an inner runtime span may already own the raw
