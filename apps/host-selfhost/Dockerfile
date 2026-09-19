@@ -9,13 +9,13 @@
 #     -e EXECUTOR_WEB_BASE_URL=https://your.domain \
 #     -v executor-data:/data executor-selfhost
 
-FROM oven/bun:1 AS prod-deps
+FROM oven/bun:1.4.1 AS prod-deps
 WORKDIR /app
 COPY . .
 RUN bun install --frozen-lockfile --production --ignore-scripts --filter @executor-js/host-selfhost \
   && bun run apps/host-selfhost/scripts/package-runtime.ts
 
-FROM oven/bun:1 AS build
+FROM oven/bun:1.4.1 AS build
 WORKDIR /app
 COPY . .
 RUN bun install --frozen-lockfile

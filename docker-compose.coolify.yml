@@ -1,0 +1,13 @@
+# Deployed by Coolify (project: executor) on beast. Builds apps/host-selfhost/Dockerfile from this checkout
+# (branch coolify-deploy = the pop-os production commit 0c0908a3d + bun pinned to the version that ran there).
+services:
+  executor:
+    build:
+      context: .
+      dockerfile: apps/host-selfhost/Dockerfile
+    container_name: executor
+    restart: unless-stopped
+    volumes:
+      - executor-data:/data
+volumes:
+  executor-data:
