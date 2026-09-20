@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, expect, test } from "@effect/vitest";
 
+import { createInviteMinter } from "../testing/mint-invite";
 import { MCP_TRANSITION_JSON_HEADER } from "./mcp-transition-json";
 
 // Real Better Auth path: set a secret + bootstrap admin before importing.
@@ -21,6 +22,7 @@ delete process.env.EXECUTOR_TRUSTED_ORIGINS;
 const { makeSelfHostApiHandler } = await import("../app");
 
 const { handler, dispose } = await makeSelfHostApiHandler();
+const mintInvite = await createInviteMinter(handler);
 afterAll(() => dispose());
 
 const BASE = "https://executor.test";
