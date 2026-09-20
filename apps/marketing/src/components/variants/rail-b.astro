@@ -1,0 +1,111 @@
+---
+// Rail, variant B: "Gridline rail".
+// Compact and technical: mark-only wordmark, a tight link stack, two quiet
+// meta lines (open source, YC), and a numbered mono index. The rail does not
+// sell; the hero owns the call to action. A full-height hairline closes the
+// right edge.
+import "../../styles/variants/rail.css";
+import rhysAvatar from "../../assets/rhys-sullivan.jpg";
+
+const X_URL = "https://x.com/RhysSullivan";
+const EMAIL = "rhys@executor.sh";
+
+interface Props {
+  stars: string | null;
+  /** Which primary link is the current page. Defaults to home. */
+  current?: "home" | "pricing" | "blog";
+}
+const { stars, current = "home" } = Astro.props;
+const cur = (k: string) => (k === current ? "page" : undefined);
+
+const GH = "https://github.com/UsefulSoftwareCo/executor";
+const SIGN_IN = "/api/auth/login";
+
+const sections = [
+  { id: "mission", label: "What we think" },
+  { id: "context", label: "Context" },
+  { id: "safety", label: "Safety" },
+  { id: "install", label: "Run it" },
+  { id: "people", label: "What people say" },
+  { id: "pricing", label: "Pricing" },
+  { id: "writing", label: "Writing" },
+  { id: "about", label: "About" },
+];
+const pad = (index: number) => String(index + 1).padStart(2, "0");
+---
+
+<aside class="rail rail--b">
+  <a href="/" class="rail__brand" aria-label="Executor home">
+    <img src="/favicon-192.png" alt="" class="rail__brand-mark" />
+  </a>
+
+  <div class="rail__stack">
+    <nav class="rail__nav" aria-label="Main">
+      <a href="/" class="rail__link rail__link--keep" aria-current={cur("home")}>Home</a>
+      <a href="https://executor.sh/docs" class="rail__link rail__link--keep">Docs</a>
+      <a href="/blog" class="rail__link" aria-current={cur("blog")}>Blog</a>
+      <a href="/pricing" class="rail__link" aria-current={cur("pricing")}>Pricing</a>
+      <a href={SIGN_IN} class="rail__link rail__link--keep">Sign in</a>
+    </nav>
+
+    <div class="rail__meta">
+      <a href={GH} target="_blank" rel="noopener" class="rail__meta-line">
+        <span>Open source</span>
+        {stars != null && <span class="rail__meta-n">★ {stars}</span>}
+      </a>
+      <a href="https://www.ycombinator.com" target="_blank" rel="noopener noreferrer" class="rail__meta-line">
+        <span>Backed by Y Combinator</span>
+      </a>
+    </div>
+
+    {current === "home" ? (
+    <nav class="rail__toc" aria-label="On this page">
+      {
+        sections.map((section, index) => (
+          <span class="rail__toc-item">
+            <a href={`#${section.id}`}>
+              <span class="rail__num">{pad(index)}</span>
+              <span>{section.label}</span>
+            </a>
+          </span>
+        ))
+      }
+    </nav>
+    ) : null}
+
+    <div class="rail__contact">
+      <div class="rail__contact-head">
+        <img src={rhysAvatar.src} alt="" width="28" height="28" />
+        <div>
+          <span class="rail__contact-title">Questions? Get in touch.</span>
+          <span class="rail__contact-sub">Rhys, founder</span>
+        </div>
+      </div>
+      <ul class="rail__contact-list">
+        <li>
+          <a href={`mailto:${EMAIL}?subject=Executor`}>
+            <span class="rail__contact-k">Email</span>
+            <span class="rail__contact-v">{EMAIL}</span>
+          </a>
+        </li>
+        <li>
+          <a href={`mailto:${EMAIL}?subject=slack%20connect%20invite%20for%20Executor`}>
+            <span class="rail__contact-k">Shared Slack</span>
+            <span class="rail__contact-v">send a slack connect invite to {EMAIL}</span>
+          </a>
+        </li>
+        <li>
+          <a href={X_URL} target="_blank" rel="me noopener">
+            <span class="rail__contact-k">X</span>
+            <span class="rail__contact-v">@RhysSullivan</span>
+          </a>
+        </li>
+      </ul>
+    </div>
+  </div>
+</aside>
+
+<script>
+  import { initRailSpy } from "./rail-spy";
+  document.querySelectorAll<HTMLElement>(".rail").forEach(initRailSpy);
+</script>

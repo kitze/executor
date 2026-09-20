@@ -18,6 +18,31 @@ import type { OpaqueValueHandoff } from "./opaque-value-handoff";
 export const ElicitationMeta = Schema.Record(Schema.String, Schema.Unknown);
 export type ElicitationMeta = typeof ElicitationMeta.Type;
 
+/** The persistence scopes an approval OFFERS, when its terms leave that to
+ *  the answer. Codex Computer Use sends `persist: ["session", "always"]` and
+ *  remembers the app only if the reply names one; a bare accept is a
+ *  one-time approval and the very next call asks again. Chrome's per-site
+ *  approval sends `persist: "always"` — a statement of what accepting
+ *  means, not a choice — and contributes nothing here. */
+export const offeredPersistence = (meta: ElicitationMeta | undefined): readonly string[] => {
+  const persist = meta?.["persist"];
+  return Array.isArray(persist) && persist.every((scope) => typeof scope === "string")
+    ? persist
+    : [];
+};
+
+/** What an accepted approval carries back, in the request's own vocabulary.
+ *
+ *  Closed on purpose, the mirror of the request-side projection: an answer
+ *  can only state terms this contract names, so no host can grant something
+ *  the prompt never offered. `persist` is the one term that is a choice —
+ *  one of `offeredPersistence(request.meta)`, or absent for a one-time
+ *  approval. */
+export const ElicitationResponseMeta = Schema.Struct({
+  persist: Schema.optional(Schema.String),
+});
+export type ElicitationResponseMeta = typeof ElicitationResponseMeta.Type;
+
 /** Tool needs structured input from the user (render a form). */
 export const FormElicitation = Schema.TaggedStruct("FormElicitation", {
   message: Schema.String,
@@ -46,6 +71,8 @@ export const ElicitationResponse = Schema.Struct({
   action: ElicitationAction,
   /** Present when `action` is "accept" — the data the user provided. */
   content: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  /** The answer's own terms, meaningful only with "accept". */
+  meta: Schema.optional(ElicitationResponseMeta),
 });
 export type ElicitationResponse = typeof ElicitationResponse.Type;
 
@@ -54,12 +81,21 @@ export type ElicitationResponse = typeof ElicitationResponse.Type;
  * in the active tool fiber; public approval, browser, and native-MCP paths
  * must never receive caller values by default.
  */
+/** Who raised an elicitation. `"policy"` is the executor's own approval gate
+ *  (`enforceApproval`): a consent-only form whose terms are exactly "run this
+ *  tool with these arguments". `"tool"` is anything the tool itself asked for
+ *  mid-call, which may carry its own terms (a permanent site grant, a scope
+ *  choice) even when the schema is empty. A host that has already obtained
+ *  consent for the tool call may auto-accept the former and must never
+ *  auto-accept the latter. Absent means unknown, which reads as `"tool"`. */
+export type ElicitationSource = "policy" | "tool";
 export interface ElicitationContext {
   readonly address: ToolAddress;
   readonly request: ElicitationRequest;
   /** Metadata only: this gate consumes an opaque value and therefore cannot be
    * auto-accepted by a transport-level Run/Test shortcut. */
   readonly requiresLiveApproval?: boolean;
+  readonly source?: ElicitationSource;
 }
 
 /** Host-provided handler the SDK calls when a tool suspends for input. */

@@ -146,6 +146,10 @@ const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?:
           }
         : {}),
     },
+    // Better Auth's own limiter is on in production and off in development.
+    // Only an explicit opt-out is passed through, so that environment default
+    // stays in charge everywhere else.
+    ...(config.authRateLimit ? {} : { rateLimit: { enabled: false } }),
     emailAndPassword: { enabled: true },
     // `apiKey` issues long-lived personal keys (the API-keys page). With
     // `enableSessionForAPIKeys`, presenting a key resolves to its owner's

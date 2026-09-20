@@ -186,6 +186,7 @@ export const ExecutionsHandlers = HttpApiBuilder.group(ExecutorApi, "executions"
           const response = {
             action: payload.action,
             content: payload.content as Record<string, unknown> | undefined,
+            ...(payload.persist === undefined ? {} : { meta: { persist: payload.persist } }),
           };
           let responseToResume: ResumeResponse = response;
 

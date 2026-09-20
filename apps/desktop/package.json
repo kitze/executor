@@ -1,6 +1,6 @@
 {
   "name": "@executor-js/desktop",
-  "version": "1.6.8",
+  "version": "1.6.10",
   "private": true,
   "homepage": "https://github.com/UsefulSoftwareCo/executor",
   "license": "MIT",
@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@sentry/bun": "^10.57.0",
-    "@sentry/electron": "^7.13.0",
+    "@sentry/electron": "7.19.0",
     "electron-log": "^5",
     "electron-store": "^10",
     "electron-updater": "^6",
@@ -47,8 +47,8 @@
     "@types/node": "catalog:",
     "@zip.js/zip.js": "^2.8.26",
     "bun-types": "catalog:",
-    "electron": "41.2.1",
-    "electron-builder": "^26",
+    "electron": "41.10.3",
+    "electron-builder": "26.16.1",
     "electron-vite": "^5",
     "quickjs-emscripten": "catalog:",
     "typescript": "catalog:",

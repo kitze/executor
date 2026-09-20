@@ -83,6 +83,13 @@ type DescribedTool = {
   readonly outputTypeScript?: string;
   readonly outputTypeScriptNote?: string;
   readonly typeScriptDefinitions?: Record<string, string>;
+  /** The tool's declared annotations, when it carries any. Lets code inside
+   *  `execute` branch on approval posture without parsing the description. */
+  readonly annotations?: {
+    readonly requiresApproval?: boolean;
+    readonly approvalDescription?: string;
+    readonly mayElicit?: boolean;
+  };
   /** Set when the path resolves to no tool — mirrors invoke's tool_not_found. */
   readonly error?: {
     readonly code: "tool_not_found";
@@ -136,7 +143,7 @@ const BUILTIN_TOOL_DESCRIPTIONS: ReadonlyMap<string, DescribedTool> = new Map<
       outputTypeScript: "DescribedTool",
       typeScriptDefinitions: {
         DescribedTool:
-          '{ path: string; name: string; description?: string; inputTypeScript?: string; outputTypeScript?: string; typeScriptDefinitions?: { [k: string]: string; }; error?: { code: "tool_not_found"; message: string; suggestions?: string[]; }; }',
+          '{ path: string; name: string; description?: string; inputTypeScript?: string; outputTypeScript?: string; typeScriptDefinitions?: { [k: string]: string; }; annotations?: { requiresApproval?: boolean; approvalDescription?: string; mayElicit?: boolean; }; error?: { code: "tool_not_found"; message: string; suggestions?: string[]; }; }',
       },
     },
   ],
@@ -307,7 +314,10 @@ const extractNamespace = (path: string): string => {
  */
 export const makeExecutorToolInvoker = (
   executor: Executor,
-  options: { readonly invokeOptions: InvokeOptions },
+  options: {
+    readonly invokeOptions: InvokeOptions;
+    readonly onConnectedToolCall?: (path: string) => void;
+  },
 ): SandboxToolInvoker => ({
   invoke: Effect.fn("mcp.tool.dispatch")(function* ({ path, args }) {
     yield* Effect.annotateCurrentSpan({
@@ -381,6 +391,12 @@ export const makeExecutorToolInvoker = (
     const projectedCoolifyResult = coolifySafeProjectToolResult(path, result);
     const publicResult = projectedCoolifyResult ?? result;
     yield* annotateToolResultOutcome(publicResult);
+    const connectedToolPath = parseToolAddress(String(address))
+      ? addressToPath(String(address))
+      : undefined;
+    if (connectedToolPath && (!isToolResult(publicResult) || publicResult.ok)) {
+      options.onConnectedToolCall?.(connectedToolPath);
+    }
     if (isToolResult(publicResult)) {
       return publicResult;
     }
@@ -665,7 +681,7 @@ const scoreToolMatch = (tool: SearchableTool, query: string): ToolDiscoveryResul
 
 /** What `tools.search()` calls inside the sandbox. */
 export const searchTools = Effect.fn("executor.tools.search")(function* (
-  executor: Executor,
+  executor: { readonly tools: Pick<Executor["tools"], "list"> },
   query: string,
   limit = 12,
   options?: { readonly namespace?: string; readonly offset?: number },
@@ -892,6 +908,7 @@ export const describeTool = Effect.fn("executor.tools.describe")(function* (
         }
       : {}),
     typeScriptDefinitions: withToolResultDefinitions(schema.typeScriptDefinitions),
+    ...(schema.annotations ? { annotations: schema.annotations } : {}),
   };
   return described;
 });
