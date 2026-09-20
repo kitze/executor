@@ -104,6 +104,7 @@ const makeRecordingEngine = (result: unknown = { ok: true, data: { hello: "world
         return { status: "completed" as const, result: { result } };
       }),
     resume: () => Effect.succeed(null),
+    grantLiveApproval: (_executionId, response) => Effect.succeed(response),
     isExecutionSettled: undefined,
     getPausedExecution: () => Effect.succeed(null),
     pausedExecutionCount: () => Effect.succeed(0),
@@ -652,7 +653,6 @@ describe("passthrough mode server", () => {
         for (const { source, request } of requests) {
           const answer = yield* options.onElicitation({
             address: CATALOG[0]!.address,
-            args: {},
             request,
             source,
           });
