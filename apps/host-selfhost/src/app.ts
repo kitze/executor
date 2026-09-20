@@ -80,8 +80,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     authHandler,
     betterAuth,
     oauthCallbackPrincipalResolver,
-  } =
-    await resolveAuthProviders(dbHandle);
+  } = await resolveAuthProviders(dbHandle);
 
   // ---- the in-process MCP serving seams (+ shutdown hook) ----------------
   // Pass the resolved config so browser-approval URLs use the pinned public
