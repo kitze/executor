@@ -7,6 +7,9 @@ services:
       dockerfile: apps/host-selfhost/Dockerfile
     container_name: executor
     restart: unless-stopped
+    extra_hosts:
+      # Tailnet DNS is not available inside the application network.
+      - "mac-studio.chicken-galaxy.ts.net:100.70.214.114"
     volumes:
       - executor-data:/data
 volumes:
