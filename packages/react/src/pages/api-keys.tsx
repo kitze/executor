@@ -74,6 +74,7 @@ function KeyTable(props: {
   readonly keys: readonly ApiKeySummary[];
   readonly revokingId: string | null;
   readonly onRevoke: (key: ApiKeySummary) => void;
+  readonly renderKeyScope?: (keyId: string) => ReactNode;
 }) {
   return (
     <div className="overflow-hidden rounded-md border border-border bg-card">
@@ -91,6 +92,7 @@ function KeyTable(props: {
           <div className="min-w-0">
             <p className="truncate text-sm font-medium text-foreground">{key.name}</p>
             <p className="mt-1 font-mono text-xs text-muted-foreground">{key.obfuscatedValue}</p>
+            {props.renderKeyScope && <div className="mt-2">{props.renderKeyScope(key.id)}</div>}
           </div>
           <p className="hidden text-sm text-muted-foreground md:block">
             {formatDate(key.createdAt)}
@@ -222,7 +224,10 @@ function CreateKeyDialogBody(props: {
   );
 }
 
-export function ApiKeysPage(props: { readonly orgKeysSection?: ReactNode }) {
+export function ApiKeysPage(props: {
+  readonly orgKeysSection?: ReactNode;
+  readonly renderKeyScope?: (keyId: string) => ReactNode;
+}) {
   useExecutorDocumentTitle("API keys");
   const result = useAtomValue(apiKeysAtom);
   const refreshApiKeys = useAtomRefresh(apiKeysAtom);
@@ -285,10 +290,12 @@ export function ApiKeysPage(props: { readonly orgKeysSection?: ReactNode }) {
 
       <section>
         <h2 className="text-sm font-medium text-foreground">Personal keys</h2>
-        <p className="mb-4 mt-0.5 max-w-2xl text-sm text-muted-foreground">
-          Personal keys work like personal access tokens: they act as you, in this organization,
-          with full access to your own account.
-        </p>
+        {!props.renderKeyScope && (
+          <p className="mb-4 mt-0.5 max-w-2xl text-sm text-muted-foreground">
+            Personal keys work like personal access tokens: they act as you, in this organization,
+            with full access to your own account.
+          </p>
+        )}
 
         {isAsyncResultLoading(result) ? (
           <div className="rounded-md border border-border bg-card p-6 text-sm text-muted-foreground">
@@ -317,6 +324,7 @@ export function ApiKeysPage(props: { readonly orgKeysSection?: ReactNode }) {
                   keys={value.apiKeys}
                   revokingId={revokingId}
                   onRevoke={(key) => setConfirmRevoke(key)}
+                  renderKeyScope={props.renderKeyScope}
                 />
               ),
           })

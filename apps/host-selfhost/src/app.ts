@@ -7,11 +7,13 @@ import {
   composePluginApi,
   ExecutorApp,
   textFailureStrategy,
+  toApiHandler,
 } from "@executor-js/api/server";
 
 import { runSqliteDataMigrations } from "@executor-js/sdk";
 
 import { resolveAuthProviders } from "./auth";
+import { toolkitApiKeyMiddleware, toolkitApiKeyRoutes } from "./auth/toolkit-api-keys";
 import { selfHostDataMigrations } from "./db/data-migrations";
 import { makeSelfHostAdminApiLayer } from "./admin/handlers";
 import { makeSelfHostAdminUsersApiLayer } from "./admin/admin-users-api";
@@ -107,7 +109,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
       ),
   );
 
-  const { appLayer, toWebHandler } = ExecutorApp.make({
+  const { appLayer } = ExecutorApp.make({
     plugins: selfHostPlugins,
     providers: {
       identity: identityLayer,
@@ -128,6 +130,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     },
     extensions: {
       routes: [
+        toolkitApiKeyRoutes({ db: dbHandle, betterAuth }),
         // CLI device-login discovery, must precede the /api/auth/* wildcard
         // below (Better Auth would otherwise 404 it). The verification page it
         // points at (/device) is a console SPA route
@@ -174,13 +177,20 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     ),
   });
 
+  // Wrap the entire router, not just MCP: a scoped key must not use account,
+  // admin or raw Better Auth endpoints to obtain wider credentials.
+  const guardedAppLayer = appLayer.pipe(
+    Layer.provide(toolkitApiKeyMiddleware({ db: dbHandle, betterAuth })),
+  );
+
   return {
     // Every route requirement is provided (the seams + boot resolve to nothing
     // residual), so the assembled app is a `Layer<never>` — the precise shape
     // `serve.ts` binds to the Bun socket. `make` types its `appLayer` loosely
     // (it can't prove each host's resolution); self-host narrows it here.
-    AppLayer: appLayer as Layer.Layer<never>,
-    toWebHandler,
+    AppLayer: guardedAppLayer as Layer.Layer<never>,
+    // Match ExecutorApp's erased web-handler boundary after adding the guard.
+    toWebHandler: () => toApiHandler(guardedAppLayer as Parameters<typeof toApiHandler>[0]),
     betterAuth,
     oauthCallbackPrincipalResolver,
     disposeExecutionRetention: () => Effect.runPromise(executionRetention.dispose),
