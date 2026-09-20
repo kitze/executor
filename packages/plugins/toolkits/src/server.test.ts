@@ -1,202 +1,137 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Predicate, Result } from "effect";
+import { Effect, Predicate } from "effect";
 import { makeTestExecutor } from "@executor-js/sdk/testing";
 
 import { toolkitsPlugin } from "./server";
 
 describe("toolkitsPlugin", () => {
-  it.effect("creates toolkits and manages ordered policy rules", () =>
+  it.effect("deduplicates connections and rejects duplicate visible slugs", () =>
     Effect.gen(function* () {
-      const executor = yield* makeTestExecutor({
-        plugins: [toolkitsPlugin()] as const,
-      });
-
-      const toolkit = yield* executor.toolkits.create({
-        owner: "org",
-        name: "Deploy Kit",
-      });
+      const executor = yield* makeTestExecutor({ plugins: [toolkitsPlugin()] as const });
+      const toolkit = yield* executor.toolkits.create({ owner: "org", name: "Deploy Kit" });
       expect(toolkit.slug).toBe("deploy-kit");
-
       const connection = yield* executor.toolkits.createConnection(toolkit.id, {
         pattern: "github.org.main.*",
       });
-      const duplicateConnection = yield* executor.toolkits.createConnection(toolkit.id, {
+      const duplicate = yield* executor.toolkits.createConnection(toolkit.id, {
         pattern: "github.org.main.*",
       });
-      expect(duplicateConnection.id).toBe(connection.id);
-
-      const first = yield* executor.toolkits.createPolicy(toolkit.id, {
-        pattern: "github.org.main.repos.*",
-        action: "approve",
-      });
-      const second = yield* executor.toolkits.createPolicy(toolkit.id, {
-        pattern: "github.*",
-        action: "block",
-      });
-
-      const policies = yield* executor.toolkits.listPolicies(toolkit.id);
-      expect(policies.map((policy) => policy.id)).toEqual([second.id, first.id]);
-
-      yield* executor.toolkits.updatePolicy(toolkit.id, first.id, {
-        action: "require_approval",
-      });
-      const rules = yield* executor.toolkits.policyRulesForSlug("deploy-kit");
-      expect(rules.find((rule) => rule.id === first.id)?.action).toBe("require_approval");
-
-      const connections = yield* executor.toolkits.listConnections(toolkit.id);
-      expect(connections.map((row) => row.pattern)).toEqual(["github.org.main.*"]);
-    }),
-  );
-
-  it.effect("rejects duplicate visible slugs", () =>
-    Effect.gen(function* () {
-      const executor = yield* makeTestExecutor({
-        plugins: [toolkitsPlugin()] as const,
-      });
-      yield* executor.toolkits.create({ owner: "org", name: "Deploy Kit" });
-
-      const duplicate = yield* Effect.result(
+      expect(duplicate.id).toBe(connection.id);
+      const error = yield* Effect.flip(
         executor.toolkits.create({ owner: "user", name: "Deploy Kit" }),
       );
-      expect(Result.isFailure(duplicate)).toBe(true);
-      if (!Result.isFailure(duplicate)) return;
-      expect(Predicate.isTagged("ToolkitError")(duplicate.failure)).toBe(true);
+      expect(Predicate.isTagged("ToolkitError")(error)).toBe(true);
     }),
   );
 
-  it.effect("resolves toolkit policies with implicit deny and workspace owner limits", () =>
+  it.effect("authorizes every connected operation regardless of defaults or stored policies", () =>
     Effect.gen(function* () {
-      const executor = yield* makeTestExecutor({
-        plugins: [toolkitsPlugin()] as const,
+      const executor = yield* makeTestExecutor({ plugins: [toolkitsPlugin()] as const });
+      const toolkit = yield* executor.toolkits.create({ owner: "org", name: "Deploy Kit" });
+      yield* executor.toolkits.createConnection(toolkit.id, { pattern: "github.org.main.*" });
+      yield* executor.toolkits.createPolicy(toolkit.id, {
+        pattern: "github.org.main.repos.delete",
+        action: "block",
       });
+      yield* executor.toolkits.createPolicy(toolkit.id, {
+        pattern: "github.org.main.repos.create",
+        action: "require_approval",
+      });
+      // Even a broad historical approve rule cannot expose an unassigned service.
+      yield* executor.toolkits.createPolicy(toolkit.id, { pattern: "*", action: "approve" });
+      const prepared = yield* executor.toolkits.preparePolicyResolverForSlug(toolkit.slug);
+      for (const toolId of [
+        "github.org.main.repos.list",
+        "github.org.main.repos.create",
+        "github.org.main.repos.delete",
+      ]) {
+        const policy = yield* executor.toolkits.resolvePolicyForSlug(toolkit.slug, toolId, true);
+        expect(policy).toEqual({ action: "approve", source: "plugin-default" });
+        expect(prepared({ toolId, defaultRequiresApproval: true })).toEqual(policy);
+      }
+      for (const toolId of ["github.org.other.repos.delete", "slack.org.main.chat.post"]) {
+        expect(prepared({ toolId, defaultRequiresApproval: false }).action).toBe("block");
+        expect((yield* executor.toolkits.resolvePolicyForSlug(toolkit.slug, toolId)).action).toBe(
+          "block",
+        );
+      }
+      expect(yield* executor.toolkits.policyRulesForSlug(toolkit.slug)).toEqual([]);
+      // Legacy data remains available for migration; it is no longer an operation gate.
+      expect((yield* executor.toolkits.listPolicies(toolkit.id)).length).toBe(3);
+    }),
+  );
 
-      const workspace = yield* executor.toolkits.create({
-        owner: "org",
-        name: "Workspace Kit",
+  it.effect("preserves workspace ownership limits and missing-toolkit denial", () =>
+    Effect.gen(function* () {
+      const executor = yield* makeTestExecutor({ plugins: [toolkitsPlugin()] as const });
+      const workspace = yield* executor.toolkits.create({ owner: "org", name: "Workspace Kit" });
+      yield* executor.toolkits.createConnection(workspace.id, { pattern: "github.user.main.*" });
+      const prepared = yield* executor.toolkits.preparePolicyResolverForSlug(workspace.slug);
+      const toolId = "github.user.main.repos.delete";
+      expect(prepared({ toolId }).action).toBe("block");
+      expect((yield* executor.toolkits.resolvePolicyForSlug(workspace.slug, toolId)).action).toBe(
+        "block",
+      );
+      const personal = yield* executor.toolkits.create({ owner: "user", name: "Personal Kit" });
+      yield* executor.toolkits.createConnection(personal.id, { pattern: "github.user.main.*" });
+      expect(
+        (yield* executor.toolkits.resolvePolicyForSlug(personal.slug, toolId, true)).action,
+      ).toBe("approve");
+      expect((yield* executor.toolkits.resolvePolicyForSlug("missing", toolId)).action).toBe(
+        "block",
+      );
+      const missing = yield* executor.toolkits.preparePolicyResolverForSlug("missing");
+      expect(missing({ toolId }).action).toBe("block");
+    }),
+  );
+
+  it.effect("does not turn historical policy patterns into connection grants", () =>
+    Effect.gen(function* () {
+      const executor = yield* makeTestExecutor({ plugins: [toolkitsPlugin()] as const });
+      const toolkit = yield* executor.toolkits.create({ owner: "org", name: "Legacy Kit" });
+      yield* executor.toolkits.createPolicy(toolkit.id, {
+        pattern: "github.org.main.*",
+        action: "approve",
       });
-      yield* executor.toolkits.createConnection(workspace.id, {
+      yield* executor.toolkits.createConnection(toolkit.id, { pattern: "docs.org.main.*" });
+      yield* executor.toolkits.createPolicy(toolkit.id, {
+        pattern: "docs.org.*",
+        action: "approve",
+      });
+      const prepared = yield* executor.toolkits.preparePolicyResolverForSlug(toolkit.slug);
+      expect(
+        prepared({ toolId: "github.org.main.repos.delete", defaultRequiresApproval: true }).action,
+      ).toBe("block");
+      expect(
+        prepared({ toolId: "docs.org.main.documents.delete", defaultRequiresApproval: true })
+          .action,
+      ).toBe("approve");
+      expect(prepared({ toolId: "docs.org.other.documents.delete" }).action).toBe("block");
+    }),
+  );
+
+  it.effect("revokes access after a connection or toolkit is removed", () =>
+    Effect.gen(function* () {
+      const executor = yield* makeTestExecutor({ plugins: [toolkitsPlugin()] as const });
+      const toolkit = yield* executor.toolkits.create({ owner: "org", name: "Temporary Kit" });
+      const connection = yield* executor.toolkits.createConnection(toolkit.id, {
         pattern: "github.org.main.*",
       });
-
-      const workspaceTool = yield* executor.toolkits.resolvePolicyForSlug(
-        workspace.slug,
-        "github.org.main.repos.list",
-      );
-      expect(workspaceTool.action).toBe("approve");
-      expect(workspaceTool.source).toBe("plugin-default");
-
-      const defaultApprovalTool = yield* executor.toolkits.resolvePolicyForSlug(
-        workspace.slug,
-        "github.org.main.repos.delete",
-        true,
-      );
-      expect(defaultApprovalTool.action).toBe("require_approval");
-      expect(defaultApprovalTool.source).toBe("plugin-default");
-
-      yield* executor.toolkits.createPolicy(workspace.id, {
-        pattern: "github.org.main.repos.delete",
-        action: "approve",
-      });
-      const explicitTool = yield* executor.toolkits.resolvePolicyForSlug(
-        workspace.slug,
-        "github.org.main.repos.delete",
-        true,
-      );
-      expect(explicitTool.action).toBe("approve");
-      expect(explicitTool.source).toBe("user");
-
-      const personalTool = yield* executor.toolkits.resolvePolicyForSlug(
-        workspace.slug,
-        "github.user.main.repos.list",
-      );
-      expect(personalTool.action).toBe("block");
-
-      const missingTool = yield* executor.toolkits.resolvePolicyForSlug(
-        workspace.slug,
-        "slack.org.main.chat.post",
-      );
-      expect(missingTool.action).toBe("block");
-
-      const personal = yield* executor.toolkits.create({
-        owner: "user",
-        name: "Personal Kit",
-      });
-      yield* executor.toolkits.createConnection(personal.id, {
-        pattern: "github.user.main.*",
-      });
-      const personalToolkitTool = yield* executor.toolkits.resolvePolicyForSlug(
-        personal.slug,
-        "github.user.main.repos.list",
-      );
-      expect(personalToolkitTool.action).toBe("approve");
-    }),
-  );
-
-  it.effect("treats a persisted connection-root approve as an access policy", () =>
-    Effect.gen(function* () {
-      const executor = yield* makeTestExecutor({
-        plugins: [toolkitsPlugin()] as const,
-      });
-
-      const toolkit = yield* executor.toolkits.create({
-        owner: "org",
-        name: "Core Tools Kit",
-      });
-      yield* executor.toolkits.createConnection(toolkit.id, {
-        pattern: "executor.coreTools.*",
-      });
-      yield* executor.toolkits.createPolicy(toolkit.id, {
-        pattern: "executor.coreTools.*",
-        action: "approve",
-      });
-
-      const result = yield* executor.toolkits.resolvePolicyForSlug(
-        toolkit.slug,
-        "executor.coreTools.connections.remove",
-        true,
-      );
-      expect(result.action).toBe("approve");
-      expect(result.source).toBe("user");
-
-      const rules = yield* executor.toolkits.policyRulesForSlug(toolkit.slug);
+      const toolId = "github.org.main.repos.delete";
       expect(
-        rules.map((rule) => `${rule.pattern} ${rule.action}`),
-        "policy listing agrees with toolkit enforcement",
-      ).toContain("executor.coreTools.* approve");
-    }),
-  );
-
-  it.effect("applies a broad approve policy over a narrower connection", () =>
-    Effect.gen(function* () {
-      const executor = yield* makeTestExecutor({
-        plugins: [toolkitsPlugin()] as const,
-      });
-
-      const toolkit = yield* executor.toolkits.create({
-        owner: "org",
-        name: "Docs Kit",
-      });
-      yield* executor.toolkits.createConnection(toolkit.id, {
-        pattern: "google_docs.org.main.*",
-      });
+        (yield* executor.toolkits.resolvePolicyForSlug(toolkit.slug, toolId, true)).action,
+      ).toBe("approve");
       yield* executor.toolkits.createPolicy(toolkit.id, {
-        pattern: "google_docs.org.*",
+        pattern: "github.org.main.*",
         action: "approve",
       });
-
-      const result = yield* executor.toolkits.resolvePolicyForSlug(
-        toolkit.slug,
-        "google_docs.org.main.documents.update",
-        true,
+      yield* executor.toolkits.removeConnection(toolkit.id, connection.id);
+      const afterRemoval = yield* executor.toolkits.preparePolicyResolverForSlug(toolkit.slug);
+      expect(afterRemoval({ toolId }).action).toBe("block");
+      yield* executor.toolkits.remove(toolkit.id);
+      expect((yield* executor.toolkits.resolvePolicyForSlug(toolkit.slug, toolId)).action).toBe(
+        "block",
       );
-      expect(result.action).toBe("approve");
-      expect(result.source).toBe("user");
-
-      const rules = yield* executor.toolkits.policyRulesForSlug(toolkit.slug);
-      expect(
-        rules.map((rule) => `${rule.pattern} ${rule.action}`),
-        "policy listing agrees with toolkit enforcement",
-      ).toContain("google_docs.org.* approve");
     }),
   );
 });

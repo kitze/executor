@@ -79,7 +79,7 @@ type ToolkitStorage = {
 };
 
 export interface ToolkitsPluginOptions {
-  /** When set, this executor instance enforces only the named toolkit's rules. */
+  /** When set, only the named toolkit's connections are accessible. */
   readonly activeToolkitSlug?: string;
 }
 
@@ -139,57 +139,16 @@ const blockedPolicy = (pattern = "*"): EffectivePolicy => ({
   pattern,
 });
 
-const pluginDefaultPolicy = (defaultRequiresApproval: boolean | undefined): EffectivePolicy =>
-  defaultRequiresApproval
-    ? { action: "require_approval", source: "plugin-default" }
-    : { action: "approve", source: "plugin-default" };
-
-const isLegacyConnectionPolicy = (policy: ToolkitPolicyRecord): boolean => {
-  if (policy.action !== "approve") return false;
-  const parts = policy.pattern.split(".");
-  return parts.at(-1) === "*" && (parts.length === 3 || parts.length === 4);
-};
-
 const resolveToolkitPolicy = (
   toolId: string,
   connections: readonly ToolkitConnectionRecord[],
-  policies: readonly ToolkitPolicyRecord[],
-  defaultRequiresApproval?: boolean,
 ): EffectivePolicy => {
-  const legacyPolicyIds = legacyConnectionPolicyIds(policies, connections);
-  const connected =
-    connections.some((connection) => matchPattern(connection.pattern, toolId)) ||
-    policies.some(
-      (policy) => legacyPolicyIds.has(policy.id) && matchPattern(policy.pattern, toolId),
-    );
+  const connected = connections.some((connection) => matchPattern(connection.pattern, toolId));
   if (!connected) return blockedPolicy();
 
-  for (const policy of [...policies].sort(comparePositioned)) {
-    if (legacyPolicyIds.has(policy.id)) continue;
-    if (!matchPattern(policy.pattern, toolId)) continue;
-    return {
-      action: policy.action,
-      source: "user",
-      pattern: policy.pattern,
-      policyId: policy.id,
-    };
-  }
-  return pluginDefaultPolicy(defaultRequiresApproval);
-};
-
-const legacyConnectionPolicyIds = (
-  policies: readonly ToolkitPolicyRecord[],
-  connections: readonly ToolkitConnectionRecord[],
-): ReadonlySet<string> => {
-  return new Set(
-    policies
-      .filter(
-        (policy) =>
-          isLegacyConnectionPolicy(policy) &&
-          !connections.some((connection) => matchPattern(policy.pattern, connection.pattern)),
-      )
-      .map((policy) => policy.id),
-  );
+  // Adding a connection authorizes every operation on it. Persisted policies
+  // neither constrain the connection nor grant access to an unassigned one.
+  return { action: "approve", source: "plugin-default" };
 };
 
 const isPersonalDynamicToolId = (toolId: string): boolean => toolId.split(".")[1] === "user";
@@ -478,44 +437,24 @@ const makeToolkitsExtension = (ctx: PluginCtx<ToolkitStorage>) => {
     });
 
   const policyRulesForSlug = (
-    slug: string,
-  ): Effect.Effect<readonly ToolPolicyProviderRule[], StorageFailure> =>
-    Effect.gen(function* () {
-      const toolkit = yield* getBySlugEntry(slug);
-      if (!toolkit) return [];
-      const policies = yield* listPoliciesForRecord(toolkit.data.id);
-      const connections = yield* listConnectionsForRecord(toolkit.data.id);
-      const legacyPolicyIds = legacyConnectionPolicyIds(policies, connections);
-      return policies
-        .filter((policy) => !legacyPolicyIds.has(policy.id))
-        .map((policy) => ({
-          id: policy.id,
-          pattern: policy.pattern,
-          action: policy.action,
-          position: policy.position,
-        }));
-    });
+    _slug: string,
+  ): Effect.Effect<readonly ToolPolicyProviderRule[], StorageFailure> => Effect.succeed([]);
 
   const resolvePolicyForSlug = (
     slug: string,
     toolId: string,
-    defaultRequiresApproval?: boolean,
+    _defaultRequiresApproval?: boolean,
   ): Effect.Effect<EffectivePolicy, StorageFailure> =>
     Effect.gen(function* () {
       const toolkit = yield* getBySlugEntry(slug);
       if (!toolkit) return blockedPolicy();
       if (toolkit.owner === "org" && isPersonalDynamicToolId(toolId)) return blockedPolicy();
-      const policies = yield* listPoliciesForRecord(toolkit.data.id);
       const connections = yield* listConnectionsForRecord(toolkit.data.id);
-      return resolveToolkitPolicy(toolId, connections, policies, defaultRequiresApproval);
+      return resolveToolkitPolicy(toolId, connections);
     });
 
-  // Batched form of `resolvePolicyForSlug`: fetch the toolkit, its policies, and
-  // its connections ONCE, then hand back a pure resolver core can run for every
-  // tool in a single tools/list or tools/call. `resolvePolicyForSlug` re-fetches
-  // policies + connections on every tool, which is the per-tool N+1 that scales
-  // with the whole catalog on the list surface. This is byte-for-byte the same
-  // resolution, just hoisted out of the loop.
+  // Snapshot connection membership once per operation, not once per tool.
+  // Every subsequent operation reads it again so removals take effect.
   const preparePolicyResolverForSlug = (
     slug: string,
   ): Effect.Effect<
@@ -529,16 +468,10 @@ const makeToolkitsExtension = (ctx: PluginCtx<ToolkitStorage>) => {
       const toolkit = yield* getBySlugEntry(slug);
       if (!toolkit) return () => blockedPolicy();
       const isOrg = toolkit.owner === "org";
-      const policies = yield* listPoliciesForRecord(toolkit.data.id);
       const connections = yield* listConnectionsForRecord(toolkit.data.id);
       return (input: { readonly toolId: string; readonly defaultRequiresApproval?: boolean }) => {
         if (isOrg && isPersonalDynamicToolId(input.toolId)) return blockedPolicy();
-        return resolveToolkitPolicy(
-          input.toolId,
-          connections,
-          policies,
-          input.defaultRequiresApproval,
-        );
+        return resolveToolkitPolicy(input.toolId, connections);
       };
     });
 
@@ -682,7 +615,7 @@ const makePolicyProvider = (
   resolve: ({ toolId, defaultRequiresApproval }) =>
     extension.resolvePolicyForSlug(slug, toolId, defaultRequiresApproval),
   // Preferred path: core calls this once per operation, so the toolkit's
-  // policies + connections are fetched once instead of once per tool.
+  // connections are fetched once instead of once per tool.
   prepare: () => extension.preparePolicyResolverForSlug(slug),
 });
 

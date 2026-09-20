@@ -51,7 +51,6 @@ scenario(
       { owner: "user" as const, name: `${prefix}-personal-c` },
     ];
     let addedConnectionPattern = "";
-    const blockPattern = "executor.coreTools.policies.list";
 
     const cleanup = Effect.gen(function* () {
       yield* client.connections
@@ -275,15 +274,14 @@ scenario(
           await toolkitTools.getByLabel("Filter tools").clear();
         });
 
-        await step("Block one tool from the toolkit tools list", async () => {
+        await step("Inspect an included tool without per-tool policy controls", async () => {
           const toolkitTools = page.getByRole("region", { name: "Toolkit tools" });
           await toolkitTools.getByLabel("Filter tools").fill("policies.list");
           await toolkitTools.getByRole("button").filter({ hasText: "list" }).last().click();
-          await page.getByRole("button", { name: "Set policy", exact: true }).click();
-          await page.getByText(blockPattern, { exact: true }).waitFor();
-          await page.getByRole("menuitem", { name: "Block" }).click();
-          await toolkitTools.getByRole("button").filter({ hasText: "list" }).last().waitFor();
-          await page.getByText("This tool is not available through the current toolkit.").waitFor();
+          expect(await page.getByRole("button", { name: /^Set policy/ }).count()).toBe(0);
+          expect(
+            await page.getByText("This tool is not available through the current toolkit.").count(),
+          ).toBe(0);
         });
       });
 
@@ -306,8 +304,8 @@ scenario(
       ).toContain(addedConnectionPattern);
       expect(
         policies.map((policy) => `${policy.pattern} ${policy.action}`).sort(),
-        "the UI-authored toolkit access persisted with its action",
-      ).toEqual([`${blockPattern} block`]);
+        "toolkit access needs connection membership only",
+      ).toEqual([]);
     }).pipe(Effect.ensuring(cleanup));
   }),
 );

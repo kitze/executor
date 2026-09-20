@@ -16,7 +16,6 @@ import {
   type Integration,
   type Owner,
   type ToolAddress,
-  type ToolPolicyAction,
 } from "@executor-js/sdk/shared";
 import { integrationsOptimisticAtom, toolsAllAtom } from "@executor-js/react/api/atoms";
 import { ReactivityKey } from "@executor-js/react/api/reactivity-keys";
@@ -60,12 +59,7 @@ import { ToolDetail, ToolDetailEmpty } from "@executor-js/react/components/tool-
 import { ToolTree, type ToolSummary } from "@executor-js/react/components/tool-tree";
 import { cn } from "@executor-js/react/lib/utils";
 
-import {
-  ToolkitsApi,
-  type ToolkitConnectionResponse,
-  type ToolkitPolicyResponse,
-  type ToolkitResponse,
-} from "./shared";
+import { ToolkitsApi, type ToolkitConnectionResponse, type ToolkitResponse } from "./shared";
 
 const ToolkitsClient = createPluginAtomClient(ToolkitsApi, {
   baseUrl: getExecutorApiBaseUrl,
@@ -84,14 +78,6 @@ const toolkitsAtom = ToolkitsClient.query("toolkits", "list", {
   reactivityKeys: [ReactivityKey.policies],
 });
 
-const toolkitPoliciesAtom = Atom.family((toolkitId: string) =>
-  ToolkitsClient.query("toolkits", "listPolicies", {
-    params: { toolkitId },
-    timeToLive: "30 seconds",
-    reactivityKeys: [ReactivityKey.policies],
-  }),
-);
-
 const toolkitConnectionsAtom = Atom.family((toolkitId: string) =>
   ToolkitsClient.query("toolkits", "listConnections", {
     params: { toolkitId },
@@ -102,9 +88,6 @@ const toolkitConnectionsAtom = Atom.family((toolkitId: string) =>
 
 const createToolkit = ToolkitsClient.mutation("toolkits", "create");
 const removeToolkit = ToolkitsClient.mutation("toolkits", "remove");
-const createToolkitPolicy = ToolkitsClient.mutation("toolkits", "createPolicy");
-const updateToolkitPolicy = ToolkitsClient.mutation("toolkits", "updatePolicy");
-const removeToolkitPolicy = ToolkitsClient.mutation("toolkits", "removePolicy");
 const createToolkitConnection = ToolkitsClient.mutation("toolkits", "createConnection");
 const removeToolkitConnection = ToolkitsClient.mutation("toolkits", "removeConnection");
 
@@ -119,38 +102,9 @@ type ToolRow = {
   readonly static?: boolean;
 };
 
-const comparePolicy = (a: ToolkitPolicyResponse, b: ToolkitPolicyResponse): number => {
-  if (a.position < b.position) return -1;
-  if (a.position > b.position) return 1;
-  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-};
-
-const pluginDefaultPolicy = (requiresApproval: boolean | undefined): EffectivePolicy =>
-  requiresApproval
-    ? { action: "require_approval", source: "plugin-default" }
-    : { action: "approve", source: "plugin-default" };
-
-const isLegacyConnectionPolicy = (policy: ToolkitPolicyResponse): boolean => {
-  if (policy.action !== "approve") return false;
-  const parts = policy.pattern.split(".");
-  return parts.at(-1) === "*" && (parts.length === 3 || parts.length === 4);
-};
-
-const resolveToolkitPolicy = (
-  matchId: string,
-  policies: readonly ToolkitPolicyResponse[],
-  requiresApproval?: boolean,
-): EffectivePolicy => {
-  for (const policy of [...policies].sort(comparePolicy)) {
-    if (!matchPattern(policy.pattern, matchId)) continue;
-    return {
-      action: policy.action,
-      source: "user",
-      pattern: policy.pattern,
-      policyId: policy.id,
-    };
-  }
-  return pluginDefaultPolicy(requiresApproval);
+const toolkitConnectionPolicy: EffectivePolicy = {
+  action: "approve",
+  source: "plugin-default",
 };
 
 const toolMatchId = (tool: ToolRow): string =>
@@ -381,35 +335,6 @@ const configuredConnectionViews = (
       ...(meta.url ? { url: meta.url } : {}),
     };
   });
-
-const legacyConnectionPolicyIds = (
-  policies: readonly ToolkitPolicyResponse[],
-  connectionGroups: readonly ToolkitConnectionGroup[],
-  connections: readonly ToolkitConnectionResponse[],
-): ReadonlySet<string> => {
-  const persistedPatterns = new Set(connections.map((connection) => connection.pattern));
-  const connectionPatterns = new Set(connectionGroups.flatMap((group) => group.patterns));
-  return new Set(
-    policies
-      .filter(
-        (policy) =>
-          isLegacyConnectionPolicy(policy) &&
-          connectionPatterns.has(policy.pattern) &&
-          !persistedPatterns.has(policy.pattern),
-      )
-      .map((policy) => policy.id),
-  );
-};
-
-const configuredConnectionPatterns = (
-  connections: readonly ToolkitConnectionResponse[],
-  policies: readonly ToolkitPolicyResponse[],
-  legacyPolicyIds: ReadonlySet<string>,
-): ReadonlySet<string> =>
-  new Set([
-    ...connections.map((connection) => connection.pattern),
-    ...policies.filter((policy) => legacyPolicyIds.has(policy.id)).map((policy) => policy.pattern),
-  ]);
 
 function ToolkitConnectionIconStack(props: { connections: readonly ConfiguredConnectionView[] }) {
   const visibleConnections = props.connections.slice(0, 3);
@@ -724,11 +649,8 @@ function ToolkitContentsEmpty(props: { onManageConnections: () => void }) {
 function ToolkitToolsPanel(props: {
   tools: readonly ToolSummary[];
   selectedToolId: string | null;
-  policies: readonly ToolkitPolicyResponse[];
   onManageConnections: () => void;
   onSelectTool: (toolId: string) => void;
-  onSetPolicy: (pattern: string, action: ToolPolicyAction) => void;
-  onClearPolicy: (pattern: string) => void;
 }) {
   return (
     <div
@@ -744,10 +666,7 @@ function ToolkitToolsPanel(props: {
           tools={props.tools}
           selectedToolId={props.selectedToolId}
           onSelect={props.onSelectTool}
-          onSetPolicy={props.onSetPolicy}
-          onClearPolicy={props.onClearPolicy}
           patternForDisplay={identityPattern}
-          policies={props.policies}
           groupByConnection
         />
       )}
@@ -1030,7 +949,6 @@ function ToolkitHeader(props: {
 function ToolkitWorkspace(props: {
   toolkit: ToolkitResponse;
   showOwnerLabels: boolean;
-  policies: readonly ToolkitPolicyResponse[];
   connections: readonly ToolkitConnectionResponse[];
   tools: readonly ToolRow[];
   integrations: readonly Integration[];
@@ -1040,8 +958,6 @@ function ToolkitWorkspace(props: {
   onRemoveToolkit: () => void;
   onAddConnection: (pattern: string) => Promise<void> | void;
   onRemoveConnection: (connectionId: string) => Promise<void> | void;
-  onSetPolicy: (pattern: string, action: ToolPolicyAction) => Promise<void> | void;
-  onClearPolicy: (pattern: string) => Promise<void> | void;
 }) {
   const [addOpen, setAddOpen] = useState(false);
   const [selectedToolId, setSelectedToolId] = useState<string | null>(null);
@@ -1071,17 +987,9 @@ function ToolkitWorkspace(props: {
       props.showOwnerLabels,
     ],
   );
-  const legacyPolicyIds = useMemo(
-    () => legacyConnectionPolicyIds(props.policies, connectionGroups, props.connections),
-    [connectionGroups, props.connections, props.policies],
-  );
-  const accessPolicies = useMemo(
-    () => props.policies.filter((policy) => !legacyPolicyIds.has(policy.id)),
-    [legacyPolicyIds, props.policies],
-  );
   const connectionPatterns = useMemo(
-    () => configuredConnectionPatterns(props.connections, props.policies, legacyPolicyIds),
-    [legacyPolicyIds, props.connections, props.policies],
+    () => new Set(props.connections.map((connection) => connection.pattern)),
+    [props.connections],
   );
   const configuredToolIds = useMemo(() => {
     const ids = new Set<string>();
@@ -1104,13 +1012,13 @@ function ToolkitWorkspace(props: {
           id,
           name: id,
           description: tool.description,
-          policy: resolveToolkitPolicy(id, accessPolicies, tool.requiresApproval),
+          policy: toolkitConnectionPolicy,
           owner: toolOwner(tool),
           connection: toolConnectionName(tool),
           integration: String(tool.integration),
         };
       }),
-    [accessPolicies, configuredTools],
+    [configuredTools],
   );
   const selectedTool = selectedToolId
     ? (configuredTools.find((tool) => toolMatchId(tool) === selectedToolId) ?? null)
@@ -1134,11 +1042,8 @@ function ToolkitWorkspace(props: {
         <ToolkitToolsPanel
           tools={toolkitTools}
           selectedToolId={selectedToolId}
-          policies={accessPolicies}
           onManageConnections={() => setAddOpen(true)}
           onSelectTool={setSelectedToolId}
-          onSetPolicy={(pattern, action) => void props.onSetPolicy(pattern, action)}
-          onClearPolicy={(pattern) => void props.onClearPolicy(pattern)}
         />
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
           {selectedTool && selectedToolPolicy ? (
@@ -1147,8 +1052,6 @@ function ToolkitWorkspace(props: {
               toolName={toolMatchId(selectedTool)}
               staticTool={selectedTool.static === true}
               policy={selectedToolPolicy}
-              onSetPolicy={props.onSetPolicy}
-              onClearPolicy={props.onClearPolicy}
               patternForDisplay={identityPattern}
             />
           ) : (
@@ -1290,32 +1193,10 @@ function ToolkitDetailView(props: {
   onBack: () => void;
   onRemoveToolkit: (toolkit: ToolkitResponse) => void;
 }) {
-  const policies = useAtomValue(toolkitPoliciesAtom(props.toolkit.id));
   const connections = useAtomValue(toolkitConnectionsAtom(props.toolkit.id));
-  const doCreatePolicy = useAtomSet(createToolkitPolicy, { mode: "promiseExit" });
-  const doUpdatePolicy = useAtomSet(updateToolkitPolicy, { mode: "promiseExit" });
-  const doRemovePolicy = useAtomSet(removeToolkitPolicy, { mode: "promiseExit" });
   const doCreateConnection = useAtomSet(createToolkitConnection, { mode: "promiseExit" });
   const doRemoveConnection = useAtomSet(removeToolkitConnection, { mode: "promiseExit" });
-  const policyRows = AsyncResult.isSuccess(policies) ? policies.value.policies : [];
   const connectionRows = AsyncResult.isSuccess(connections) ? connections.value.connections : [];
-
-  const setPolicyHandler = async (pattern: string, action: ToolPolicyAction) => {
-    const existing = policyRows.find((policy) => policy.pattern === pattern);
-    if (existing) {
-      await doUpdatePolicy({
-        params: { toolkitId: props.toolkit.id, policyId: existing.id },
-        payload: { action },
-        reactivityKeys: toolkitWriteKeys,
-      });
-      return;
-    }
-    await doCreatePolicy({
-      params: { toolkitId: props.toolkit.id },
-      payload: { pattern, action },
-      reactivityKeys: toolkitWriteKeys,
-    });
-  };
 
   const addConnectionHandler = async (pattern: string) => {
     await doCreateConnection({
@@ -1332,19 +1213,10 @@ function ToolkitDetailView(props: {
     });
   };
 
-  const clearPolicyHandler = async (pattern: string) => {
-    const existing = policyRows.find((policy) => policy.pattern === pattern);
-    if (!existing) return;
-    await doRemovePolicy({
-      params: { toolkitId: props.toolkit.id, policyId: existing.id },
-      reactivityKeys: toolkitWriteKeys,
-    });
-  };
-
-  if (AsyncResult.isFailure(policies) || AsyncResult.isFailure(connections)) {
+  if (AsyncResult.isFailure(connections)) {
     return <div className="p-6 text-sm text-destructive">Failed to load toolkit</div>;
   }
-  if (!AsyncResult.isSuccess(policies) || !AsyncResult.isSuccess(connections)) {
+  if (!AsyncResult.isSuccess(connections)) {
     return <ToolkitDetailSkeleton />;
   }
 
@@ -1352,7 +1224,6 @@ function ToolkitDetailView(props: {
     <ToolkitWorkspace
       toolkit={props.toolkit}
       showOwnerLabels={props.showOwnerLabels}
-      policies={policyRows}
       connections={connectionRows}
       tools={props.tools}
       integrations={props.integrations}
@@ -1362,8 +1233,6 @@ function ToolkitDetailView(props: {
       onRemoveToolkit={() => props.onRemoveToolkit(props.toolkit)}
       onAddConnection={addConnectionHandler}
       onRemoveConnection={removeConnectionHandler}
-      onSetPolicy={setPolicyHandler}
-      onClearPolicy={clearPolicyHandler}
     />
   );
 }

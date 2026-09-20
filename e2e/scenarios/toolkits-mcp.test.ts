@@ -483,7 +483,7 @@ scenario(
 );
 
 scenario(
-  "Toolkits · approve and block policies change destructive core-tool side effects",
+  "Toolkits · connection grants authorize writes without per-tool approvals",
   { timeout: 240_000 },
   Effect.gen(function* () {
     const target = yield* Target;
@@ -505,11 +505,6 @@ scenario(
         params: { toolkitId: approveToolkit.id },
         payload: { pattern: "executor.coreTools.*" },
       });
-      yield* client.toolkits.createPolicy({
-        params: { toolkitId: approveToolkit.id },
-        payload: { pattern: "executor.coreTools.policies.create", action: "approve" },
-      });
-
       const approveSession = mcp.session(identity, {
         url: toolkitUrl(target.baseUrl, approveToolkit.slug),
       });
@@ -549,14 +544,16 @@ scenario(
       const blocked = yield* blockSession.call("execute", {
         code: createPolicyCode({ pattern: blockedPattern, action: "block" }),
       });
-      expect(blocked.text, "blocked policy create does not pause for approval").not.toContain(
+      expect(blocked.text, "historical block rules do not add an operation gate").not.toContain(
         "Execution paused",
       );
+      expect(blocked.ok, `connected write completed: ${blocked.text}`).toBe(true);
+      expect((JSON.parse(blocked.text) as Record<string, unknown>).ok).toBe(true);
       const afterBlocked = yield* client.policies.list();
       expect(
         afterBlocked.map((policy) => `${policy.owner} ${policy.pattern} ${policy.action}`),
-        "blocked toolkit policy prevents the user policy side effect",
-      ).not.toContain(`user ${blockedPattern} block`);
+        "connection membership authorizes the write despite a historical block rule",
+      ).toContain(`user ${blockedPattern} block`);
     }).pipe(
       Effect.ensuring(
         Effect.gen(function* () {
@@ -585,7 +582,7 @@ scenario(
 );
 
 scenario(
-  "Toolkits · a broad approve policy applies over a narrower connection grant",
+  "Toolkits · a narrow connection grant authorizes its operations",
   { timeout: 240_000 },
   Effect.gen(function* () {
     const target = yield* Target;
